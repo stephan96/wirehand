@@ -1,0 +1,37 @@
+# ----------------------------------------------------------------------------
+# Manual devices. The LLM only sees: name, platform, access, description, tags.
+# Credentials: env:VARNAME -> resolved from the container environment (.env).
+# access: ro (default) | rw.
+# device_type = Netmiko driver: linux, cisco_ios, cisco_xe, cisco_xr, cisco_nxos,
+#               huawei, huawei_vrpv8, fortinet, arista_eos, juniper_junos
+# A manual entry with the same name as a discovered containerlab node overrides it.
+# ----------------------------------------------------------------------------
+devices:
+  lab-srv1:
+    host: 192.0.2.10
+    device_type: linux
+    username: env:LAB_SRV1_USER
+    password: env:LAB_SRV1_PASS
+    access: rw
+    description: Ubuntu lab VM (change testing target)
+    tags: [lab, linux]
+
+# ----------------------------------------------------------------------------
+# Containerlab discovery (folder set via WIREHAND_CLAB_DIR). Every deployed lab
+# (clab-<name>/ansible-inventory.yml) is scanned; nodes are named <lab>-<node>,
+# e.g. xrd-test-xrd1. Destroyed labs disappear within WIREHAND_CLAB_RESCAN seconds.
+# ----------------------------------------------------------------------------
+containerlab:
+  default_access: rw          # labs are disposable; set ro if you prefer the cautious default
+  long_names: false           # true -> use full names like clab-xrd-test-xrd1
+
+  # kind -> Netmiko driver / access overrides (built-in map covers cisco_xrd, cisco_iol,
+  # huawei_vrp, fortinet_fortigate, arista_ceos, juniper_vjunos*, linux, ...)
+  kinds:
+    huawei_vrp: { device_type: huawei_vrpv8 }     # NE40E/CE = VRP8; use 'huawei' for VRP5 images
+    # cisco_xrd: { access: ro }
+
+  # credentials per kind when the generated ansible inventory has none, or to override it
+  credentials:
+    fortinet_fortigate: { username: admin, password: env:FGT_PASS }
+    # cisco_xrd: { username: clab, password: clab@123 }    # containerlab default, already built in

@@ -1,0 +1,68 @@
+"""End-to-end API test with a fake SSH pool (no real devices)."""
+import os, sys, tempfile
+os.environ["WIREHAND_API_KEY"] = "k"
+os.environ["WIREHAND_DATA"] = tempfile.mkdtemp()
+inv = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+inv.write("""devices:
+  r1: {host: 1.1.1.1, device_type: cisco_xr, username: u, password: p, access: rw}
+  s1: {host: 1.1.1.2, device_type: linux, username: u, password: p, access: ro}
+""")
+inv.close()
+os.environ["WIREHAND_INVENTORY"] = inv.name
+os.environ["LAB"] = "x"
+for m in list(sys.modules):
+    if m.startswith("app"):
+        del sys.modules[m]
+
+from fastapi.testclient import TestClient
+from app import main
+
+RUNNING = "interface Loopback0\n ipv4 address 1.1.1.1/32\ninterface GigabitEthernet0/0/0/0\n description uplink\n"
+
+class FakePool:
+    def __init__(self): self.configured = []
+    def run(self, dev, cmds, timeout=60):
+        return [(c, RUNNING if "running" in c else f"out of {c} on {dev.name}") for c in cmds]
+    def configure(self, dev, lines, commit):
+        self.configured.append((dev.name, lines, commit)); return "Commit complete"
+    def close_all(self): pass
+
+main.pool = FakePool()
+H = {"Authorization": "Bearer k"}
+c = TestClient(main.app)
+
+assert c.get("/list_devices").status_code == 401
+assert "r1" in c.get("/list_devices", headers=H).text
+assert "out of show version" in c.get("/get_facts", params={"device": "r1"}, headers=H).text
+r = c.get("/run_read", params={"device": "r1,s1", "commands": "show running-config", "filter": "loopback", "context": 1}, headers=H)
+assert "Loopback0" in r.text and "uplink" not in r.text and "=== s1" in r.text, r.text
+assert c.get("/run_read", params={"device": "s1", "commands": "sudo reboot"}, headers=H).status_code == 403
+assert c.get("/run_read", params={"device": "nope", "commands": "uptime"}, headers=H).status_code == 404
+
+p = c.post("/propose_change", json={"device": "r1", "config": "interface Loopback10\n description test"}, headers=H)
+assert p.status_code == 200 and "STAGED" in p.text, p.text
+code = p.text.split("code: ")[1][:6]
+assert c.post("/propose_change", json={"device": "s1", "config": "echo hi"}, headers=H).status_code == 403
+assert c.post("/confirm_change", params={"code": "ZZZZZZ"}, headers=H).status_code == 404
+a = c.post("/confirm_change", params={"code": code}, headers=H)
+assert a.status_code == 200 and "APPLIED" in a.text and main.pool.configured[0][1] == ["interface Loopback10", " description test"], a.text
+assert c.post("/confirm_change", params={"code": code}, headers=H).status_code == 404  # single use
+assert "rollback configuration last 1" in c.post("/rollback_change", params={"device": "r1"}, headers=H).text
+log = c.get("/get_audit_log", headers=H).text
+assert "propose_change" in log and "confirm_change" in log
+ops = [op["operationId"] for p_ in c.get("/openapi.json").json()["paths"].values() for op in p_.values()]
+print("tools:", ops)
+print("OK")
+pre = c.options("/openapi.json", headers={"Origin": "http://llm-srv1:3000", "Access-Control-Request-Method": "GET"})
+assert pre.status_code == 200 and pre.headers.get("access-control-allow-origin"), pre.status_code
+print("CORS OK")
+pre = c.options("/get_facts", params={"device": "r1"}, headers={"Origin": "http://x", "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization,content-type,x-requested-with,accept"})
+assert pre.status_code == 200, pre.text
+print("CORS wide OK")
+p = c.post("/propose_change", json={"device": "r1", "config": "reset ospf process 1", "mode": "exec"}, headers=H)
+assert p.status_code == 200 and "user/exec view" in p.text, p.text
+code2 = p.text.split("code: ")[1][:6]
+a = c.post("/confirm_change", params={"code": code2}, headers=H)
+assert "EXECUTED" in a.text and "reset ospf process 1" in a.text and len(main.pool.configured) == 1, a.text
+assert c.post("/propose_change", json={"device": "r1", "config": "x", "mode": "wrong"}, headers=H).status_code == 400
+print("EXEC MODE OK")

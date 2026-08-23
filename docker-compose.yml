@@ -1,0 +1,46 @@
+# wirehand 0.2: SSH-backed device analysis & change tool for Open WebUI and Onyx,
+# with automatic containerlab discovery.
+#
+# Runs with network_mode: host so it can reach the containerlab management bridge
+# (172.20.20.0/24 by default) - Docker isolates user-defined bridges from each other,
+# so a normal bridged container could NOT reach the lab nodes.
+# Front-ends on other machines use http://<this-host>:8110.
+#
+# Build with the host user's uid/gid so bind-mounted 600-files are readable:
+#   UID=$(id -u) GID=$(id -g) docker compose build
+# UVICORN workers MUST stay at 1: pending change codes and the SSH pool are in-process.
+
+services:
+  wirehand:
+    build:
+      context: .
+      args:
+        APP_UID: "${UID:-1000}"
+        APP_GID: "${GID:-1000}"
+    image: wirehand:0.3.0
+    container_name: wirehand
+    restart: unless-stopped
+    network_mode: host
+    mem_limit: 1g
+    env_file:
+      - .env                        # WIREHAND_API_KEY, WIREHAND_CLAB_DIR, manual device creds (chmod 600)
+    environment:
+      WIREHAND_INVENTORY: /app/config/inventory.yaml
+      WIREHAND_CLAB_DIR: /clab        # container-side path of the containerlab folder (mounted below)
+      WIREHAND_CLAB_RESCAN: "30"      # seconds between checks for deployed/destroyed labs
+      WIREHAND_DATA: /app/data
+      WIREHAND_IDLE_SECONDS: "300"
+      WIREHAND_CMD_TIMEOUT: "60"
+      WIREHAND_CHANGE_TTL: "600"
+      WIREHAND_MAX_OUTPUT_CHARS: "80000"   # ~20k tokens
+      WIREHAND_CORS_ORIGINS: "*"           # tighten to e.g. "http://llm-srv1:3000" once it works
+    volumes:
+      - ./config:/app/config:ro
+      - ${WIREHAND_CLAB_DIR:-./clab-empty}:/clab:ro   # host path from .env, e.g. /home/stephan/containerlabs
+      - wirehand_data:/app/data
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  wirehand_data:
