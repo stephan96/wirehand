@@ -66,3 +66,17 @@ a = c.post("/confirm_change", params={"code": code2}, headers=H)
 assert "EXECUTED" in a.text and "reset ospf process 1" in a.text and len(main.pool.configured) == 1, a.text
 assert c.post("/propose_change", json={"device": "r1", "config": "x", "mode": "wrong"}, headers=H).status_code == 400
 print("EXEC MODE OK")
+# fortinet: blocks with config/end allowed, missing end auto-appended, honest preview
+import yaml as _yaml
+inv2 = open(os.environ["WIREHAND_INVENTORY"]).read()
+open(os.environ["WIREHAND_INVENTORY"], "w").write(inv2 + "  fgt: {host: 1.1.1.3, device_type: fortinet, username: u, password: p, access: rw}\n")
+c.get("/list_devices", params={"refresh": "true"}, headers=H)
+p = c.post("/propose_change", json={"device": "fgt", "config": "config system global\nset lldp-reception enable"}, headers=H)
+assert p.status_code == 200 and "+ end" in p.text and "lldp-reception" in p.text, p.text
+code3 = p.text.split("code: ")[1][:6]
+a = c.post("/confirm_change", params={"code": code3}, headers=H)
+assert a.status_code == 200 and main.pool.configured[-1][1][-1] == "end", a.text
+# ios still rejects end
+p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\nend"}, headers=H)
+assert p.status_code == 400, p.text
+print("FORTINET BLOCKS OK")

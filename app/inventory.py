@@ -77,7 +77,15 @@ class Device:
             "conn_timeout": 15,
             "banner_timeout": 30,
             "fast_cli": False,
+            # TCP keepalives so firewalls/devices (FortiGate admintimeout!) do not
+            # silently half-close the session while it sits in the pool.
+            "keepalive": 30,
         }
+        import os as _os
+        if _os.environ.get("WIREHAND_SESSION_LOG") == "1":
+            _d = _os.environ.get("WIREHAND_DATA", "/app/data")
+            kw["session_log"] = f"{_d}/session-{self.name}.log"
+            kw["session_log_file_mode"] = "append"
         if self.key_file:
             kw["use_keys"] = True
             kw["key_file"] = self.key_file

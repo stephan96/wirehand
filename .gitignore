@@ -1,4 +1,5 @@
 .env
 config/keys/
+config/inventory.yaml
 data/
 __pycache__/

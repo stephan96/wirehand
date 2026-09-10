@@ -8,6 +8,9 @@ import os
 import threading
 import time
 
+import socket
+from concurrent.futures import ThreadPoolExecutor
+
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
 from .inventory import Device
@@ -31,11 +34,14 @@ class _Session:
         self.conn = ConnectHandler(**self.device.netmiko_kwargs())
         if self.device.secret and self.device.family in ("ios", "nxos", "eos"):
             self.conn.enable()
-        if self.device.family != "linux":
-            try:
-                self.conn.disable_paging()
-            except Exception:  # some platforms do this in session_preparation
-                pass
+        # Do NOT call disable_paging() here: Netmiko's session_preparation already
+        # handles paging per platform. A second invocation re-runs config dialogs on
+        # some platforms (FortiGate!) and leaves unread data in the channel, which
+        # makes the FIRST real command time out. Instead, sync the channel:
+        try:
+            self.conn.find_prompt()
+        except Exception:
+            pass
         return self.conn
 
     def close(self):
@@ -71,10 +77,21 @@ class Pool:
             for cmd in commands:
                 try:
                     out = conn.send_command(cmd, read_timeout=timeout, strip_command=True)
-                except Exception as exc:  # timeout, prompt issues -> report and keep going
-                    out = f"[error running command: {type(exc).__name__}: {exc}]"
+                except Exception as first_exc:
+                    # Pooled sessions can be half-dead (device-side idle timeout kills the
+                    # TCP session, is_alive() does not notice). Reconnect and retry ONCE -
+                    # read commands are idempotent, so this is safe.
+                    log.warning("%s: '%s' failed (%s), reconnecting and retrying once",
+                                device.name, cmd, type(first_exc).__name__)
                     s.close()
                     conn = self._open_or_raise(s)
+                    try:
+                        out = conn.send_command(cmd, read_timeout=timeout, strip_command=True)
+                    except Exception as exc:
+                        out = (f"[error running command (after reconnect+retry): "
+                               f"{type(exc).__name__}: {exc}]")
+                        s.close()
+                        conn = self._open_or_raise(s)
                 results.append((cmd, out or ""))
             s.last_used = time.time()
             return results
@@ -109,11 +126,8 @@ class Pool:
                         conn.exit_config_mode()
                         if commit:
                             out += "\n" + conn.save_config()
-                    else:  # fortinet etc.
-                        try:
-                            conn.exit_config_mode()
-                        except Exception:
-                            pass
+                    else:  # fortinet: blocks carry their own 'end'; nothing to exit
+                        pass
             finally:
                 s.last_used = time.time()
             return out
@@ -146,3 +160,23 @@ class Pool:
         for s in list(self._sessions.values()):
             with s.lock:
                 s.close()
+
+
+CHECK_TIMEOUT = float(os.environ.get("WIREHAND_CHECK_TIMEOUT", "2"))
+
+
+def tcp_reachable(host: str, port: int, timeout: float = CHECK_TIMEOUT) -> bool:
+    """True if a TCP connection to host:port succeeds within timeout."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def check_devices(devices: list[Device]) -> dict[str, bool]:
+    """Concurrent SSH-port reachability check from the wirehand host.
+    Verifies network path + listening sshd, NOT credentials."""
+    with ThreadPoolExecutor(max_workers=min(32, max(1, len(devices)))) as ex:
+        results = ex.map(lambda d: (d.name, tcp_reachable(d.host, d.port)), devices)
+        return dict(results)

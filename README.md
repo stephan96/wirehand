@@ -85,6 +85,7 @@ tar xzf wirehand-<version>.tar.gz -C ~/docker    # creates/overwrites ~/docker/w
 cd ~/docker/wirehand
 
 cp .env.example .env
+cp config/inventory.yaml.example config/inventory.yaml
 $EDITOR .env                    # see "Configuration" below
 $EDITOR config/inventory.yaml
 chmod 600 .env config/inventory.yaml
@@ -135,7 +136,7 @@ port and API key are unchanged, so the URL stays the same.
 ### Updating to a new version
 
 ```bash
-tar xzf wirehand-<version>.tar.gz -C ~/docker    # .env + config/ survive: not in the archive
+tar xzf wirehand-<version>.tar.gz -C ~/docker    # safe: .env and config/inventory.yaml are NOT in the archive (only *.example files)
 cd ~/docker/wirehand
 UID=$(id -u) GID=$(id -g) docker compose up -d --build
 curl -s http://localhost:8110/openapi.json | grep -o '"version": *"[^"]*"'

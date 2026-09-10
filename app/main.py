@@ -14,7 +14,6 @@ Design rules (see README):
 """
 from __future__ import annotations
 
-import difflib
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -29,7 +28,7 @@ from . import platforms
 from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
 from .state import ChangeStore, audit, read_audit
-from .transport import Pool
+from .transport import Pool, check_devices
 
 logging.basicConfig(level=os.environ.get("WIREHAND_LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("wirehand")
@@ -53,7 +52,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.3.0",
+    version="0.3.4",
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
@@ -102,13 +101,28 @@ def _fmt(device: str, results: list[tuple[str, str]], flt: str = "", context: in
          description=(
              "Returns device names, platform and access level (ro = read only, rw = changes allowed). "
              "Call this first if you do not know the exact device name. "
-             "Example: list_devices()"
+             "With check=true, also tests which devices are currently reachable from the wirehand "
+             "host (TCP connect to the SSH port; verifies network path, not credentials) and adds "
+             "a STATE column (up/down). "
+             "Examples: list_devices() | list_devices(check=true) - 'which devices are up right now?'"
          ), dependencies=[Depends(auth)])
-def list_devices(refresh: bool = Query(False, description="Re-read inventory.yaml and rescan containerlab labs now")) -> str:
+def list_devices(
+    refresh: bool = Query(False, description="Re-read inventory.yaml and rescan containerlab labs now"),
+    check: bool = Query(False, description="Also check reachability (SSH port) of every device"),
+) -> str:
     if refresh:
         inventory.reload()
-    rows = [f"{d.name:<24} {d.device_type:<14} {d.access:<3} {d.host:<15} {d.description}" for d in inventory.all()]
-    return "NAME                     PLATFORM       ACC MGMT-IP         DESCRIPTION\n" + "\n".join(rows)
+    devs = inventory.all()
+    if not check:
+        rows = [f"{d.name:<24} {d.device_type:<14} {d.access:<3} {d.host:<15} {d.description}" for d in devs]
+        return "NAME                     PLATFORM       ACC MGMT-IP         DESCRIPTION\n" + "\n".join(rows)
+    state = check_devices(devs)
+    audit("check_devices", "", up=sum(1 for v in state.values() if v), total=len(devs))
+    rows = [f"{d.name:<24} {d.device_type:<14} {d.access:<3} {'up' if state.get(d.name) else 'DOWN':<5} {d.host:<15} {d.description}" for d in devs]
+    up = sum(1 for v in state.values() if v)
+    return (f"NAME                     PLATFORM       ACC STATE MGMT-IP         DESCRIPTION\n"
+            + "\n".join(rows)
+            + f"\n\n{up}/{len(devs)} devices reachable (SSH port, checked from the wirehand host)")
 
 
 @app.get("/get_facts", operation_id="get_facts", response_class=PlainTextResponse,
@@ -176,8 +190,12 @@ def run_read(
 class ProposeIn(BaseModel):
     device: str = Field(..., description="Device name (must have access=rw)")
     config: str = Field(..., description=(
-        "Configuration lines, one per line, exactly as typed on the device. "
-        "Network devices: config-mode lines (no 'configure terminal', no 'commit' - the tool adds them). "
+        "Configuration lines, ONE PER LINE, exactly as typed on the device. "
+        "Cisco/Huawei/Arista/Junos: config-mode lines only (no 'configure terminal', no 'commit' - "
+        "the tool adds them). "
+        "FortiGate: full section blocks INCLUDING 'config ...', 'next' and 'end' lines, e.g. "
+        "'config system global\\nset lldp-reception enable\\nset lldp-transmission enable\\nend' "
+        "(missing 'end' lines are appended automatically). "
         "Linux: shell commands run sequentially; prefix with 'sudo' if root is required."))
     reason: str = Field("", description="Short human-readable purpose, goes into the audit log")
     mode: str = Field("config", description=(
@@ -206,10 +224,19 @@ def propose_change(body: ProposeIn) -> str:
         raise HTTPException(400, "config is empty")
     if body.mode not in ("config", "exec"):
         raise HTTPException(400, "mode must be 'config' or 'exec'")
-    if body.mode == "config":
+    if body.mode == "config" and dev.family not in ("linux", "fortinet"):
         forbidden = [ln for ln in lines if ln.strip().lower().split()[0] in ("commit", "end", "configure", "conf", "write", "reload", "reboot")]
-        if forbidden and dev.family != "linux":
+        if forbidden:
             raise HTTPException(400, f"do not include {forbidden} - the tool handles mode changes and commit")
+    if body.mode == "config" and dev.family == "fortinet":
+        bad = [ln for ln in lines if ln.strip().lower().split()[0] in ("execute", "reload", "reboot")]
+        if bad:
+            raise HTTPException(400, f"not allowed in a config change: {bad}")
+        # FortiOS applies a section only at 'end' - balance missing ends automatically.
+        opens = sum(1 for ln in lines if ln.strip().lower().startswith("config "))
+        ends = sum(1 for ln in lines if ln.strip().lower() == "end")
+        if opens > ends:
+            lines = lines + ["end"] * (opens - ends)
 
     snap_cmd = platforms.SNAPSHOT.get(dev.family)
     try:
@@ -218,15 +245,16 @@ def propose_change(body: ProposeIn) -> str:
         raise HTTPException(502, str(exc))
     snap_path = changes.save_snapshot(dev.name, snapshot)
 
-    # Preview: for config platforms a unified diff of "what will be added"; for linux/exec the command list.
+    # Preview: ALWAYS the exact lines that will be sent. (An earlier version diffed
+    # against the snapshot line-set; on hierarchical configs the same 'set ...' line can
+    # exist under a different section, which made the preview claim changes were
+    # already present. Honest beats clever here.)
     if body.mode == "exec":
         preview = "Maintenance commands (user/exec view):\n" + "\n".join(f"  > {ln}" for ln in lines)
     elif dev.family == "linux":
         preview = "Commands to run:\n" + "\n".join(f"  $ {ln}" for ln in lines)
     else:
-        existing = snapshot.splitlines()
-        added = [ln for ln in lines if ln.strip() not in {e.strip() for e in existing}]
-        preview = "\n".join(difflib.unified_diff([], added, fromfile="running-config", tofile="proposed (additions)", lineterm="")) or "(all lines already present in running-config)"
+        preview = "Configuration lines to send:\n" + "\n".join(f"  + {ln}" for ln in lines)
     pc = changes.create(dev.name, lines, snap_path, preview, mode=body.mode)
     audit("propose_change", dev.name, code=pc.code, lines=lines, reason=body.reason, mode=body.mode, snapshot=str(snap_path))
     return (

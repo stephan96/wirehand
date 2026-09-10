@@ -90,3 +90,39 @@ def test_no_clab_dir_still_rescans_manual(tmp_path):
     _os.utime(inv_file, (0, 9999999999))
     inv._last_scan = 0
     assert [d.name for d in inv.all()] == ["s1"]
+
+
+def test_retry_once_after_dead_session(monkeypatch, tmp_path):
+    from app import transport
+    from app.inventory import Device
+    calls = {"n": 0}
+    class FakeConn:
+        def __init__(self, fail_first): self.fail_first = fail_first
+        def is_alive(self): return True
+        def send_command(self, cmd, **kw):
+            calls["n"] += 1
+            if self.fail_first and calls["n"] == 1:
+                raise OSError("Socket is closed")
+            return f"ok {cmd}"
+        def disconnect(self): pass
+        def disable_paging(self): pass
+    conns = [FakeConn(True), FakeConn(False)]
+    monkeypatch.setattr(transport, "ConnectHandler", lambda **kw: conns.pop(0))
+    dev = Device(name="d", host="h", device_type="fortinet", username="u", password="p")
+    pool = transport.Pool()
+    res = pool.run(dev, ["get system status"])
+    assert res == [("get system status", "ok get system status")]
+    assert calls["n"] == 2
+
+
+def test_reachability_check():
+    import socket, threading
+    from app.transport import check_devices
+    from app.inventory import Device
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+    port = srv.getsockname()[1]
+    up = Device(name="up", host="127.0.0.1", device_type="linux", username="u", password="p", port=port)
+    down = Device(name="down", host="127.0.0.1", device_type="linux", username="u", password="p", port=1)
+    state = check_devices([up, down])
+    srv.close()
+    assert state == {"up": True, "down": False}
