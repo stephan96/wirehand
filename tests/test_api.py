@@ -80,3 +80,35 @@ assert a.status_code == 200 and main.pool.configured[-1][1][-1] == "end", a.text
 p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\nend"}, headers=H)
 assert p.status_code == 400, p.text
 print("FORTINET BLOCKS OK")
+# auth failure: 401 (not 502), terminal wording, never retried, audited
+from app.transport import AuthError
+class AuthFailPool(FakePool):
+    def __init__(self): FakePool.__init__(self); self.attempts = 0
+    def run(self, dev, cmds, timeout=60):
+        if dev.name == "s1":
+            self.attempts += 1
+            raise AuthError("AUTHENTICATION FAILED for 's1' (linux, user 'u'). This is FINAL: do not retry this device.")
+        return FakePool.run(self, dev, cmds, timeout)
+afp = AuthFailPool(); main.pool = afp
+r = c.get("/get_facts", params={"device": "s1"}, headers=H)
+assert r.status_code == 401 and "FINAL" in r.text, (r.status_code, r.text)
+r = c.get("/run_read", params={"device": "s1,r1", "commands": "uptime"}, headers=H)
+assert "AUTHENTICATION FAILED" in r.text and "=== r1" in r.text, r.text   # other devices still processed
+assert afp.attempts == 2, afp.attempts                                    # one per call, never retried
+assert "auth_failed" in c.get("/get_audit_log", headers=H).text
+main.pool = FakePool()
+print("AUTH STOP OK")
+# health check: duplicate mgmt IPs across labs -> 'up?' + warning
+import app.main as _m
+_m.inventory.reload()
+orig_check = _m.check_devices
+_m.check_devices = lambda devs: {d.name: True for d in devs}
+inv3 = open(os.environ["WIREHAND_INVENTORY"]).read()
+open(os.environ["WIREHAND_INVENTORY"], "w").write(
+    inv3 + "  labA-x: {host: 172.20.20.2, device_type: linux, username: u, password: p}\n"
+           "  labB-x: {host: 172.20.20.2, device_type: linux, username: u, password: p}\n")
+r = c.get("/list_devices", params={"refresh": "true", "check": "true"}, headers=H).text
+assert "up?" in r and "WARNING" in r and "172.20.20.2 -> labA-x, labB-x" in r, r
+assert r.count("up?   ") == 2 and "ipv4-subnet" in r, r
+_m.check_devices = orig_check
+print("SHARED IP WARNING OK")

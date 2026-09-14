@@ -28,7 +28,7 @@ from . import platforms
 from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
 from .state import ChangeStore, audit, read_audit
-from .transport import Pool, check_devices
+from .transport import AuthError, Pool, check_devices
 
 logging.basicConfig(level=os.environ.get("WIREHAND_LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("wirehand")
@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.3.4",
+    version="0.3.6",
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
@@ -103,7 +103,8 @@ def _fmt(device: str, results: list[tuple[str, str]], flt: str = "", context: in
              "Call this first if you do not know the exact device name. "
              "With check=true, also tests which devices are currently reachable from the wirehand "
              "host (TCP connect to the SSH port; verifies network path, not credentials) and adds "
-             "a STATE column (up/down). "
+             "a STATE column: up / DOWN / 'up?' (ambiguous - several devices share that management "
+             "IP; read and relay the WARNING at the end of the output in that case). "
              "Examples: list_devices() | list_devices(check=true) - 'which devices are up right now?'"
          ), dependencies=[Depends(auth)])
 def list_devices(
@@ -117,12 +118,47 @@ def list_devices(
         rows = [f"{d.name:<24} {d.device_type:<14} {d.access:<3} {d.host:<15} {d.description}" for d in devs]
         return "NAME                     PLATFORM       ACC MGMT-IP         DESCRIPTION\n" + "\n".join(rows)
     state = check_devices(devs)
-    audit("check_devices", "", up=sum(1 for v in state.values() if v), total=len(devs))
-    rows = [f"{d.name:<24} {d.device_type:<14} {d.access:<3} {'up' if state.get(d.name) else 'DOWN':<5} {d.host:<15} {d.description}" for d in devs]
+    # Several containerlab labs share the default management subnet (172.20.20.0/24),
+    # so the same IP can appear in more than one lab's inventory. A TCP probe cannot
+    # tell WHICH lab answered -> mark those entries instead of claiming certainty.
+    by_host: dict[str, list[str]] = {}
+    for d in devs:
+        by_host.setdefault(d.host, []).append(d.name)
+    shared = {h: names for h, names in by_host.items() if len(names) > 1}
+
+    rows = []
+    for d in devs:
+        if not state.get(d.name):
+            st = "DOWN"
+        elif d.host in shared:
+            st = "up?"
+        else:
+            st = "up"
+        rows.append(f"{d.name:<24} {d.device_type:<14} {d.access:<3} {st:<5} {d.host:<15} {d.description}")
     up = sum(1 for v in state.values() if v)
-    return (f"NAME                     PLATFORM       ACC STATE MGMT-IP         DESCRIPTION\n"
-            + "\n".join(rows)
-            + f"\n\n{up}/{len(devs)} devices reachable (SSH port, checked from the wirehand host)")
+    audit("check_devices", "", up=up, total=len(devs), shared_ips=len(shared))
+
+    out = ("NAME                     PLATFORM       ACC STATE MGMT-IP         DESCRIPTION\n"
+           + "\n".join(rows)
+           + f"\n\n{up}/{len(devs)} devices answered on the SSH port "
+             "(checked from the wirehand host; this tests the network path, not the credentials).")
+    if shared:
+        groups = "; ".join(f"{h} -> {', '.join(sorted(n))}" for h, n in sorted(shared.items()))
+        out += (
+            "\n\nWARNING - ambiguous results, marked 'up?':\n"
+            f"These devices share a management IP: {groups}\n"
+            "containerlab gives every lab the same default management subnet "
+            "(172.20.20.0/24), so nodes of different labs can end up with identical IPs. "
+            "A reachable IP may therefore belong to a DIFFERENT lab than the name suggests, "
+            "and a node shown as 'up?' may in fact be down. Tell the user: give each lab its "
+            "own subnet in its .clab.yml, e.g.\n"
+            "  mgmt:\n"
+            "    network: clab-<labname>\n"
+            "    ipv4-subnet: 172.20.30.0/24\n"
+            "and remove stale lab folders of labs that are no longer deployed "
+            "(destroy with --cleanup)."
+        )
+    return out
 
 
 @app.get("/get_facts", operation_id="get_facts", response_class=PlainTextResponse,
@@ -138,6 +174,9 @@ def get_facts(device: str = Query(..., description="Device name from list_device
     cmds = platforms.FACTS.get(dev.family, ["show version"])
     try:
         res = pool.run(dev, cmds)
+    except AuthError as exc:
+        audit("auth_failed", dev.name)
+        raise HTTPException(401, str(exc))
     except RuntimeError as exc:
         raise HTTPException(502, str(exc))
     audit("get_facts", dev.name)
@@ -178,8 +217,13 @@ def run_read(
         dev = _device(name)
         try:
             res = pool.run(dev, cmds)
+        except AuthError as exc:
+            audit("auth_failed", dev.name, commands=cmds)
+            out.append(f"=== {dev.name} ===\n[{exc}]\n")
+            continue
         except RuntimeError as exc:
-            out.append(f"=== {dev.name} ===\n[connection error: {exc}]\n")
+            out.append(f"=== {dev.name} ===\n[connection error - device unreachable or not "
+                       f"responding: {exc}. Verify with list_devices(check=true) before retrying.]\n")
             audit("run_read_error", dev.name, commands=cmds, error=str(exc))
             continue
         audit("run_read", dev.name, commands=cmds, filter=filter)
@@ -241,6 +285,9 @@ def propose_change(body: ProposeIn) -> str:
     snap_cmd = platforms.SNAPSHOT.get(dev.family)
     try:
         snapshot = pool.run(dev, [snap_cmd])[0][1] if snap_cmd else "(linux: no config snapshot; per-file backups are your responsibility - include them in the change, e.g. 'sudo cp /etc/x /etc/x.bak')"
+    except AuthError as exc:
+        audit("auth_failed", dev.name)
+        raise HTTPException(401, str(exc))
     except RuntimeError as exc:
         raise HTTPException(502, str(exc))
     snap_path = changes.save_snapshot(dev.name, snapshot)
@@ -285,6 +332,9 @@ def confirm_change(code: str = Query(..., min_length=6, max_length=6, descriptio
             out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120))
         else:
             out = pool.configure(dev, pc.lines, commit=platforms.COMMITS.get(dev.family, False))
+    except AuthError as exc:
+        audit("auth_failed", dev.name, code=code)
+        raise HTTPException(401, str(exc))
     except Exception as exc:
         audit("confirm_change_error", dev.name, code=code, error=str(exc))
         raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. Snapshot {pc.snapshot_path} is available for rollback.")
@@ -312,6 +362,9 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
     if cmds:
         try:
             res = pool.run(dev, cmds, timeout=120)
+        except AuthError as exc:
+            audit("auth_failed", dev.name)
+            raise HTTPException(401, str(exc))
         except RuntimeError as exc:
             raise HTTPException(502, str(exc))
         audit("rollback", dev.name, native=True)

@@ -13,6 +13,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
+
+class AuthError(RuntimeError):
+    """Credentials rejected by the device. Terminal - retrying cannot help."""
+
 from .inventory import Device
 
 log = logging.getLogger("wirehand.transport")
@@ -77,6 +81,8 @@ class Pool:
             for cmd in commands:
                 try:
                     out = conn.send_command(cmd, read_timeout=timeout, strip_command=True)
+                except AuthError:
+                    raise          # credentials are wrong; a retry cannot fix that
                 except Exception as first_exc:
                     # Pooled sessions can be half-dead (device-side idle timeout kills the
                     # TCP session, is_alive() does not notice). Reconnect and retry ONCE -
@@ -137,7 +143,15 @@ class Pool:
             return s.open()
         except NetmikoAuthenticationException as exc:
             s.close()
-            raise RuntimeError(f"authentication failed for {s.device.name}") from exc
+            raise AuthError(
+                f"AUTHENTICATION FAILED for '{s.device.name}' ({s.device.device_type}, user "
+                f"'{s.device.username}'). The device rejected the stored credentials. This is "
+                f"FINAL: do not retry this device, do not try other commands or tools on it. "
+                f"Tell the user that the credentials for '{s.device.name}' must be corrected "
+                f"server-side (config/inventory.yaml or the containerlab credential override for "
+                f"that kind, then `docker compose up -d`). Continue with other devices if the "
+                f"task involves several."
+            ) from exc
         except NetmikoTimeoutException as exc:
             s.close()
             raise RuntimeError(f"connection timeout to {s.device.name}") from exc

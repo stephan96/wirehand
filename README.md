@@ -8,7 +8,7 @@ approval - apply configuration changes. It is a small FastAPI service that prese
 handful of well-described tools via OpenAPI; any front-end that speaks "OpenAPI tool
 server" can use it.
 
-**Version:** 0.3.0
+**Version:** 0.3.6
 
 ## How it works
 
@@ -63,7 +63,7 @@ it is mounted read-only into the container.
 
 | Tool | Type | What it does |
 |---|---|---|
-| `list_devices(refresh)` | read | Device names, platform, access level, mgmt IP. `refresh=true` forces a rescan. |
+| `list_devices(refresh, check)` | read | Device names, platform, access level, mgmt IP. `refresh=true` forces a rescan; `check=true` adds a STATE column (up / DOWN / `up?`) by TCP-probing each SSH port from the wirehand host. |
 | `get_facts(device)` | read | One-call overview bundle (version, interfaces, routing summary, neighbors, recent log) - the intended first step of an analysis. |
 | `run_read(device, commands, filter, context)` | read | Arbitrary read-only commands. `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
 | `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char code. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
@@ -279,6 +279,29 @@ line, greppable and jq-able.
 status, device count, pending changes) and `GET /pending` (Bearer auth; currently staged
 changes with age).
 
+## Reachability check and overlapping lab subnets
+
+`list_devices(check=true)` opens a TCP connection to each device's SSH port (2 s timeout,
+`WIREHAND_CHECK_TIMEOUT`, all devices in parallel). It verifies the network path and a
+listening sshd - **not** credentials: a device can show `up` and still fail the login.
+
+containerlab puts every lab on the same default management subnet (`172.20.20.0/24`)
+unless told otherwise, so two labs can legitimately contain the same management IP - and
+stale `clab-*` folders from labs destroyed without `--cleanup` keep such entries alive in
+discovery. A TCP probe cannot tell which lab answered. wirehand therefore marks every
+device whose management IP is shared with another device as `up?` and appends a warning
+naming the colliding entries.
+
+To get unambiguous results, give each lab its own subnet in its `.clab.yml`:
+
+```yaml
+mgmt:
+  network: clab-<labname>
+  ipv4-subnet: 172.20.30.0/24      # one distinct /24 per lab
+```
+
+and destroy unused labs with `--cleanup` so their generated folders disappear.
+
 ## Platform behavior for changes
 
 | Family | Change path | Rollback |
@@ -321,6 +344,7 @@ skipped with a log line (`docker logs wirehand`).
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
 | Ubuntu2/local host unreachable | sshd not listening on the address used | with host networking use `host: 127.0.0.1` |
 | Change fails with prompt/timeout errors | wrong Netmiko driver for the platform | check `kinds:` mapping (VRP5 vs VRP8 is the classic) |
+| `AUTHENTICATION FAILED` (HTTP 401) | stored credentials rejected by the device | fix them server-side: `config/inventory.yaml` (manual device) or `containerlab.credentials` for that kind, then `docker compose up -d`. The tool never retries auth failures - they are terminal by design. |
 
 ## Tests
 
