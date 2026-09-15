@@ -17,14 +17,43 @@ server, and every change is staged, human-approved, snapshotted and audited.
 
 ## How it works
 
+![wirehand high-level view](wirehand_high_level_view_v0.1.png)
+
+The same picture as text:
+
 ```
-Browser (Open WebUI chat)                    wirehand container            Devices
-        |                                            |                           |
-        |--- tool call: run_read(device, cmds) ----->|                           |
-        |                                            |--- SSH (Netmiko) -------->|
-        |                                            |<-- command output --------|
-        |<-- plain text output ----------------------|                           |
+  LLM & Orchestration                  Tool Server                       Target Devices
+
++----------------------+      +----------------------------+       +------------------------+
+| Linux                |      | Linux VM                   |       |                        |
+|                      |      |                            |       | +--------------------+ |
+| +------------------+ |      | +------------------------+ |   +---->| Cisco IOS XR       | |
+| | Open WebUI       | |      | | wirehand (container)   | |   |   | | (container)        | |
+| | (container)      | |      | |                        | |   |   | +--------------------+ |
+| |  +------------+  | |      | |  +------------------+  | |   +---->| Huawei VRP         | |
+| |  |Integrations|<-----http----->| FastAPI/OpenAPI  |  | |   |   | | (container)        | |
+| |  |  -> Tools  |  | |      | |  |   Tool Server    |  | |   |   | +--------------------+ |
+| |  +------------+  | |      | |  +--+---------------+  | |   +---->| Fortigate          | |
+| +------------------+ |      | |     :                  | |   |   | | (KVM / container)  | |
+| | ollama           | |      | |     :..> Inventory     | |   |   | +--------------------+ |
+| |  +------------+  | |      | |     :..> Permissions   | |   +---->| Linux              | |
+| |  | local LLM  |  | |      | |     :..> Credentials   | |   |   | |                    | |
+| |  +------------+  | |      | |     '..> Netmiko -ssh--------+   | +--------------------+ |
+| +------------------+ |      | |                        | |   '---->| to be continued... | |
+|                      |      | +------------------------+ |       | |                    | |
+|                      |      |                            |       | +--------------------+ |
+|                      |      |                            |       |                        |
++----------------------+      +----------------------------+       +------------------------+
 ```
+
+1. **LLM & Orchestration:** the user chats in Open WebUI; the model (here a local LLM
+   served by ollama) decides to call a wirehand tool, which Open WebUI sends over HTTP.
+2. **Tool Server:** wirehand's FastAPI/OpenAPI server resolves the device name via the
+   inventory, checks permissions (access level, read-only command rules), looks up the
+   credentials server-side, and hands the commands to Netmiko.
+3. **Target Devices:** Netmiko runs the commands over SSH on the device - lab nodes
+   (containers or VMs) or physical/Linux hosts - and the output travels back as plain
+   text to the chat.
 
 ### The tools, in the order a session uses them
 
