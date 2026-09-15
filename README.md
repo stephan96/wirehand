@@ -2,13 +2,18 @@
 
 *A hand on the wires - with a glove on.*
 
-wirehand (formerly netops-tool) lets an LLM front-end (Open WebUI, Onyx) work on real network devices and
-Linux servers over SSH: run show commands, analyze the output, and - with explicit human
-approval - apply configuration changes. It is a small FastAPI service that presents a
-handful of well-described tools via OpenAPI; any front-end that speaks "OpenAPI tool
-server" can use it.
-
 **Version:** 0.3.6
+
+## Summary
+
+wirehand lets an LLM front-end (Open WebUI, Onyx) work on real network devices and Linux
+servers over SSH: run show commands, analyze the output, and - with explicit human
+approval - apply configuration changes.
+
+It is a small FastAPI service that presents a handful of well-described tools via
+OpenAPI; any front-end that speaks "OpenAPI tool server" can use it. Devices come from
+containerlab auto-discovery and/or a manual inventory file, credentials stay on the
+server, and every change is staged, human-approved, snapshotted and audited.
 
 ## How it works
 
@@ -21,45 +26,7 @@ Browser (Open WebUI chat)                    wirehand container            Devic
         |<-- plain text output ----------------------|                           |
 ```
 
-Key properties:
-
-- **Credentials never reach the LLM.** The model only knows device *names*. Hostnames,
-  IPs, users and passwords live server-side (inventory file + environment variables).
-- **Reading is always safe.** `run_read` refuses write/privileged commands (configure,
-  commit, rm, sudo, redirection, pipes into interpreters) no matter what the model asks.
-- **Writing is two-stage and human-gated.** `propose_change` only *stages* a change and
-  returns a confirmation code. Nothing touches the device until a human approves the code
-  in the chat and the model calls `confirm_change` with it. Codes are single-use and
-  expire after 10 minutes.
-- **Everything is logged.** Every tool call lands in an append-only audit log; every
-  proposed change first saves a configuration snapshot (see "Audit log & snapshots").
-
-## Where devices come from
-
-Two sources, merged at runtime; both can be used at the same time:
-
-1. **containerlab auto-discovery.** Point `WIREHAND_CLAB_DIR` at the folder that holds your
-   containerlab topologies (e.g. `/home/stephan/containerlabs`). For every *deployed* lab,
-   containerlab generates a `clab-<lab>/ansible-inventory.yml` with node kind, management
-   IP and default credentials - wirehand scans these recursively. Nodes appear under
-   the name `<lab>-<node>` (e.g. `xrd-test-xrd1`) and disappear automatically when the lab
-   is destroyed, because destroying a lab removes the generated folder.
-2. **Manual entries** in `config/inventory.yaml` under `devices:` - for anything that is
-   not a lab node (the containerlab host itself, physical routers, servers). A manual
-   entry with the same name as a discovered node overrides it, which is also the way to
-   pin different credentials or a different access level for a single lab node.
-
-Both sources are re-checked every 30 s (`WIREHAND_CLAB_RESCAN`) using file modification
-times, so deploying/destroying a lab or editing `inventory.yaml` shows up without a
-restart. To force an immediate reload, ask the model to call `list_devices` with
-`refresh=true`. Only `.env` changes require a container recreate (`docker compose up -d`),
-because environment variables are fixed when a container starts - that is a Docker
-property, not a tool limitation.
-
-The file `config/inventory.yaml` is **never written by the tool** - it is your file, and
-it is mounted read-only into the container.
-
-## The tools, in the order a session uses them
+### The tools, in the order a session uses them
 
 | Tool | Type | What it does |
 |---|---|---|
@@ -74,6 +41,19 @@ it is mounted read-only into the container.
 Output of every tool is plain text (small local models handle text much better than
 JSON) and capped at ~20k tokens (`WIREHAND_MAX_OUTPUT_CHARS`); truncation is marked in the
 output together with the hint to use `filter`.
+
+## Key properties
+
+- **Credentials never reach the LLM.** The model only knows device *names*. Hostnames,
+  IPs, users and passwords live server-side (inventory file + environment variables).
+- **Reading is always safe.** `run_read` refuses write/privileged commands (configure,
+  commit, rm, sudo, redirection, pipes into interpreters) no matter what the model asks.
+- **Writing is two-stage and human-gated.** `propose_change` only *stages* a change and
+  returns a confirmation code. Nothing touches the device until a human approves the code
+  in the chat and the model calls `confirm_change` with it. Codes are single-use and
+  expire after 10 minutes.
+- **Everything is logged.** Every tool call lands in an append-only audit log; every
+  proposed change first saves a configuration snapshot (see "Audit log & snapshots").
 
 ## Installation
 
@@ -111,29 +91,7 @@ normally-bridged container cannot reach the containerlab management bridge
 directly on the host and the local machine is reachable from inside the container as
 `127.0.0.1`.
 
-### Migrating from netops-tool (<= 0.2.x)
-
-The rename changes the image, container, volume and all `NETOPS_*` environment variables
-(now `WIREHAND_*`). Your audit log and snapshots live in the old volume and can be carried
-over:
-
-```bash
-cd ~/docker/netops-tool && docker compose down
-cd ~/docker && tar xzf wirehand-0.3.0.tar.gz && cd wirehand
-cp ../netops-tool/.env .   && sed -i 's/NETOPS_/WIREHAND_/g' .env
-cp ../netops-tool/config/inventory.yaml config/
-docker volume create wirehand_wirehand_data
-docker run --rm -v netops-tool_netops_data:/from -v wirehand_wirehand_data:/to \
-  alpine sh -c "cp -a /from/. /to/"
-UID=$(id -u) GID=$(id -g) docker compose up -d --build
-curl -s http://localhost:8110/openapi.json | grep -o '"version": *"[^"]*"'
-# after verifying: docker volume rm netops-tool_netops_data; rm -rf ~/docker/netops-tool
-```
-
-In Open WebUI, re-add (or toggle) the tool-server entry so the cached spec updates -
-port and API key are unchanged, so the URL stays the same.
-
-### Updating to a new version
+## Updating to a new version
 
 ```bash
 tar xzf wirehand-<version>.tar.gz -C ~/docker    # safe: .env and config/inventory.yaml are NOT in the archive (only *.example files)
@@ -237,6 +195,84 @@ auth header `Authorization: Bearer <key>`, attach the action to an Agent. If Ony
 Docker on another host, its `api_server` and `background` containers need
 `extra_hosts: ["host.docker.internal:host-gateway"]` to resolve host-mapped services.
 
+## Where devices come from
+
+Two sources, merged at runtime; both can be used at the same time:
+
+1. **containerlab auto-discovery.** Point `WIREHAND_CLAB_DIR` at the folder that holds your
+   containerlab topologies (e.g. `/home/stephan/containerlabs`). For every *deployed* lab,
+   containerlab generates a `clab-<lab>/ansible-inventory.yml` with node kind, management
+   IP and default credentials - wirehand scans these recursively. Nodes appear under
+   the name `<lab>-<node>` (e.g. `xrd-test-xrd1`) and disappear automatically when the lab
+   is destroyed, because destroying a lab removes the generated folder.
+2. **Manual entries** in `config/inventory.yaml` under `devices:` - for anything that is
+   not a lab node (the containerlab host itself, physical routers, servers). A manual
+   entry with the same name as a discovered node overrides it, which is also the way to
+   pin different credentials or a different access level for a single lab node.
+
+Both sources are re-checked every 30 s (`WIREHAND_CLAB_RESCAN`) using file modification
+times, so deploying/destroying a lab or editing `inventory.yaml` shows up without a
+restart. To force an immediate reload, ask the model to call `list_devices` with
+`refresh=true`. Only `.env` changes require a container recreate (`docker compose up -d`),
+because environment variables are fixed when a container starts - that is a Docker
+property, not a tool limitation.
+
+The file `config/inventory.yaml` is **never written by the tool** - it is your file, and
+it is mounted read-only into the container.
+
+## containerlab kind mapping (built in)
+
+| clab kind | Netmiko driver | default creds |
+|---|---|---|
+| cisco_xrd, cisco_xrv9k | cisco_xr | clab / clab@123 |
+| cisco_iol | cisco_ios | admin / admin |
+| cisco_csr1000v, c8000v, cat9kv | cisco_xe | - |
+| cisco_n9kv | cisco_nxos | - |
+| huawei_vrp | huawei_vrpv8 | admin / admin |
+| fortinet_fortigate | fortinet | admin / admin |
+| arista_ceos / veos | arista_eos | admin / admin |
+| juniper_vjunos*, vmx, vsrx | juniper_junos | - |
+| linux, sonic-vs, generic_vm | linux | clab / clab@123 |
+
+Precedence: `containerlab.credentials` in inventory.yaml > generated
+`ansible_user`/`ansible_password` > the built-in defaults above. Unmapped kinds are
+skipped with a log line (`docker logs wirehand`).
+
+## Reachability check and overlapping lab subnets
+
+`list_devices(check=true)` opens a TCP connection to each device's SSH port (2 s timeout,
+`WIREHAND_CHECK_TIMEOUT`, all devices in parallel). It verifies the network path and a
+listening sshd - **not** credentials: a device can show `up` and still fail the login.
+
+containerlab puts every lab on the same default management subnet (`172.20.20.0/24`)
+unless told otherwise, so two labs can legitimately contain the same management IP - and
+stale `clab-*` folders from labs destroyed without `--cleanup` keep such entries alive in
+discovery. A TCP probe cannot tell which lab answered. wirehand therefore marks every
+device whose management IP is shared with another device as `up?` and appends a warning
+naming the colliding entries.
+
+To get unambiguous results, give each lab its own subnet in its `.clab.yml`:
+
+```yaml
+mgmt:
+  network: clab-<labname>
+  ipv4-subnet: 172.20.30.0/24      # one distinct /24 per lab
+```
+
+and destroy unused labs with `--cleanup` so their generated folders disappear.
+
+## Platform behavior for changes
+
+| Family | Change path | Rollback |
+|---|---|---|
+| cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`) |
+| cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot only -> corrective change |
+| fortinet | config-set (persists immediately) | snapshot only |
+| linux | commands run sequentially as the login user | none - include backups in the change (`sudo cp x x.bak`) |
+
+`mode='exec'` runs in user/exec view on all platforms, commits nothing, and states that
+in its response.
+
 ## Audit log & snapshots
 
 Everything lives in the named volume `wirehand_data` (`/app/data` inside the container):
@@ -279,66 +315,13 @@ line, greppable and jq-able.
 status, device count, pending changes) and `GET /pending` (Bearer auth; currently staged
 changes with age).
 
-## Reachability check and overlapping lab subnets
-
-`list_devices(check=true)` opens a TCP connection to each device's SSH port (2 s timeout,
-`WIREHAND_CHECK_TIMEOUT`, all devices in parallel). It verifies the network path and a
-listening sshd - **not** credentials: a device can show `up` and still fail the login.
-
-containerlab puts every lab on the same default management subnet (`172.20.20.0/24`)
-unless told otherwise, so two labs can legitimately contain the same management IP - and
-stale `clab-*` folders from labs destroyed without `--cleanup` keep such entries alive in
-discovery. A TCP probe cannot tell which lab answered. wirehand therefore marks every
-device whose management IP is shared with another device as `up?` and appends a warning
-naming the colliding entries.
-
-To get unambiguous results, give each lab its own subnet in its `.clab.yml`:
-
-```yaml
-mgmt:
-  network: clab-<labname>
-  ipv4-subnet: 172.20.30.0/24      # one distinct /24 per lab
-```
-
-and destroy unused labs with `--cleanup` so their generated folders disappear.
-
-## Platform behavior for changes
-
-| Family | Change path | Rollback |
-|---|---|---|
-| cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`) |
-| cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot only -> corrective change |
-| fortinet | config-set (persists immediately) | snapshot only |
-| linux | commands run sequentially as the login user | none - include backups in the change (`sudo cp x x.bak`) |
-
-`mode='exec'` runs in user/exec view on all platforms, commits nothing, and states that
-in its response.
-
-## containerlab kind mapping (built in)
-
-| clab kind | Netmiko driver | default creds |
-|---|---|---|
-| cisco_xrd, cisco_xrv9k | cisco_xr | clab / clab@123 |
-| cisco_iol | cisco_ios | admin / admin |
-| cisco_csr1000v, c8000v, cat9kv | cisco_xe | - |
-| cisco_n9kv | cisco_nxos | - |
-| huawei_vrp | huawei_vrpv8 | admin / admin |
-| fortinet_fortigate | fortinet | admin / admin |
-| arista_ceos / veos | arista_eos | admin / admin |
-| juniper_vjunos*, vmx, vsrx | juniper_junos | - |
-| linux, sonic-vs, generic_vm | linux | clab / clab@123 |
-
-Precedence: `containerlab.credentials` in inventory.yaml > generated
-`ansible_user`/`ansible_password` > the built-in defaults above. Unmapped kinds are
-skipped with a log line (`docker logs wirehand`).
-
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `PermissionError ... inventory.yaml` at startup | container uid != owner of the 600-file | rebuild with `UID=$(id -u) GID=$(id -g)`; once: `docker volume rm wirehand_wirehand_data` |
 | `env var 'X' which is not set` | dotenv syntax (spaces, `#` in value) or `.env` edited without recreate | fix syntax; `docker compose up -d` (not `restart`) |
-| Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | included since 0.2.2; check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
+| Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
 | Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
@@ -359,10 +342,79 @@ given LLM drives these tools - run it after every model or prompt change.
 
 ## Design rules (why it looks the way it does)
 
-Few tools with flat string arguments, plain-text responses, worked examples inside the
-tool descriptions, an output cap with an explicit truncation marker - all of this exists
-because the primary consumer is a small local model. Every rule removes a failure mode
-observed in practice: wrong tool choice, dropped arguments, hallucinated command output,
-or a context window silently swallowed by an unfiltered running-config. The single
-uvicorn worker is also deliberate: pending change codes and the SSH session pool are
-in-process state.
+Some of wirehand's choices may look unusual or even old-fashioned. They are deliberate.
+This section explains them without assuming background in AI or operations tooling.
+
+### Who is actually using the tools
+
+wirehand is not operated by a person clicking buttons. It is operated by a *language
+model* (an LLM - the AI behind a chat interface like Open WebUI). When you ask in the chat
+"is OSPF up on router r1?", the model decides on its own which wirehand *tool* to call
+(a tool is simply a function the model is allowed to use, such as `run_read`), fills in
+the arguments, reads the result, and writes you an answer.
+
+The expected model is often a **small model running locally** - on your own hardware,
+so no device data leaves your network. Small models are useful but make mistakes large
+cloud models rarely make. Each rule below exists because one of these mistakes was
+observed in practice.
+
+### The rules, and the problem each one solves
+
+**1. Few tools, each with a clear job.**
+With twenty similar-sounding tools, a small model regularly picks the wrong one. wirehand
+has seven, and their names say what they do (`list_devices`, `run_read`,
+`propose_change`, ...). Fewer choices mean fewer wrong choices.
+
+**2. Simple arguments - mostly plain text.**
+Tools take a few simple values: a device name, a block of commands as text, a yes/no
+flag. There are no nested structures (lists inside objects inside lists). Small models
+often drop or garble fields in complex structures, and a missing field means a failed
+call. Example: `commands` is one string with one command per line, not a list of
+command objects.
+
+**3. Answers are plain text, not JSON.**
+JSON is a structured data format that programs love and small models struggle with -
+they misread nesting or lose track of which value belongs where. Device output is text
+anyway (`show ip route` prints text), so wirehand passes it on as text, the same way a
+human would see it in a terminal.
+
+**4. Worked examples inside every tool description.**
+The model learns how to use a tool only from its description. A sentence like "config
+lines to apply" leaves room for guessing; a concrete example such as
+`propose_change(device='r1', config='interface Loopback10 ...', reason='add test loopback')`
+does not. Models copy patterns very reliably, so the descriptions show the pattern.
+
+**5. An output limit with a visible "truncated" note.**
+A model can only keep a limited amount of text in view at once (its *context window*,
+a kind of short-term memory). A full router configuration can be larger than that. If
+the text simply got cut off silently, the model would reason about half a config
+without knowing it - or forget your original question. wirehand therefore caps each
+answer (about 80,000 characters, `WIREHAND_MAX_OUTPUT_CHARS`) and, when it cuts, says
+so explicitly and suggests using `filter` to fetch only the relevant lines.
+
+**6. The model cannot pretend.**
+A known weakness of LLMs is *hallucination*: confidently inventing an answer, including
+fake command output that looks real. wirehand cannot fully prevent that, but it makes it
+detectable: every real command goes through a tool call and lands in the audit log, and
+the recommended system prompt tells the model to base findings on tool output only. If
+the chat claims something ran and the audit log has no entry, it did not run.
+
+**7. Safety is enforced by the server, not by trusting the model.**
+Instructions to a model are requests, not guarantees. So the rules that really matter
+are enforced in wirehand's own code, where the model cannot talk its way around them:
+the model never sees passwords, reading refuses anything that could change a device,
+and changes need a code that a human must approve. See "Key properties".
+
+**8. Exactly one server process.**
+Web services are often run as several parallel copies (*workers*) for speed. wirehand
+deliberately runs a single one. The confirmation codes of changes waiting for approval,
+and the open SSH connections to devices, are kept in that process's memory. With two
+copies, a change could be proposed in one and confirmed in the other, which would not
+know the code - approval would fail at random. For a tool used by a few people through
+a chat, one process is fast enough.
+
+### The short version
+
+Every rule trades a little elegance for reliability: keep the model's choices few, its
+inputs simple, its outputs readable and bounded - and never rely on the model for
+anything that must not go wrong.
