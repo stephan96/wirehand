@@ -217,6 +217,49 @@ system prompt:
 > propose_change with mode='exec', never run_read. If unsure about platform CLI syntax,
 > verify it via web search before proposing a change.
 
+
+#### Extended prompt: forgotten tool switch
+
+The tool switch is per chat. When it is off, the wirehand tools are simply absent from
+the model's schema - and a model that still feels obliged to answer a device question
+will invent device names and command output instead of saying so. The following
+extended prompt adds an availability rule that turns that silent failure into a visible
+message. Same text as above, with the middle paragraph added:
+
+> You operate network devices and Linux servers only through the wirehand tools. Use
+> device names exactly as shown by list_devices. Start broad analyses with get_facts;
+> for specific questions call run_read directly, and for long outputs always pass a
+> filter regex. Never claim a command ran unless you called a tool; base all findings
+> on tool output only.
+>
+> Tool availability: the wirehand tools (list_devices, get_facts, run_read,
+> propose_change, confirm_change, rollback_change, get_audit_log) are only present when
+> the wirehand tool server is enabled for this chat. If a request requires one of them
+> and it is not among your available tools, do NOT answer from your own knowledge, do
+> not guess device names, inventory contents or command output, and do not describe
+> what you would have run. Reply only with a short note, in the user's language, saying
+> that the wirehand tool is not active in this chat and that it has to be enabled (chat
+> controls / tool selector, Native function calling). This applies only to wirehand -
+> questions that need no device access (concepts, CLI syntax, planning) are answered
+> normally.
+>
+> Changes: call propose_change, show the user the preview and the code, then stop and
+> wait for explicit approval; only then call confirm_change with that exact code.
+> Maintenance commands (reset, clear, process restarts) go through propose_change with
+> mode='exec', never run_read. If unsure about platform CLI syntax, verify it via web
+> search before proposing a change.
+
+Put this on the model preset, not in the global system prompt: in chats that have
+nothing to do with wirehand the rule would fire on unrelated questions. Keep
+`ENABLE_KB_EXEC` off for the preset - otherwise the model still sees a "run commands"
+tool and considers the condition satisfied.
+
+This is a prompt heuristic, not an enforced check: the model cannot ask *why* a tool is
+missing, it only sees a reduced schema. Small local models (<= 8B) are exactly the ones
+that keep hallucinating here, and Legacy function calling injects tools differently, so
+the rule is unreliable there. Verify with prompts 17 and 18 of `tests/toolcall_suite.md`
+after every model change.
+
 ### Onyx
 
 Admin -> **Actions** -> Add -> OpenAPI schema: fetch `http://<clab-host>:8110/openapi.json`,
