@@ -89,6 +89,31 @@ output together with the hint to use `filter`.
 Requirements: Docker + Compose on the machine that can reach your devices - for
 containerlab that is the clab host itself.
 
+### Quick start (git clone)
+
+```bash
+mkdir -p ~/docker && cd ~/docker
+git clone https://github.com/stephan96/wirehand.git    # creates ~/docker/wirehand
+cd wirehand
+
+cp .env.example .env
+cp config/inventory.yaml.example config/inventory.yaml
+$EDITOR .env                    # at least WIREHAND_API_KEY and WIREHAND_CLAB_DIR
+$EDITOR config/inventory.yaml   # replace the example device with your own (or remove it)
+chmod 600 .env config/inventory.yaml
+
+UID=$(id -u) GID=$(id -g) docker compose up -d --build
+curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
+     http://localhost:8110/list_devices
+```
+
+`.env` and `config/inventory.yaml` are listed in `.gitignore`, so a later `git pull`
+never overwrites them.
+
+### Development install (tarball)
+
+Use this when working with a local build that is not (yet) pushed to GitHub.
+
 ```bash
 tar xzf wirehand-<version>.tar.gz -C ~/docker    # creates/overwrites ~/docker/wirehand
 cd ~/docker/wirehand
