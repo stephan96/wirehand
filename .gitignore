@@ -2,3 +2,4 @@
 config/keys/
 data/
 __pycache__/
+.env.*
