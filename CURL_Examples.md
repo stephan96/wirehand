@@ -75,6 +75,23 @@ curl -s -i -H "$AUTH" --get \
   --data-urlencode "device=ubuntu2" \
   --data-urlencode "commands=systemctl restart nginx" \
   $WH/run_read | head -1
+
+# Linux devices are allow-list only: these are all HTTP 403, even though no
+# blocklist entry names them
+for c in "touch /tmp/x" "cp /etc/passwd /tmp/x" "find /tmp -name x -delete" \
+         "awk 'BEGIN{system(\"id\")}'" "wget http://example.com" "ethtool -s eth0 speed 100"; do
+  printf '%-40s -> ' "$c"
+  curl -s -o /dev/null -w '%{http_code}\n' -H "$AUTH" --get \
+    --data-urlencode "device=ubuntu2" --data-urlencode "commands=$c" $WH/run_read
+done
+
+# network CLIs keep working (vendor read verbs are not enumerable) ...
+curl -s -H "$AUTH" --get --data-urlencode "device=xrd-test-xrd1" \
+  --data-urlencode "commands=ping 8.8.8.8 count 5" $WH/run_read
+
+# ... but cannot escape the read-only exec view -> 403
+curl -s -i -H "$AUTH" --get --data-urlencode "device=xrd-test-xrd1" \
+  --data-urlencode "commands=show running-config | file /tmp/x" $WH/run_read | head -1
 ```
 
 ## 4. propose_change - stage a change (applies nothing)
@@ -143,14 +160,21 @@ curl -s -i -H "$AUTH" -H "Content-Type: application/json" -X POST $WH/propose_ch
   -d '{"device":"<a ro device>","config":"interface Loopback11"}' | head -1
 ```
 
-## 6. rollback_change - undo the last change
+## 6. rollback_change - stage an undo of the last change
+
+Like propose_change, this applies nothing: on IOS-XR / VRPv8 / Junos it stages the native
+rollback and returns a code, which confirm_change then applies.
 
 ```bash
 curl -s -H "$AUTH" -X POST "$WH/rollback_change?device=xrd-test-xrd1"
+# STAGED, NOT APPLIED. Confirmation code: 3C19B4 ...
+
+curl -s -H "$AUTH" -X POST "$WH/confirm_change?code=3C19B4"
+# ROLLED BACK on xrd-test-xrd1 (code 3C19B4). ...
 ```
 
-IOS-XR / VRPv8 / Junos perform a native rollback; other platforms return the pre-change
-snapshot for a manual corrective change.
+Platforms without a native rollback (IOS/NX-OS/EOS/VRP5/FortiGate/Linux) touch nothing and
+return the pre-change snapshot for a manual corrective change - no code involved.
 
 ## 7. get_audit_log - what happened
 

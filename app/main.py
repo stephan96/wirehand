@@ -8,8 +8,10 @@ OpenAPI schema). Auth: `Authorization: Bearer <WIREHAND_API_KEY>`.
 
 Design rules (see README):
   * few tools, flat string arguments, plain-text responses
-  * read path is always safe: blocklist + no privilege escalation
-  * writes are two-stage (propose_change -> human approval -> confirm_change)
+  * read path is always safe: hard refusals + blocklist, allow-list only on
+    shell-like (Linux) devices, no privilege escalation
+  * every write is two-stage (propose_change / rollback_change -> human
+    approval -> confirm_change)
   * output capped (~20k tokens) with server-side regex filter
 """
 from __future__ import annotations
@@ -52,7 +54,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.3.8",
+    version="0.4.0",
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
@@ -188,7 +190,9 @@ def get_facts(device: str = Query(..., description="Device name from list_device
          description=(
              "Executes commands in exec mode and returns the raw output. Safe to call repeatedly. "
              "Write commands (configure, commit, rm, systemctl restart, sudo, ...) are refused here - "
-             "use propose_change for those. "
+             "use propose_change for those. On Linux devices only known read-only commands run at all "
+             "(cat, grep, ls, ip, ss, systemctl status, journalctl, docker ps, ...); anything else is "
+             "refused even if it looks harmless, so do not try to work around it - use propose_change. "
              "Put several commands on separate lines or separate them with ';'. "
              "Several devices: comma-separated names. "
              "For long outputs (show running-config, large logs) ALWAYS set filter to a regex so "
@@ -208,13 +212,21 @@ def run_read(
     cmds = split_commands(commands)
     if not cmds:
         raise HTTPException(400, "no commands given")
-    refused = [(c, v.reason) for c in cmds if not (v := check_read_command(c)).allowed]
+    names = [n.strip() for n in device.split(",") if n.strip()]
+    if not names:
+        raise HTTPException(400, "no device given")
+    # Resolve every device BEFORE running anything: an unknown name in a list
+    # must not leave the earlier devices already executed. What counts as a safe
+    # read depends on the platform - a Linux shell needs the strict allow-list,
+    # a vendor exec view does not - so check each command per target family.
+    devs = [_device(n) for n in names]
+    refused = [(d.name, c, v.reason) for d in devs for c in cmds
+               if not (v := check_read_command(c, d.family)).allowed]
     if refused:
-        msg = "; ".join(f"'{c}': {r}" for c, r in refused)
+        msg = "; ".join(f"{d}: '{c}': {r}" for d, c, r in refused)
         raise HTTPException(403, f"refused on read path: {msg}")
     out = []
-    for name in [n.strip() for n in device.split(",") if n.strip()]:
-        dev = _device(name)
+    for dev in devs:
         try:
             res = pool.run(dev, cmds)
         except AuthError as exc:
@@ -328,7 +340,7 @@ def confirm_change(code: str = Query(..., min_length=6, max_length=6, descriptio
     if not dev.writable:
         raise HTTPException(403, f"device '{dev.name}' is read-only (access=ro)")
     try:
-        if pc.mode == "exec":
+        if pc.mode in ("exec", "rollback"):
             out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120))
         else:
             out = pool.configure(dev, pc.lines, commit=platforms.COMMITS.get(dev.family, False))
@@ -339,6 +351,10 @@ def confirm_change(code: str = Query(..., min_length=6, max_length=6, descriptio
         audit("confirm_change_error", dev.name, code=code, error=str(exc))
         raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. Snapshot {pc.snapshot_path} is available for rollback.")
     audit("confirm_change", dev.name, code=code, lines=pc.lines, mode=pc.mode)
+    if pc.mode == "rollback":
+        return truncate(f"ROLLED BACK on {dev.name} (code {code}). The device is back to the state "
+                        f"before its last commit; the configuration from before this rollback was "
+                        f"saved as {pc.snapshot_path}.\n\n{out}", MAX_OUT)
     if pc.mode == "exec":
         return truncate(f"EXECUTED on {dev.name} (code {code}, exec mode - nothing was committed).\n\n{out}", MAX_OUT)
     rb = "native rollback available via rollback_change" if platforms.ROLLBACK_LAST.get(dev.family) else "no native rollback on this platform - rollback_change returns the snapshot for manual restore"
@@ -346,11 +362,14 @@ def confirm_change(code: str = Query(..., min_length=6, max_length=6, descriptio
 
 
 @app.post("/rollback_change", operation_id="rollback_change", response_class=PlainTextResponse,
-          summary="Undo the last applied change on a device",
+          summary="Stage an undo of the last applied change (does NOT apply it)",
           description=(
-              "On IOS-XR / Huawei VRPv8 / Junos this performs a native rollback of the last commit. "
-              "On other platforms it cannot undo automatically and instead returns the pre-change "
-              "snapshot so you can propose a corrective change. Always confirm with the user before calling. "
+              "Step 1 of 2, exactly like propose_change: on IOS-XR / Huawei VRPv8 / Junos this STAGES "
+              "a native rollback of the last commit and returns a 6-character confirmation code - "
+              "nothing is undone yet. Show the code to the user, ask for explicit approval, and only "
+              "then call confirm_change with that code. On platforms without a native rollback it "
+              "changes nothing and returns the pre-change snapshot instead, so you can derive a "
+              "corrective propose_change from it. "
               "Example: rollback_change(device='r1')"
           ), dependencies=[Depends(auth)])
 def rollback_change(device: str = Query(..., description="Device name")) -> str:
@@ -358,23 +377,37 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
     if not dev.writable:
         raise HTTPException(403, f"device '{dev.name}' is read-only (access=ro)")
     cmds = platforms.ROLLBACK_LAST.get(dev.family)
-    snap = changes.latest_snapshot(dev.name)
-    if cmds:
-        try:
-            res = pool.run(dev, cmds, timeout=120)
-        except AuthError as exc:
-            audit("auth_failed", dev.name)
-            raise HTTPException(401, str(exc))
-        except RuntimeError as exc:
-            raise HTTPException(502, str(exc))
-        audit("rollback", dev.name, native=True)
-        return _fmt(dev.name, res)
-    audit("rollback", dev.name, native=False, snapshot=str(snap))
-    if not snap:
-        return f"No native rollback on {dev.device_type} and no snapshot found for {dev.name}."
-    return truncate(
-        f"No native rollback on {dev.device_type}. Pre-change snapshot {snap.name} follows; "
-        f"derive a corrective propose_change from it.\n\n{snap.read_text()}", MAX_OUT)
+    if not cmds:
+        # No native rollback: returning the snapshot changes nothing on the device.
+        snap = changes.latest_snapshot(dev.name)
+        audit("rollback_snapshot", dev.name, snapshot=str(snap))
+        if not snap:
+            return f"No native rollback on {dev.device_type} and no snapshot found for {dev.name}."
+        return truncate(
+            f"No native rollback on {dev.device_type}. Pre-change snapshot {snap.name} follows; "
+            f"derive a corrective propose_change from it.\n\n{snap.read_text()}", MAX_OUT)
+
+    # A native rollback overwrites the running configuration - that is a write, so
+    # it goes through the same human-approved two-stage gate as any other change
+    # instead of applying on a single call.
+    snap_cmd = platforms.SNAPSHOT.get(dev.family)
+    try:
+        snapshot = pool.run(dev, [snap_cmd])[0][1] if snap_cmd else "(no config snapshot for this platform)"
+    except AuthError as exc:
+        audit("auth_failed", dev.name)
+        raise HTTPException(401, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc))
+    snap_path = changes.save_snapshot(dev.name, snapshot)
+    preview = "Rollback commands (user/exec view):\n" + "\n".join(f"  > {c}" for c in cmds)
+    pc = changes.create(dev.name, cmds, snap_path, preview, mode="rollback")
+    audit("rollback_staged", dev.name, code=pc.code, lines=cmds, snapshot=str(snap_path))
+    return (
+        f"STAGED, NOT APPLIED. Confirmation code: {pc.code}  (device {dev.name}, expires in 10 min)\n"
+        f"This undoes the last commit on {dev.name}. The configuration as it is RIGHT NOW was saved "
+        f"as {snap_path.name} first.\n\n{preview}\n\n"
+        "Ask the user to approve. Then call confirm_change(code='" + pc.code + "')."
+    )
 
 
 @app.get("/get_audit_log", operation_id="get_audit_log", response_class=PlainTextResponse,

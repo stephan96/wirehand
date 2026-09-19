@@ -47,7 +47,17 @@ assert c.post("/confirm_change", params={"code": "ZZZZZZ"}, headers=H).status_co
 a = c.post("/confirm_change", params={"code": code}, headers=H)
 assert a.status_code == 200 and "APPLIED" in a.text and main.pool.configured[0][1] == ["interface Loopback10", " description test"], a.text
 assert c.post("/confirm_change", params={"code": code}, headers=H).status_code == 404  # single use
-assert "rollback configuration last 1" in c.post("/rollback_change", params={"device": "r1"}, headers=H).text
+# rollback_change is a WRITE: it must stage like propose_change, not apply on its own
+rb = c.post("/rollback_change", params={"device": "r1"}, headers=H)
+assert rb.status_code == 200 and "STAGED, NOT APPLIED" in rb.text and "rollback configuration last 1" in rb.text, rb.text
+rb_code = rb.text.split("code: ")[1][:6]
+assert all("rollback configuration last 1" not in " ".join(lines) for _, lines, _ in main.pool.configured), main.pool.configured
+a = c.post("/confirm_change", params={"code": rb_code}, headers=H)
+assert a.status_code == 200 and "ROLLED BACK" in a.text and "rollback configuration last 1" in a.text, a.text
+assert c.post("/confirm_change", params={"code": rb_code}, headers=H).status_code == 404       # single use
+assert c.post("/rollback_change", params={"device": "s1"}, headers=H).status_code == 403       # ro device
+assert c.get("/run_read", params={"device": "s1", "commands": "touch /tmp/x"}, headers=H).status_code == 403
+assert c.get("/run_read", params={"device": "r1,nope", "commands": "show version"}, headers=H).status_code == 404
 log = c.get("/get_audit_log", headers=H).text
 assert "propose_change" in log and "confirm_change" in log
 ops = [op["operationId"] for p_ in c.get("/openapi.json").json()["paths"].values() for op in p_.values()]
