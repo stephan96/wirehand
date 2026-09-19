@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.3.6
+**Version:** 0.3.8
 
 ## Summary
 

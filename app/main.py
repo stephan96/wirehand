@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.3.6",
+    version="0.3.8",
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
