@@ -7,7 +7,9 @@
 # Front-ends on other machines use http://<this-host>:8110.
 #
 # Build with the host user's uid/gid so bind-mounted 600-files are readable:
-#   UID=$(id -u) GID=$(id -g) docker compose build
+#   docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
+# (not as a 'UID=... GID=... docker compose' prefix: bash/zsh mark UID read-only, and
+#  compose would silently fall back to the 1000 defaults below)
 # UVICORN workers MUST stay at 1: pending change codes and the SSH pool are in-process.
 
 services:

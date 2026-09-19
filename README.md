@@ -111,7 +111,8 @@ $EDITOR .env                    # at least WIREHAND_API_KEY and WIREHAND_CLAB_DI
 $EDITOR config/inventory.yaml   # replace the example device with your own (or remove it)
 chmod 600 .env config/inventory.yaml
 
-UID=$(id -u) GID=$(id -g) docker compose up -d --build
+docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
+docker compose up -d
 curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
      http://localhost:8110/list_devices
 ```
@@ -133,7 +134,7 @@ $EDITOR .env                    # see "Configuration" below
 $EDITOR config/inventory.yaml
 chmod 600 .env config/inventory.yaml
 
-UID=$(id -u) GID=$(id -g) docker compose build
+docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
 docker compose up -d
 
 # smoke test (replace the key):
@@ -142,11 +143,22 @@ curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
 docker logs wirehand | grep "device(s)"          # one line per discovered lab
 ```
 
-**Why `UID=$(id -u) GID=$(id -g)`:** bind mounts keep host ownership. A file with mode
+**Why `--build-arg APP_UID/APP_GID`:** bind mounts keep host ownership. A file with mode
 600 is only readable by its *owner*, so the user inside the container must have the same
 uid as you on the host. The build args bake your uid/gid into the image. If you skip
 this on a system where your uid is not 1000, the container dies with
 `PermissionError: ... inventory.yaml`.
+
+Do **not** pass them as a variable prefix (`UID=$(id -u) GID=$(id -g) docker compose ...`):
+bash and zsh mark `UID` read-only. The shell prints `UID: readonly variable`, the build
+then runs anyway and exits 0 with `UID` unset, compose falls back to the `${UID:-1000}`
+default - and you get an image with uid 1000. `GID` is *not* read-only and does get
+through, so the image ends up half right and the one-line error is easy to scroll past.
+
+`--build-arg` works in every shell. If you prefer a one-liner, put `env` in front
+(`env UID=$(id -u) GID=$(id -g) docker compose ...`): that sets the variables for the
+child process instead of the shell. Note that `docker compose up --build` takes no
+`--build-arg`, so building and starting are two commands.
 
 **Why `network_mode: host`:** Docker isolates bridge networks from each other, so a
 normally-bridged container cannot reach the containerlab management bridge
@@ -159,7 +171,8 @@ directly on the host and the local machine is reachable from inside the containe
 ```bash
 tar xzf wirehand-<version>.tar.gz -C ~/docker    # safe: .env and config/inventory.yaml are NOT in the archive (only *.example files)
 cd ~/docker/wirehand
-UID=$(id -u) GID=$(id -g) docker compose up -d --build
+docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
+docker compose up -d
 curl -s http://localhost:8110/openapi.json | grep -o '"version": *"[^"]*"'
 ```
 
@@ -434,7 +447,7 @@ changes with age).
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `PermissionError ... inventory.yaml` at startup | container uid != owner of the 600-file | rebuild with `UID=$(id -u) GID=$(id -g)`; once: `docker volume rm wirehand_wirehand_data` |
+| `PermissionError ... inventory.yaml` at startup | container uid != owner of the 600-file | rebuild with `docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)`; once: `docker volume rm wirehand_wirehand_data` |
 | `env var 'X' which is not set` | dotenv syntax (spaces, `#` in value) or `.env` edited without recreate | fix syntax; `docker compose up -d` (not `restart`) |
 | Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
 | Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
