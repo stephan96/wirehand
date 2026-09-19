@@ -126,3 +126,65 @@ def test_reachability_check():
     state = check_devices([up, down])
     srv.close()
     assert state == {"up": True, "down": False}
+
+
+def test_corrected_password_retires_pooled_session(monkeypatch):
+    """An auth failure must not block the device: once the inventory hands out a
+    corrected password, the next call opens a NEW session with it."""
+    from app import transport
+    from app.inventory import Device
+    from netmiko import NetmikoAuthenticationException
+    opened = []
+    class FakeConn:
+        def __init__(self, pw): self.pw = pw
+        def is_alive(self): return True
+        def send_command(self, cmd, **kw): return f"ok {cmd}"
+        def disconnect(self): pass
+        def find_prompt(self): return "#"
+    def connect(**kw):
+        opened.append(kw["password"])
+        if kw["password"] == "wrong":
+            raise NetmikoAuthenticationException("Authentication failure")
+        return FakeConn(kw["password"])
+    monkeypatch.setattr(transport, "ConnectHandler", connect)
+    pool = transport.Pool()
+
+    bad = Device(name="d", host="h", device_type="linux", username="u", password="wrong")
+    try:
+        pool.run(bad, ["uptime"])
+        assert False, "expected AuthError"
+    except transport.AuthError as exc:
+        assert "NOT permanent" in str(exc)          # message invites a retry after the fix
+        assert "FINAL" not in str(exc)
+
+    # same (still wrong) credentials -> a fresh attempt is made, not a cached refusal
+    try:
+        pool.run(bad, ["uptime"])
+        assert False, "expected AuthError"
+    except transport.AuthError:
+        pass
+    assert opened == ["wrong", "wrong"]
+
+    # inventory reload with the corrected password -> session is retired, call succeeds
+    good = Device(name="d", host="h", device_type="linux", username="u", password="right")
+    assert pool.run(good, ["uptime"]) == [("uptime", "ok uptime")]
+    assert opened == ["wrong", "wrong", "right"]
+
+
+def test_unchanged_device_keeps_pooled_session(monkeypatch):
+    """A clab rescan hands out equal-but-new Device objects every 30s; that must
+    not throw away the pooled connection."""
+    from app import transport
+    from app.inventory import Device
+    opened = []
+    class FakeConn:
+        def is_alive(self): return True
+        def send_command(self, cmd, **kw): return f"ok {cmd}"
+        def disconnect(self): pass
+        def find_prompt(self): return "#"
+    monkeypatch.setattr(transport, "ConnectHandler", lambda **kw: (opened.append(1), FakeConn())[1])
+    pool = transport.Pool()
+    kw = dict(name="d", host="h", device_type="linux", username="u", password="p")
+    pool.run(Device(**kw), ["uptime"])
+    pool.run(Device(**kw), ["uptime"])          # equal, but a different object
+    assert len(opened) == 1

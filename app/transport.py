@@ -15,9 +15,14 @@ from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeo
 
 
 class AuthError(RuntimeError):
-    """Credentials rejected by the device. Terminal - retrying cannot help."""
+    """Credentials rejected by the device.
 
-from .inventory import Device
+    Terminal for the credentials that were used: repeating the same call cannot
+    help and may lock the account. NOT terminal for the device - once the stored
+    credentials have been corrected, the device is usable again and must be
+    retried normally."""
+
+from .inventory import Device, RESCAN_SECONDS
 
 log = logging.getLogger("wirehand.transport")
 IDLE_SECONDS = int(os.environ.get("WIREHAND_IDLE_SECONDS", "300"))
@@ -56,6 +61,11 @@ class _Session:
                 pass
             self.conn = None
 
+    def matches(self, device: Device) -> bool:
+        """True if `device` would connect exactly like this session does.
+        Covers host, port, username, password, key and secret."""
+        return self.device.netmiko_kwargs() == device.netmiko_kwargs()
+
 
 class Pool:
     def __init__(self):
@@ -65,12 +75,30 @@ class Pool:
         t.start()
 
     def _get(self, device: Device) -> _Session:
+        stale = None
         with self._guard:
             s = self._sessions.get(device.name)
-            if s is None or s.device is not device:
+            if s is not None and not s.matches(device):
+                # Credentials or connection parameters were corrected in the
+                # inventory: retire the pooled session so the next open uses the
+                # new ones instead of re-failing with the old ones.
+                log.info("%s: connection parameters changed, dropping pooled session", device.name)
+                stale, s = s, None
+            if s is None:
                 s = _Session(device)
                 self._sessions[device.name] = s
-            return s
+        if stale is not None:
+            self._close_async(stale)
+        return s
+
+    @staticmethod
+    def _close_async(s: _Session) -> None:
+        """Close a retired session without making the caller wait for a command
+        that may still be running on it."""
+        def _worker():
+            with s.lock:
+                s.close()
+        threading.Thread(target=_worker, daemon=True, name="wirehand-close").start()
 
     def run(self, device: Device, commands: list[str], timeout: int = CMD_TIMEOUT) -> list[tuple[str, str]]:
         """Run exec-mode commands sequentially. Returns [(cmd, output)]."""
@@ -82,7 +110,7 @@ class Pool:
                 try:
                     out = conn.send_command(cmd, read_timeout=timeout, strip_command=True)
                 except AuthError:
-                    raise          # credentials are wrong; a retry cannot fix that
+                    raise          # wrong credentials: an immediate retry cannot fix that
                 except Exception as first_exc:
                     # Pooled sessions can be half-dead (device-side idle timeout kills the
                     # TCP session, is_alive() does not notice). Reconnect and retry ONCE -
@@ -145,12 +173,19 @@ class Pool:
             s.close()
             raise AuthError(
                 f"AUTHENTICATION FAILED for '{s.device.name}' ({s.device.device_type}, user "
-                f"'{s.device.username}'). The device rejected the stored credentials. This is "
-                f"FINAL: do not retry this device, do not try other commands or tools on it. "
+                f"'{s.device.username}'). The device rejected the stored credentials.\n"
+                f"Do NOT repeat this call with the same credentials: it will fail again and may "
+                f"lock the account. Stop working on '{s.device.name}' for now and continue with "
+                f"the other devices if the task involves several.\n"
                 f"Tell the user that the credentials for '{s.device.name}' must be corrected "
-                f"server-side (config/inventory.yaml or the containerlab credential override for "
-                f"that kind, then `docker compose up -d`). Continue with other devices if the "
-                f"task involves several."
+                f"server-side, in config/inventory.yaml or in the containerlab credential "
+                f"override for that kind. Changes to inventory.yaml are picked up automatically "
+                f"within ~{RESCAN_SECONDS}s; list_devices(refresh=true) applies them immediately. "
+                f"Credentials that come from an environment variable ('env:NAME') need "
+                f"`docker compose up -d`.\n"
+                f"This failure is NOT permanent: as soon as the user says the credentials have "
+                f"been corrected, retry '{s.device.name}' normally - the corrected credentials "
+                f"are used automatically, and no restart of this session is needed."
             ) from exc
         except NetmikoTimeoutException as exc:
             s.close()
