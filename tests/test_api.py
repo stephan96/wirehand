@@ -25,7 +25,7 @@ RUNNING = "interface Loopback0\n ipv4 address 1.1.1.1/32\ninterface GigabitEther
 
 class FakePool:
     def __init__(self): self.configured = []
-    def run(self, dev, cmds, timeout=60):
+    def run(self, dev, cmds, timeout=60, prompts="no"):
         return [(c, RUNNING if "running" in c else f"out of {c} on {dev.name}") for c in cmds]
     def configure(self, dev, lines, commit):
         self.configured.append((dev.name, lines, commit)); return "Commit complete"
@@ -98,13 +98,13 @@ print("FORTINET BLOCKS OK")
 from app.transport import AuthError
 class AuthFailPool(FakePool):
     def __init__(self): FakePool.__init__(self); self.attempts = 0
-    def run(self, dev, cmds, timeout=60):
+    def run(self, dev, cmds, timeout=60, prompts="no"):
         if dev.name == "s1":
             self.attempts += 1
             raise AuthError("AUTHENTICATION FAILED for 's1' (linux, user 'u'). "
                             "Do NOT repeat this call with the same credentials. "
                             "This failure is NOT permanent: retry once they are corrected.")
-        return FakePool.run(self, dev, cmds, timeout)
+        return FakePool.run(self, dev, cmds, timeout, prompts)
 afp = AuthFailPool(); main.pool = afp
 r = c.get("/get_facts", params={"device": "s1"}, headers=H)
 assert r.status_code == 401 and "NOT permanent" in r.text, (r.status_code, r.text)
@@ -188,3 +188,31 @@ assert r.status_code == 503 and "WIREHAND_TOTP_SECRET" in r.text, (r.status_code
 log = c.get("/get_audit_log", params={"n": 200}, headers=H).text
 assert "confirm_denied" in log, log[-500:]
 print("BYPASS + FAIL-CLOSED + AUDIT OK")
+
+# ---------------------------------------------------------------------------
+# A device that is still asking a question has NOT done the work: confirm_change
+# must say so instead of reporting success (the VRPv8 rollback case).
+# ---------------------------------------------------------------------------
+from app.platforms import pending_prompt
+
+STUCK = ("Warning: This operation will revert configuration changes to the previous status. "
+         "Continue? [Y/N]:")
+
+class StuckPool(FakePool):
+    """A pool whose devices ask and never get an answer (unknown prompt)."""
+    def __init__(self): FakePool.__init__(self); self.reset_called = []
+    def run(self, dev, cmds, timeout=60, prompts="no"):
+        return [(c, RUNNING if "running" in c else STUCK) for c in cmds]
+    def reset(self, dev): self.reset_called.append(dev.name)
+
+main.approver = Approver(secret=secret, mode="off")
+main.pool = StuckPool()
+rb = c.post("/rollback_change", params={"device": "r1"}, headers=H)
+assert rb.status_code == 200 and "STAGED" in rb.text, rb.text
+r = c.post("/confirm_change", params={"code": rb.text.split("code: ")[1][:6]}, headers=H)
+assert r.status_code == 502, (r.status_code, r.text)
+assert "NOT COMPLETED" in r.text and "[Y/N]" in r.text, r.text
+assert main.pool.reset_called == ["r1"], "the session left at a prompt must be dropped"
+assert "confirm_incomplete" in c.get("/get_audit_log", params={"n": 200}, headers=H).text
+assert pending_prompt(STUCK) and not pending_prompt(RUNNING)
+print("STUCK PROMPT NOT REPORTED AS SUCCESS OK")

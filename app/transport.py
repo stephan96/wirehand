@@ -22,11 +22,15 @@ class AuthError(RuntimeError):
     credentials have been corrected, the device is usable again and must be
     retried normally."""
 
+from . import platforms
 from .inventory import Device, RESCAN_SECONDS
 
 log = logging.getLogger("wirehand.transport")
 IDLE_SECONDS = int(os.environ.get("WIREHAND_IDLE_SECONDS", "300"))
 CMD_TIMEOUT = int(os.environ.get("WIREHAND_CMD_TIMEOUT", "60"))
+# How often we answer a follow-up question for a single command before giving up.
+MAX_PROMPT_ANSWERS = 3
+pending_prompt = platforms.pending_prompt   # re-exported: callers ask transport
 
 
 class _Session:
@@ -51,6 +55,15 @@ class _Session:
             self.conn.find_prompt()
         except Exception:
             pass
+        # Per-platform session setup (Huawei: mmi-mode, so maintenance commands
+        # stop asking "Continue? [Y/N]"). Never fatal - an image that does not
+        # know the command just answers with an error we ignore.
+        for cmd in platforms.SESSION_PREP.get(self.device.family, []):
+            try:
+                self.conn.send_command(cmd, read_timeout=15)
+            except Exception as exc:
+                log.warning("%s: session prep '%s' failed (%s) - continuing",
+                            self.device.name, cmd, type(exc).__name__)
         return self.conn
 
     def close(self):
@@ -100,15 +113,24 @@ class Pool:
                 s.close()
         threading.Thread(target=_worker, daemon=True, name="wirehand-close").start()
 
-    def run(self, device: Device, commands: list[str], timeout: int = CMD_TIMEOUT) -> list[tuple[str, str]]:
-        """Run exec-mode commands sequentially. Returns [(cmd, output)]."""
+    def run(self, device: Device, commands: list[str], timeout: int = CMD_TIMEOUT,
+            prompts: str = "no") -> list[tuple[str, str]]:
+        """Run exec-mode commands sequentially. Returns [(cmd, output)].
+
+        `prompts` says what to do when a device answers with a question instead
+        of doing the work ("Continue? [Y/N]:"):
+          "no"  - answer it away (read paths must not change anything, and the
+                  session must not be left hanging at the question)
+          "yes" - go ahead; only confirm_change uses this, where a human has
+                  already approved the operation.
+        """
         s = self._get(device)
         with s.lock:
             conn = self._open_or_raise(s)
             results = []
             for cmd in commands:
                 try:
-                    out = conn.send_command(cmd, read_timeout=timeout, strip_command=True)
+                    out = self._send(conn, device, cmd, timeout, prompts)
                 except AuthError:
                     raise          # wrong credentials: an immediate retry cannot fix that
                 except Exception as first_exc:
@@ -120,7 +142,7 @@ class Pool:
                     s.close()
                     conn = self._open_or_raise(s)
                     try:
-                        out = conn.send_command(cmd, read_timeout=timeout, strip_command=True)
+                        out = self._send(conn, device, cmd, timeout, prompts)
                     except Exception as exc:
                         out = (f"[error running command (after reconnect+retry): "
                                f"{type(exc).__name__}: {exc}]")
@@ -129,6 +151,34 @@ class Pool:
                 results.append((cmd, out or ""))
             s.last_used = time.time()
             return results
+
+    def _send(self, conn, device: Device, cmd: str, timeout: int, prompts: str) -> str:
+        out = conn.send_command(cmd, read_timeout=timeout, strip_command=True) or ""
+        return self._settle(conn, device, out, timeout, prompts)
+
+    def _settle(self, conn, device: Device, out: str, timeout: int, prompts: str) -> str:
+        """Answer a question the device asked instead of running the command."""
+        if prompts not in ("yes", "no"):
+            return out
+        for _ in range(MAX_PROMPT_ANSWERS):
+            hit = pending_prompt(out)
+            if hit is None:
+                return out
+            question, yes, no = hit
+            answer = yes if prompts == "yes" else no
+            log.info("%s: device asked %r -> answering %r", device.name, question, answer)
+            more = conn.send_command_timing(answer, strip_prompt=False, strip_command=False,
+                                            read_timeout=timeout) or ""
+            out = f"{out}\n{more}"
+        log.warning("%s: still at a prompt after %d answers", device.name, MAX_PROMPT_ANSWERS)
+        return out
+
+    def reset(self, device: Device) -> None:
+        """Drop the pooled session, e.g. after it was left at a question we could
+        not answer. The next call reconnects."""
+        s = self._sessions.get(device.name)
+        if s is not None:
+            self._close_async(s)
 
     def configure(self, device: Device, lines: list[str], commit: bool) -> str:
         """Apply configuration lines. Platform specifics:
@@ -162,6 +212,8 @@ class Pool:
                             out += "\n" + conn.save_config()
                     else:  # fortinet: blocks carry their own 'end'; nothing to exit
                         pass
+                # A config session can end on a question too ('Save? [Y/N]').
+                out = self._settle(conn, device, out, CMD_TIMEOUT, "yes")
             finally:
                 s.last_used = time.time()
             return out

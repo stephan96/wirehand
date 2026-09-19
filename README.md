@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.5.0
+**Version:** 0.5.1
 
 ## Summary
 
@@ -473,13 +473,39 @@ and destroy unused labs with `--cleanup` so their generated folders disappear.
 
 | Family | Change path | Rollback |
 |---|---|---|
-| cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed |
+| cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed; VRP needs `mmi-mode` (see below) |
 | cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot only -> corrective change |
 | fortinet | config-set (persists immediately) | snapshot only |
 | linux | commands run sequentially as the login user | none - include backups in the change (`sudo cp x x.bak`) |
 
 `mode='exec'` runs in user/exec view on all platforms, commits nothing, and states that
 in its response.
+
+### Devices that ask before they act
+
+Huawei VRP answers a maintenance command with a question:
+
+```
+> rollback configuration last 1
+Warning: This operation will revert configuration changes... Continue? [Y/N]:
+```
+
+Netmiko's `send_command` returns as soon as the output looks like a prompt, and the `]`
+in `[Y/N]` is enough - so the command has **not** run, the session sits at the question,
+and the next command becomes its answer. Until 0.5.1 wirehand reported "ROLLED BACK" for
+exactly this, while the device had rolled back nothing.
+
+Two things prevent it now. Sessions to VRP devices open with **`mmi-mode enable`**
+(`platforms.SESSION_PREP`) - Huawei's own switch for "a machine is typing", which stops
+the questions at the source. And any question that still appears is **answered**
+(`platforms.CONFIRM_PROMPTS`): `yes` when a human has approved the operation via
+`confirm_change`, `no` on the read path, where an unexpected question is backed out of
+rather than agreed to. If a question is still standing afterwards, `confirm_change`
+returns HTTP 502 `NOT COMPLETED`, drops the session and logs `confirm_incomplete` -
+it never claims work that did not happen.
+
+IOS-XR needs neither: `rollback configuration last 1` runs there without asking. To teach
+wirehand a new question, add the pattern and its two answers to `CONFIRM_PROMPTS`.
 
 ## Audit log & snapshots
 
@@ -515,7 +541,7 @@ docker cp wirehand:/app/data ./wirehand-data-backup
 ```
 
 Each audit entry holds timestamp, event (`run_read`, `propose_change`, `confirm_change`,
-`rollback_staged`, `rollback_snapshot`, `confirm_denied`, ...), device, the commands/lines involved and, for changes, the confirmation
+`rollback_staged`, `rollback_snapshot`, `confirm_denied`, `confirm_incomplete`, ...), device, the commands/lines involved and, for changes, the confirmation
 code and snapshot path - never credentials. The file is plain JSONL: one JSON object per
 line, greppable and jq-able.
 
@@ -532,6 +558,7 @@ changes with age).
 | Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
 | Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
+| `confirm_change` returns 502 `NOT COMPLETED: the device asked ...` | the platform asks a question wirehand does not know | add the pattern to `CONFIRM_PROMPTS` in `app/platforms.py`; nothing was applied, the session was dropped |
 | `confirm_change` returns 503 with a setup hint | `WIREHAND_CONFIRM_MODE=totp` but no usable `WIREHAND_TOTP_SECRET` | generate one (`docker exec wirehand python -m app.approval --new`), put it in `.env`, `docker compose up -d` - or set `WIREHAND_CONFIRM_MODE=off` |
 | `confirm_change` returns 403 "approval code is not valid (right now)" | phone clock drift, or the model made the number up | compare `docker exec wirehand python -m app.approval` with your app; the change stays staged, just send a fresh code |
 | "too many wrong approval codes - locked" | five refused approvals in two minutes | wait it out, or raise `WIREHAND_APPROVAL_MAX_FAILURES` / lower `WIREHAND_APPROVAL_LOCKOUT` |
@@ -545,7 +572,7 @@ changes with age).
 
 ```bash
 pip install -r requirements.txt pytest httpx
-python -m pytest tests/                  # read path, approval codes, containerlab discovery
+python -m pytest tests/                  # read path, approval codes, device prompts, containerlab discovery
 PYTHONPATH=. python tests/test_api.py    # full propose/confirm/rollback/approval flow against a fake pool
 ```
 
