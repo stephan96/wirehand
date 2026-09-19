@@ -10,6 +10,10 @@ inv.write("""devices:
 inv.close()
 os.environ["WIREHAND_INVENTORY"] = inv.name
 os.environ["LAB"] = "x"
+# The default is WIREHAND_CONFIRM_MODE=totp; the flows above predate it and are
+# exercised without approval. The approval enforcement has its own section at the
+# end of this file, and its unit tests live in tests/test_approval.py.
+os.environ["WIREHAND_CONFIRM_MODE"] = "off"
 for m in list(sys.modules):
     if m.startswith("app"):
         del sys.modules[m]
@@ -124,3 +128,63 @@ assert "up?" in r and "WARNING" in r and "172.20.20.2 -> labA-x, labB-x" in r, r
 assert r.count("up?   ") == 2 and "ipv4-subnet" in r, r
 _m.check_devices = orig_check
 print("SHARED IP WARNING OK")
+
+# ---------------------------------------------------------------------------
+# Approval: a model must not be able to confirm its own proposal.
+# Reproduces what qwen3.6:35b-a3b did - propose_change, then immediately reply
+# to itself with the code it had just been handed.
+# ---------------------------------------------------------------------------
+import time
+from app.approval import STEP_SECONDS, Approver, hotp, new_secret, normalize_secret
+
+secret = new_secret()
+main.approver = Approver(secret=secret, mode="totp", max_failures=3, lockout=60)
+main.pool = FakePool()
+
+p = c.post("/propose_change", json={"device": "r1", "config": "interface Loopback9\n description gated"}, headers=H)
+assert p.status_code == 200 and "STOP HERE" in p.text and "authenticator app" in p.text, p.text
+gated = p.text.split("code: ")[1][:6]
+
+r = c.post("/confirm_change", params={"code": gated}, headers=H)                      # self-confirm
+assert r.status_code == 403 and main.pool.configured == [], (r.status_code, r.text)
+r = c.post("/confirm_change", params={"code": gated, "approval": "123456"}, headers=H)  # invented code
+assert r.status_code == 403 and main.pool.configured == [], (r.status_code, r.text)
+assert any(x["code"] == gated for x in main.changes.list()), "a refused approval must not discard the change"
+
+now = time.time()
+human = hotp(normalize_secret(secret), int(now // STEP_SECONDS))                      # user reads their app
+a = c.post("/confirm_change", params={"code": gated, "approval": human}, headers=H)
+assert a.status_code == 200 and "APPLIED" in a.text, a.text
+assert main.pool.configured[-1][1] == ["interface Loopback9", " description gated"], main.pool.configured
+
+p2 = c.post("/propose_change", json={"device": "r1", "config": "interface Loopback8"}, headers=H)
+g2 = p2.text.split("code: ")[1][:6]
+r = c.post("/confirm_change", params={"code": g2, "approval": human}, headers=H)       # replay
+assert r.status_code == 403 and "already used" in r.text, r.text
+assert len(main.pool.configured) == 1, main.pool.configured
+
+rb = c.post("/rollback_change", params={"device": "r1"}, headers=H)                    # rollback is gated too
+assert "STOP HERE" in rb.text, rb.text
+rbc = rb.text.split("code: ")[1][:6]
+assert c.post("/confirm_change", params={"code": rbc}, headers=H).status_code == 403
+print("APPROVAL ENFORCED OK")
+
+# per-device bypass: disposable lab nodes may be confirmed by the model alone
+inv4 = open(os.environ["WIREHAND_INVENTORY"]).read()
+open(os.environ["WIREHAND_INVENTORY"], "w").write(
+    inv4 + "  lab1: {host: 1.1.1.9, device_type: cisco_xr, username: u, password: p, access: rw, confirm: off}\n")
+c.get("/list_devices", params={"refresh": "true"}, headers=H)
+p = c.post("/propose_change", json={"device": "lab1", "config": "interface Loopback7"}, headers=H)
+assert "STOP HERE" not in p.text and "Ask the user to approve" in p.text, p.text
+a = c.post("/confirm_change", params={"code": p.text.split("code: ")[1][:6]}, headers=H)
+assert a.status_code == 200 and "APPLIED" in a.text, a.text
+
+# ... and a missing/broken secret fails CLOSED, with a setup hint for the operator
+main.approver = Approver(secret="", mode="totp")
+p = c.post("/propose_change", json={"device": "r1", "config": "interface Loopback6"}, headers=H)
+r = c.post("/confirm_change", params={"code": p.text.split("code: ")[1][:6], "approval": "123456"}, headers=H)
+assert r.status_code == 503 and "WIREHAND_TOTP_SECRET" in r.text, (r.status_code, r.text)
+
+log = c.get("/get_audit_log", params={"n": 200}, headers=H).text
+assert "confirm_denied" in log, log[-500:]
+print("BYPASS + FAIL-CLOSED + AUDIT OK")

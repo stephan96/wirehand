@@ -44,6 +44,9 @@ class Device:
     secret: str | None = None
     port: int = 22
     access: str = "ro"  # ro | rw
+    # None = use WIREHAND_CONFIRM_MODE; "totp" = confirm_change needs a one-time
+    # code from a human; "off" = the model may confirm its own proposal.
+    confirm: str | None = None
     description: str = ""
     tags: list[str] = field(default_factory=list)
     timeout: int = 30
@@ -62,6 +65,7 @@ class Device:
             "name": self.name,
             "platform": self.device_type,
             "access": self.access,
+            "confirm": self.confirm,
             "description": self.description,
             "tags": self.tags,
             "source": self.source,
@@ -145,6 +149,14 @@ class Inventory:
                 raise RuntimeError(f"device '{name}': unsupported device_type '{spec.get('device_type')}'")
             if spec.get("access", "ro") not in ("ro", "rw"):
                 raise RuntimeError(f"device '{name}': access must be 'ro' or 'rw'")
+            if "confirm" in spec and spec["confirm"] is not None:
+                # YAML 1.1 turns a bare off/no/false into a boolean, and 'confirm: off'
+                # is exactly how people write it - so accept that spelling too.
+                conf = spec["confirm"]
+                conf = ("off" if conf is False else "totp") if isinstance(conf, bool) else str(conf).strip().lower()
+                if conf not in ("totp", "off"):
+                    raise RuntimeError(f"device '{name}': confirm must be 'totp' or 'off', not {spec['confirm']!r}")
+                spec["confirm"] = conf
             for key in ("password", "secret", "username"):
                 if key in spec:
                     spec[key] = _resolve(spec[key])

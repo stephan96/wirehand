@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.4.0
+**Version:** 0.5.0
 
 ## Summary
 
@@ -63,7 +63,7 @@ The same picture as text:
 | `get_facts(device)` | read | One-call overview bundle (version, interfaces, routing summary, neighbors, recent log) - the intended first step of an analysis. |
 | `run_read(device, commands, filter, context)` | read | Read-only commands. On network devices a blocklist plus argument-level checks; on **Linux devices an allow-list**: only known read-only commands run at all, everything else is refused (see "Key properties"). `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
 | `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char code. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
-| `confirm_change(code)` | write | Applies the staged change: config mode + commit/save for `config`, plain exec for `exec` and for a staged `rollback`. Requires `access: rw` on the device. |
+| `confirm_change(code, approval)` | write | Applies the staged change: config mode + commit/save for `config`, plain exec for `exec` and for a staged `rollback`. Requires `access: rw` and - unless confirmation is switched off for that device - `approval`: the current 6-digit one-time code from the operator's authenticator app. See "Approving changes". |
 | `rollback_change(device)` | stage | IOS-XR / VRPv8 / Junos: *stages* a native rollback of the last commit and returns a confirmation code - **undoes nothing** until `confirm_change`. Other platforms: touches nothing and returns the pre-change snapshot so a corrective change can be proposed. |
 | `get_audit_log(device, n)` | read | The last `n` audit entries, optionally filtered by device. |
 
@@ -87,9 +87,15 @@ output together with the hint to use `filter`.
   blocklist and allow unknown verbs: their exec view cannot start arbitrary programs, and
   vendor read verbs are far too varied to enumerate.
 - **Every write is two-stage and human-gated.** `propose_change` and `rollback_change` only
-  *stage* an operation and return a confirmation code. Nothing touches the device until a
-  human approves the code in the chat and the model calls `confirm_change` with it. Codes
-  are single-use and expire after 10 minutes.
+  *stage* an operation and return a confirmation code. Codes are single-use and expire after
+  10 minutes.
+- **The approval is something the model cannot produce.** The staged code travels back
+  through the model, so on its own it proves nothing - a model that decides to approve for
+  you simply calls `confirm_change` with the code it was just handed, and small local models
+  do exactly that. `confirm_change` therefore also wants a one-time code (TOTP) from the
+  operator's authenticator app: valid ~30 seconds, consumed on first use, never visible to
+  the model until a human types it into the chat. No system prompt can replace this - see
+  "Approving changes".
 - **Everything is logged.** Every tool call lands in an append-only audit log; every
   proposed change first saves a configuration snapshot (see "Audit log & snapshots").
 
@@ -176,6 +182,13 @@ docker compose up -d
 curl -s http://localhost:8110/openapi.json | grep -o '"version": *"[^"]*"'
 ```
 
+**Upgrading to 0.5.0 needs one decision.** Changes now require a one-time approval code
+by default, so `confirm_change` answers 503 until you either set `WIREHAND_TOTP_SECRET`
+(`docker exec wirehand python -m app.approval --new`) or set `WIREHAND_CONFIRM_MODE=off`
+to keep the old behaviour. Reading, proposing and staging keep working either way -
+only the apply step is gated. `curl -s http://localhost:8110/health` shows
+`confirm_mode` and `approval_ready`.
+
 Do **not** unpack the tarball *inside* `~/docker/wirehand` - the archive contains the
 `wirehand/` folder as prefix and you would end up with a nested copy while building
 the old code. Unpack in the parent (`~/docker`).
@@ -189,6 +202,8 @@ off/on (or re-add it) so the model sees the new tool descriptions.
 
 ```bash
 WIREHAND_API_KEY=change-me-long-random-string
+WIREHAND_CONFIRM_MODE=totp                    # totp (default) | off - see "Approving changes"
+WIREHAND_TOTP_SECRET=JBSWY3DPEHPK3PXP...      # docker exec wirehand python -m app.approval --new
 WIREHAND_CLAB_DIR=/home/stephan/containerlabs   # host path with your labs
 UBUNTU2_USER=netops                           # credentials referenced from inventory.yaml
 UBUNTU2_PASS=...
@@ -211,11 +226,13 @@ devices:                       # manual devices; {} if you only use containerlab
     username: env:UBUNTU2_USER # env:VAR -> resolved from the container environment
     password: env:UBUNTU2_PASS
     access: ro                 # ro (default) | rw; start ro, lift deliberately
+    confirm: totp              # totp | off - overrides WIREHAND_CONFIRM_MODE for this device
     description: containerlab host
     tags: [host, linux]
 
 containerlab:
   default_access: rw           # labs are disposable; set ro for the cautious default
+  default_confirm: off         # ... and may be changed without a one-time code; omit for totp
   long_names: false            # true -> full names like clab-xrd-test-xrd1
   kinds:                       # per-kind overrides of driver or access
     huawei_vrp: { device_type: huawei_vrpv8 }   # NE40E/CE = VRP8; 'huawei' for VRP5 images
@@ -233,7 +250,8 @@ Missing `env:` variables fail the whole inventory load at startup - deliberately
 
 `access: ro` allows `get_facts`/`run_read` only; `rw` additionally allows
 propose/confirm/rollback (config **and** exec mode - a rollback is staged and confirmed
-like any other change). Recommended path: everything `ro`,
+like any other change). `rw` decides *whether* a device can be changed, `confirm:` decides
+*who may approve* it (see "Approving changes"). Recommended path: everything `ro`,
 lift devices to `rw` one at a time, first write test on a disposable lab node.
 
 For Linux devices, the SSH account is what the LLM gets: the read path can `cat`
@@ -242,6 +260,64 @@ personal account, and grant targeted passwordless sudo only for commands you exp
 changes. The read path never escalates (`sudo` is refused there) and runs allow-listed
 read commands only - but an allow-listed `cat` still reads every file the account can
 read, so the account, not the allow-list, is what bounds exposure.
+
+## Approving changes
+
+Wirehand refuses to let the model approve its own proposal, because that is the one thing
+it will eventually try. A real transcript (qwen3.6:35b-a3b):
+
+```
+propose_change(...) -> STAGED, NOT APPLIED. Confirmation code: 65C02D
+                       Ask the user to approve. Then call confirm_change(code='65C02D').
+Thought: Executing confirm_change...
+confirm_change(code='65C02D')
+```
+
+Nothing in a system prompt fixes this. The model is *told* to wait, and the code it needs
+is in its own context - instructions it can ignore, plus a secret it already has. So the
+approval is a **time-based one-time code (TOTP)** that only a human can read:
+
+| `WIREHAND_CONFIRM_MODE` | `confirm_change` needs | Use for |
+|---|---|---|
+| `totp` (default) | `code` **and** a fresh 6-digit code from your authenticator app | anything you care about |
+| `off` | `code` only - the model may apply its own proposal | disposable labs, unattended runs |
+
+`confirm: totp` / `confirm: off` per device in `inventory.yaml` (and
+`containerlab.default_confirm` for discovered nodes) overrides the global mode, so lab
+nodes can stay frictionless while real devices need a human.
+
+### Setting it up
+
+```bash
+docker exec wirehand python -m app.approval --new     # prints secret + otpauth:// URI
+$EDITOR .env                                          # WIREHAND_TOTP_SECRET=<the secret>
+docker compose up -d
+```
+
+Add the secret to an authenticator app (Aegis, FreeOTP, Google Authenticator, ...) by
+typing it or by scanning the URI - `qrencode -t ANSIUTF8 '<uri>'` turns it into a QR code
+in the terminal. The secret lives only in `.env` and the app; **no API endpoint ever
+returns it**, precisely so a front-end (and with it the model) cannot fetch it.
+
+### What a change looks like in the chat
+
+```
+you:   add a loopback on vrp1
+model: <calls propose_change, shows the preview and the code, then stops and asks>
+you:   734891                       <- read from the authenticator app
+model: <calls confirm_change(code='65C02D', approval='734891')>  -> APPLIED
+```
+
+A wrong or invented approval is refused with HTTP 403, logged as `confirm_denied`, and
+leaves the change staged so you can simply send the right number. Five failures within
+two minutes lock approvals for a while (`WIREHAND_APPROVAL_MAX_FAILURES`,
+`WIREHAND_APPROVAL_LOCKOUT`) - six digits are guessable if you may keep trying. Each code
+is consumed on use, so a model cannot reuse the number you read out a minute ago for a
+second change, and codes from the neighbouring 30-second steps are accepted so you are not
+racing the clock.
+
+If the mode is `totp` and no usable secret is configured, `confirm_change` fails **closed**
+(HTTP 503) with setup instructions. Changes stop; nothing gets applied by accident.
 
 ## Connecting the front-ends
 
@@ -300,7 +376,11 @@ message. Same text as above, with the middle paragraph added:
 > Changes: call propose_change, show the user the preview and the code, then stop and
 > wait for explicit approval; only then call confirm_change with that exact code. The
 > same applies to rollback_change: it only stages the undo and returns a code, so show
-> it, wait for approval, then call confirm_change.
+> it, wait for approval, then call confirm_change. If the tool answer asks for an
+> approval code, the user has to read a 6-digit number from their authenticator app:
+> ask for it in plain words and wait for their reply. Never put a number there that
+> the user did not just send you - you cannot compute it, an old one will not work,
+> and a wrong one is logged as a failed approval.
 > Maintenance commands (reset, clear, process restarts) go through propose_change with
 > mode='exec', never run_read. If unsure about platform CLI syntax, verify it via web
 > search before proposing a change.
@@ -435,7 +515,7 @@ docker cp wirehand:/app/data ./wirehand-data-backup
 ```
 
 Each audit entry holds timestamp, event (`run_read`, `propose_change`, `confirm_change`,
-`rollback_staged`, `rollback_snapshot`, ...), device, the commands/lines involved and, for changes, the confirmation
+`rollback_staged`, `rollback_snapshot`, `confirm_denied`, ...), device, the commands/lines involved and, for changes, the confirmation
 code and snapshot path - never credentials. The file is plain JSONL: one JSON object per
 line, greppable and jq-able.
 
@@ -452,6 +532,9 @@ changes with age).
 | Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
 | Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
+| `confirm_change` returns 503 with a setup hint | `WIREHAND_CONFIRM_MODE=totp` but no usable `WIREHAND_TOTP_SECRET` | generate one (`docker exec wirehand python -m app.approval --new`), put it in `.env`, `docker compose up -d` - or set `WIREHAND_CONFIRM_MODE=off` |
+| `confirm_change` returns 403 "approval code is not valid (right now)" | phone clock drift, or the model made the number up | compare `docker exec wirehand python -m app.approval` with your app; the change stays staged, just send a fresh code |
+| "too many wrong approval codes - locked" | five refused approvals in two minutes | wait it out, or raise `WIREHAND_APPROVAL_MAX_FAILURES` / lower `WIREHAND_APPROVAL_LOCKOUT` |
 | A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | if it really is read-only, add it to `_ALLOW` in `app/safety.py`; if it writes, it belongs in `propose_change` |
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
 | Ubuntu2/local host unreachable | sshd not listening on the address used | with host networking use `host: 127.0.0.1` |
@@ -462,8 +545,8 @@ changes with age).
 
 ```bash
 pip install -r requirements.txt pytest httpx
-python -m pytest tests/                  # safety blocklist + containerlab discovery
-PYTHONPATH=. python tests/test_api.py    # full propose/confirm/rollback flow against a fake pool
+python -m pytest tests/                  # read path, approval codes, containerlab discovery
+PYTHONPATH=. python tests/test_api.py    # full propose/confirm/rollback/approval flow against a fake pool
 ```
 
 `tests/toolcall_suite.md` is a 16-prompt regression set for judging how reliably a

@@ -11,7 +11,8 @@ Design rules (see README):
   * read path is always safe: hard refusals + blocklist, allow-list only on
     shell-like (Linux) devices, no privilege escalation
   * every write is two-stage (propose_change / rollback_change -> human
-    approval -> confirm_change)
+    approval -> confirm_change), and the approval is a one-time code the model
+    cannot produce itself (app/approval.py) unless confirmation is switched off
   * output capped (~20k tokens) with server-side regex filter
 """
 from __future__ import annotations
@@ -27,6 +28,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from . import platforms
+from .approval import Approver, ConfigError
 from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
 from .state import ChangeStore, audit, read_audit
@@ -41,12 +43,21 @@ MAX_OUT = int(os.environ.get("WIREHAND_MAX_OUTPUT_CHARS", DEFAULT_MAX_OUTPUT_CHA
 inventory = Inventory()
 pool = Pool()
 changes = ChangeStore()
+approver = Approver()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not API_KEY:
         log.warning("WIREHAND_API_KEY is empty - API is unauthenticated!")
+    if approver.mode_invalid:
+        log.warning("WIREHAND_CONFIRM_MODE is not 'totp' or 'off' - falling back to 'totp'")
+    if approver.mode == "totp" and not approver.configured:
+        log.warning("confirm_change will REFUSE every change: %s", approver.setup_hint())
+    elif approver.mode == "off":
+        log.warning("WIREHAND_CONFIRM_MODE=off - the model can apply its own proposals without a human")
+    else:
+        log.info("changes require a one-time approval code (WIREHAND_CONFIRM_MODE=totp)")
     log.info("loaded %d devices (inventory.yaml=%s, containerlab=%s)", len(inventory.all()), inventory.path, inventory.clab_dir or "off")
     yield
     pool.close_all()
@@ -54,7 +65,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.4.0",
+    version="0.5.0",
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
@@ -94,6 +105,23 @@ def _fmt(device: str, results: list[tuple[str, str]], flt: str = "", context: in
         body = filter_lines(out, flt, context) if flt else out
         blocks.append(f"=== {device} : {cmd} ===\n{body.rstrip()}\n")
     return truncate("\n".join(blocks), MAX_OUT)
+
+
+def _next_step(dev, code: str) -> str:
+    """What the model must do to get the staged change applied. In totp mode it
+    cannot do it alone, and the text says so in the imperative the small models
+    actually follow - the old 'Ask the user to approve. Then call confirm_change'
+    was read by some as 'call confirm_change now'."""
+    if not approver.requires_approval(dev.confirm):
+        return f"Ask the user to approve. Then call confirm_change(code='{code}')."
+    return (
+        f"STOP HERE. This device needs approval by a human: the user must read the current "
+        f"6-digit code from their authenticator app and send it to you. You cannot generate, "
+        f"guess or remember that number, and a code you used before will not work again. "
+        f"If it is not in the user's NEXT message, ask for it and wait - do not call any tool. "
+        f"Once the user gives you the number, call "
+        f"confirm_change(code='{code}', approval='<the 6 digits from the user>')."
+    )
 
 
 # ---------------------------------------------------------------- tools ---
@@ -319,26 +347,53 @@ def propose_change(body: ProposeIn) -> str:
     return (
         f"STAGED, NOT APPLIED. Confirmation code: {pc.code}  (device {dev.name}, expires in 10 min)\n"
         f"Snapshot saved: {snap_path.name}\n\n{preview}\n\n"
-        "Ask the user to approve. Then call confirm_change(code='" + pc.code + "')."
+        + _next_step(dev, pc.code)
     )
 
 
 @app.post("/confirm_change", operation_id="confirm_change", response_class=PlainTextResponse,
           summary="Apply a previously proposed change after the user approved it",
           description=(
-              "Step 2 of 2. Applies the staged change identified by the code from propose_change, "
-              "commits/saves it and returns the device output. Only call this after the user has "
-              "explicitly approved the exact code in the chat. "
-              "Example: confirm_change(code='A1B2C3')"
+              "Step 2 of 2. Applies the staged change identified by the code from propose_change "
+              "or rollback_change, commits/saves it and returns the device output. Most devices "
+              "additionally require `approval`: the current 6-digit one-time code from the USER's "
+              "authenticator app, which only the user can read. Never call this tool with an "
+              "approval you made up, remembered from an earlier change, or derived yourself - it "
+              "will be refused and the attempt is logged. If the user has not sent you a fresh "
+              "6-digit code, ask for it instead of calling this tool. "
+              "Example: confirm_change(code='A1B2C3', approval='481502')"
           ), dependencies=[Depends(auth)])
-def confirm_change(code: str = Query(..., min_length=6, max_length=6, description="6-character code from propose_change")) -> str:
+def confirm_change(
+    code: str = Query(..., min_length=6, max_length=6, description="6-character code from propose_change / rollback_change"),
+    approval: str = Query("", description=(
+        "The current 6-digit code from the USER's authenticator app, exactly as the user sent it. "
+        "It changes every 30 seconds and each code works only once. You cannot compute or recall "
+        "it - if the user did not just give it to you, do not call this tool.")),
+) -> str:
+    # peek, not pop: a wrong approval must not throw the staged change away.
     try:
-        pc = changes.pop(code)
+        pc = changes.peek(code)
     except KeyError as exc:
         raise HTTPException(404, str(exc))
     dev = _device(pc.device)
     if not dev.writable:
         raise HTTPException(403, f"device '{dev.name}' is read-only (access=ro)")
+    if approver.requires_approval(dev.confirm):
+        try:
+            verdict = approver.verify(approval)
+        except ConfigError as exc:
+            audit("confirm_denied", dev.name, code=code, reason="approval not configured")
+            raise HTTPException(503, str(exc))
+        if not verdict.ok:
+            audit("confirm_denied", dev.name, code=code, reason=verdict.reason, approval_given=bool(approval.strip()))
+            raise HTTPException(403, (
+                f"NOT APPLIED - {verdict.reason}. The change is still staged as {pc.code} until it "
+                f"expires. Ask the user for the current 6-digit code from their authenticator app "
+                f"and call confirm_change again with it. Do not retry with a number you invented."))
+    try:
+        pc = changes.pop(code)   # consume only once the approval holds
+    except KeyError as exc:
+        raise HTTPException(404, str(exc))
     try:
         if pc.mode in ("exec", "rollback"):
             out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120))
@@ -350,7 +405,8 @@ def confirm_change(code: str = Query(..., min_length=6, max_length=6, descriptio
     except Exception as exc:
         audit("confirm_change_error", dev.name, code=code, error=str(exc))
         raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. Snapshot {pc.snapshot_path} is available for rollback.")
-    audit("confirm_change", dev.name, code=code, lines=pc.lines, mode=pc.mode)
+    audit("confirm_change", dev.name, code=code, lines=pc.lines, mode=pc.mode,
+          approval=approver.mode_for(dev.confirm))
     if pc.mode == "rollback":
         return truncate(f"ROLLED BACK on {dev.name} (code {code}). The device is back to the state "
                         f"before its last commit; the configuration from before this rollback was "
@@ -406,7 +462,7 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
         f"STAGED, NOT APPLIED. Confirmation code: {pc.code}  (device {dev.name}, expires in 10 min)\n"
         f"This undoes the last commit on {dev.name}. The configuration as it is RIGHT NOW was saved "
         f"as {snap_path.name} first.\n\n{preview}\n\n"
-        "Ask the user to approve. Then call confirm_change(code='" + pc.code + "')."
+        + _next_step(dev, pc.code)
     )
 
 
@@ -429,7 +485,8 @@ def get_audit_log(device: str = Query("", description="Optional device name"), n
 
 @app.get("/health", include_in_schema=False)
 def health():
-    return {"status": "ok", "devices": len(inventory.all()), "pending_changes": len(changes.list())}
+    return {"status": "ok", "devices": len(inventory.all()), "pending_changes": len(changes.list()),
+            "confirm_mode": approver.mode, "approval_ready": approver.configured}
 
 
 @app.get("/pending", include_in_schema=False, dependencies=[Depends(auth)])
