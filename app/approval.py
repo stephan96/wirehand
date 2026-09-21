@@ -13,7 +13,7 @@ the model is told it can ignore, and anything the model is shown it can replay.
 An approval is only worth something if it requires a secret the model never sees.
 
 That secret is a TOTP (RFC 6238) from the operator's authenticator app: the model
-has to ask a human for the number, it is valid for ~30 seconds, and it is consumed
+has to ask a human for the number, it expires after a couple of minutes, and it is consumed
 on first use so it cannot be replayed onto a second staged change. A *static*
 passphrase in .env would not do - the first time a human types it into the chat,
 the model has it in its context and can reuse it forever.
@@ -40,8 +40,12 @@ MODES = ("totp", "off")
 CONFIRM_MODE = (os.environ.get("WIREHAND_CONFIRM_MODE") or "totp").strip().lower()
 TOTP_SECRET = (os.environ.get("WIREHAND_TOTP_SECRET") or "").strip()
 STEP_SECONDS = 30
-# Accept the neighbouring steps too: phone clocks drift, and the user needs a
-# moment to read the number out and the model a moment to call the tool.
+# How long a code is still accepted after the app stopped showing it. The user
+# needs a moment to read the number out, and a local model may think for a minute
+# or two before it calls confirm_change - a 30 s window loses that race. Codes stay
+# single-use and guesses still lock out, so a longer window costs little.
+MAX_AGE_SECONDS = int(os.environ.get("WIREHAND_APPROVAL_MAX_AGE", "120"))
+# Codes from the *future* are only a clock-drift allowance (phone clock ahead).
 SKEW_STEPS = int(os.environ.get("WIREHAND_APPROVAL_SKEW_STEPS", "1"))
 MAX_FAILURES = int(os.environ.get("WIREHAND_APPROVAL_MAX_FAILURES", "5"))
 LOCKOUT_SECONDS = int(os.environ.get("WIREHAND_APPROVAL_LOCKOUT", "120"))
@@ -96,7 +100,8 @@ class Approver:
     failures (6 digits are brute-forceable if you may keep guessing)."""
 
     def __init__(self, secret: str = TOTP_SECRET, mode: str = CONFIRM_MODE,
-                 max_failures: int = MAX_FAILURES, lockout: int = LOCKOUT_SECONDS):
+                 max_failures: int = MAX_FAILURES, lockout: int = LOCKOUT_SECONDS,
+                 max_age: int = MAX_AGE_SECONDS, skew_steps: int = SKEW_STEPS):
         self.mode = mode if mode in MODES else "totp"
         self.mode_invalid = mode not in MODES
         self._secret_raw = secret
@@ -112,6 +117,8 @@ class Approver:
         self._failures: list[float] = []
         self.max_failures = max_failures
         self.lockout = lockout
+        self.max_age = max(max_age, 0)
+        self.skew_steps = max(skew_steps, 0)
 
     # -- configuration -------------------------------------------------------
     @property
@@ -159,20 +166,25 @@ class Approver:
                 self._failures.append(now)
                 return ApprovalResult(False, "approval must be the current 6-digit code from the user's authenticator app")
             counter = int(now // STEP_SECONDS)
-            for off in range(-SKEW_STEPS, SKEW_STEPS + 1):
-                c = counter + off
+            oldest = counter - -(-self.max_age // STEP_SECONDS)      # ceil
+            for c in range(oldest, counter + self.skew_steps + 1):
+                # step c is shown until (c+1)*STEP; accept it max_age beyond that
+                if (c + 1) * STEP_SECONDS + self.max_age <= now:
+                    continue
                 if hmac.compare_digest(hotp(self._key, c), digits):
                     if c in self._used:
                         self._failures.append(now)
                         return ApprovalResult(False, "this approval code was already used - each change needs a fresh one")
                     self._used[c] = now
-                    horizon = STEP_SECONDS * (SKEW_STEPS + 2)
+                    horizon = self.max_age + STEP_SECONDS * (self.skew_steps + 2)
                     self._used = {k: t for k, t in self._used.items() if now - t < horizon}
                     self._failures.clear()
                     return ApprovalResult(True)
             self._failures.append(now)
             left = self.max_failures - len(self._failures)
-            return ApprovalResult(False, f"approval code is not valid (right now) - {max(left, 0)} attempt(s) left before lockout")
+            return ApprovalResult(False, (f"approval code is not valid - wrong, or expired (a code is accepted for {self.max_age}s "
+                                         f"after the app stops showing it). Ask the user for the current code. "
+                                         f"{max(left, 0)} attempt(s) left before lockout"))
 
 
 if __name__ == "__main__":   # operator helper, never reachable from the API

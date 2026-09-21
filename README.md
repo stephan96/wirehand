@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.5.1
+**Version:** 0.5.2
 
 ## Summary
 
@@ -204,6 +204,7 @@ off/on (or re-add it) so the model sees the new tool descriptions.
 WIREHAND_API_KEY=change-me-long-random-string
 WIREHAND_CONFIRM_MODE=totp                    # totp (default) | off - see "Approving changes"
 WIREHAND_TOTP_SECRET=JBSWY3DPEHPK3PXP...      # docker exec wirehand python -m app.approval --new
+WIREHAND_APPROVAL_MAX_AGE=120                 # seconds a code stays valid after the app moves on
 WIREHAND_CLAB_DIR=/home/stephan/containerlabs   # host path with your labs
 UBUNTU2_USER=netops                           # credentials referenced from inventory.yaml
 UBUNTU2_PASS=...
@@ -313,8 +314,14 @@ leaves the change staged so you can simply send the right number. Five failures 
 two minutes lock approvals for a while (`WIREHAND_APPROVAL_MAX_FAILURES`,
 `WIREHAND_APPROVAL_LOCKOUT`) - six digits are guessable if you may keep trying. Each code
 is consumed on use, so a model cannot reuse the number you read out a minute ago for a
-second change, and codes from the neighbouring 30-second steps are accepted so you are not
-racing the clock.
+second change.
+
+You are not racing the 30-second clock: a code is still accepted for
+`WIREHAND_APPROVAL_MAX_AGE` seconds (default 120) after your app stopped showing it, because
+a local model can easily think for a minute before it calls `confirm_change`. Raise it if
+your model is slower than that; single use and the lockout keep a longer window cheap.
+Codes from the *next* step are accepted too (`WIREHAND_APPROVAL_SKEW_STEPS`, default 1), for
+a phone clock that runs slightly ahead.
 
 If the mode is `totp` and no usable secret is configured, `confirm_change` fails **closed**
 (HTTP 503) with setup instructions. Changes stop; nothing gets applied by accident.
@@ -561,6 +568,7 @@ changes with age).
 | `confirm_change` returns 502 `NOT COMPLETED: the device asked ...` | the platform asks a question wirehand does not know | add the pattern to `CONFIRM_PROMPTS` in `app/platforms.py`; nothing was applied, the session was dropped |
 | `confirm_change` returns 503 with a setup hint | `WIREHAND_CONFIRM_MODE=totp` but no usable `WIREHAND_TOTP_SECRET` | generate one (`docker exec wirehand python -m app.approval --new`), put it in `.env`, `docker compose up -d` - or set `WIREHAND_CONFIRM_MODE=off` |
 | `confirm_change` returns 403 "approval code is not valid (right now)" | phone clock drift, or the model made the number up | compare `docker exec wirehand python -m app.approval` with your app; the change stays staged, just send a fresh code |
+| "approval code is not valid - wrong, or expired" although you read it correctly | the model took longer than `WIREHAND_APPROVAL_MAX_AGE` to call `confirm_change`, or the phone clock is off | send a fresh code; raise `WIREHAND_APPROVAL_MAX_AGE` for slow models; enable automatic time on the phone |
 | "too many wrong approval codes - locked" | five refused approvals in two minutes | wait it out, or raise `WIREHAND_APPROVAL_MAX_FAILURES` / lower `WIREHAND_APPROVAL_LOCKOUT` |
 | A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | if it really is read-only, add it to `_ALLOW` in `app/safety.py`; if it writes, it belongs in `propose_change` |
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
