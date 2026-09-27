@@ -47,7 +47,17 @@ assert c.post("/confirm_change", params={"code": "ZZZZZZ"}, headers=H).status_co
 a = c.post("/confirm_change", params={"code": code}, headers=H)
 assert a.status_code == 200 and "APPLIED" in a.text and main.pool.configured[0][1] == ["interface Loopback10", " description test"], a.text
 assert c.post("/confirm_change", params={"code": code}, headers=H).status_code == 404  # single use
-assert "rollback configuration last 1" in c.post("/rollback_change", params={"device": "r1"}, headers=H).text
+# rollback_change is a WRITE: it must stage like propose_change, not apply on its own
+rb = c.post("/rollback_change", params={"device": "r1"}, headers=H)
+assert rb.status_code == 200 and "STAGED, NOT APPLIED" in rb.text and "rollback configuration last 1" in rb.text, rb.text
+rb_code = rb.text.split("code: ")[1][:6]
+assert all("rollback configuration last 1" not in " ".join(lines) for _, lines, _ in main.pool.configured), main.pool.configured
+a = c.post("/confirm_change", params={"code": rb_code}, headers=H)
+assert a.status_code == 200 and "ROLLED BACK" in a.text and "rollback configuration last 1" in a.text, a.text
+assert c.post("/confirm_change", params={"code": rb_code}, headers=H).status_code == 404       # single use
+assert c.post("/rollback_change", params={"device": "s1"}, headers=H).status_code == 403       # ro device
+assert c.get("/run_read", params={"device": "s1", "commands": "touch /tmp/x"}, headers=H).status_code == 403
+assert c.get("/run_read", params={"device": "r1,nope", "commands": "show version"}, headers=H).status_code == 404
 log = c.get("/get_audit_log", headers=H).text
 assert "propose_change" in log and "confirm_change" in log
 ops = [op["operationId"] for p_ in c.get("/openapi.json").json()["paths"].values() for op in p_.values()]
@@ -80,21 +90,23 @@ assert a.status_code == 200 and main.pool.configured[-1][1][-1] == "end", a.text
 p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\nend"}, headers=H)
 assert p.status_code == 400, p.text
 print("FORTINET BLOCKS OK")
-# auth failure: 401 (not 502), terminal wording, never retried, audited
+# auth failure: 401 (not 502), no auto-retry inside the call, recoverable wording, audited
 from app.transport import AuthError
 class AuthFailPool(FakePool):
     def __init__(self): FakePool.__init__(self); self.attempts = 0
     def run(self, dev, cmds, timeout=60):
         if dev.name == "s1":
             self.attempts += 1
-            raise AuthError("AUTHENTICATION FAILED for 's1' (linux, user 'u'). This is FINAL: do not retry this device.")
+            raise AuthError("AUTHENTICATION FAILED for 's1' (linux, user 'u'). "
+                            "Do NOT repeat this call with the same credentials. "
+                            "This failure is NOT permanent: retry once they are corrected.")
         return FakePool.run(self, dev, cmds, timeout)
 afp = AuthFailPool(); main.pool = afp
 r = c.get("/get_facts", params={"device": "s1"}, headers=H)
-assert r.status_code == 401 and "FINAL" in r.text, (r.status_code, r.text)
+assert r.status_code == 401 and "NOT permanent" in r.text, (r.status_code, r.text)
 r = c.get("/run_read", params={"device": "s1,r1", "commands": "uptime"}, headers=H)
 assert "AUTHENTICATION FAILED" in r.text and "=== r1" in r.text, r.text   # other devices still processed
-assert afp.attempts == 2, afp.attempts                                    # one per call, never retried
+assert afp.attempts == 2, afp.attempts                                    # one per call, no auto-retry
 assert "auth_failed" in c.get("/get_audit_log", headers=H).text
 main.pool = FakePool()
 print("AUTH STOP OK")

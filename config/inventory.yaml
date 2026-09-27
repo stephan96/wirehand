@@ -51,3 +51,4 @@ containerlab:
   credentials:
     fortinet_fortigate: { username: admin, password: env:FGT_PASS }
     # cisco_xrd: { username: clab, password: clab@123 }    # containerlab default, already built in
+    linux: { username: root, password: env:CLAB_ALPINE_SSH_PASS }

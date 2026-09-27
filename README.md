@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.3.6
+**Version:** 0.4.0
 
 ## Summary
 
@@ -61,10 +61,10 @@ The same picture as text:
 |---|---|---|
 | `list_devices(refresh, check)` | read | Device names, platform, access level, mgmt IP. `refresh=true` forces a rescan; `check=true` adds a STATE column (up / DOWN / `up?`) by TCP-probing each SSH port from the wirehand host. |
 | `get_facts(device)` | read | One-call overview bundle (version, interfaces, routing summary, neighbors, recent log) - the intended first step of an analysis. |
-| `run_read(device, commands, filter, context)` | read | Arbitrary read-only commands. `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
+| `run_read(device, commands, filter, context)` | read | Read-only commands. On network devices a blocklist plus argument-level checks; on **Linux devices an allow-list**: only known read-only commands run at all, everything else is refused (see "Key properties"). `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
 | `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char code. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
-| `confirm_change(code)` | write | Applies the staged change: config mode + commit/save for `config`, plain exec for `exec`. Requires `access: rw` on the device. |
-| `rollback_change(device)` | write | IOS-XR / VRPv8 / Junos: native rollback of the last commit. Other platforms: returns the pre-change snapshot so a corrective change can be proposed. |
+| `confirm_change(code)` | write | Applies the staged change: config mode + commit/save for `config`, plain exec for `exec` and for a staged `rollback`. Requires `access: rw` on the device. |
+| `rollback_change(device)` | stage | IOS-XR / VRPv8 / Junos: *stages* a native rollback of the last commit and returns a confirmation code - **undoes nothing** until `confirm_change`. Other platforms: touches nothing and returns the pre-change snapshot so a corrective change can be proposed. |
 | `get_audit_log(device, n)` | read | The last `n` audit entries, optionally filtered by device. |
 
 Output of every tool is plain text (small local models handle text much better than
@@ -75,12 +75,21 @@ output together with the hint to use `filter`.
 
 - **Credentials never reach the LLM.** The model only knows device *names*. Hostnames,
   IPs, users and passwords live server-side (inventory file + environment variables).
-- **Reading is always safe.** `run_read` refuses write/privileged commands (configure,
-  commit, rm, sudo, redirection, pipes into interpreters) no matter what the model asks.
-- **Writing is two-stage and human-gated.** `propose_change` only *stages* a change and
-  returns a confirmation code. Nothing touches the device until a human approves the code
-  in the chat and the model calls `confirm_change` with it. Codes are single-use and
-  expire after 10 minutes.
+- **Reading is always safe.** `run_read` refuses write/privileged commands no matter what
+  the model asks, in three layers: argument-level hard refusals (redirection, chaining,
+  command substitution, `find -delete`, `awk 'BEGIN{system(...)}'`, `ethtool -s`,
+  `journalctl --vacuum`, vendor shell escapes such as IOS-XR `run` or Junos `start shell`,
+  and write-capable pipe modifiers such as `| file`, `| utility`, `| save`), then the write
+  blocklist (configure, commit, rm, sudo, ...), then the allow-list. On **Linux devices the
+  allow-list is the last word**: what is not on it is refused. A blocklist can only name the
+  commands somebody thought of, and on a shell that is never all of them - `touch`, `cp`,
+  `ln -s` and `wget` are exactly the kind that used to slip through. Network CLIs keep the
+  blocklist and allow unknown verbs: their exec view cannot start arbitrary programs, and
+  vendor read verbs are far too varied to enumerate.
+- **Every write is two-stage and human-gated.** `propose_change` and `rollback_change` only
+  *stage* an operation and return a confirmation code. Nothing touches the device until a
+  human approves the code in the chat and the model calls `confirm_change` with it. Codes
+  are single-use and expire after 10 minutes.
 - **Everything is logged.** Every tool call lands in an append-only audit log; every
   proposed change first saves a configuration snapshot (see "Audit log & snapshots").
 
@@ -102,7 +111,8 @@ $EDITOR .env                    # at least WIREHAND_API_KEY and WIREHAND_CLAB_DI
 $EDITOR config/inventory.yaml   # replace the example device with your own (or remove it)
 chmod 600 .env config/inventory.yaml
 
-UID=$(id -u) GID=$(id -g) docker compose up -d --build
+docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
+docker compose up -d
 curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
      http://localhost:8110/list_devices
 ```
@@ -124,7 +134,7 @@ $EDITOR .env                    # see "Configuration" below
 $EDITOR config/inventory.yaml
 chmod 600 .env config/inventory.yaml
 
-UID=$(id -u) GID=$(id -g) docker compose build
+docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
 docker compose up -d
 
 # smoke test (replace the key):
@@ -133,11 +143,22 @@ curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
 docker logs wirehand | grep "device(s)"          # one line per discovered lab
 ```
 
-**Why `UID=$(id -u) GID=$(id -g)`:** bind mounts keep host ownership. A file with mode
+**Why `--build-arg APP_UID/APP_GID`:** bind mounts keep host ownership. A file with mode
 600 is only readable by its *owner*, so the user inside the container must have the same
 uid as you on the host. The build args bake your uid/gid into the image. If you skip
 this on a system where your uid is not 1000, the container dies with
 `PermissionError: ... inventory.yaml`.
+
+Do **not** pass them as a variable prefix (`UID=$(id -u) GID=$(id -g) docker compose ...`):
+bash and zsh mark `UID` read-only. The shell prints `UID: readonly variable`, the build
+then runs anyway and exits 0 with `UID` unset, compose falls back to the `${UID:-1000}`
+default - and you get an image with uid 1000. `GID` is *not* read-only and does get
+through, so the image ends up half right and the one-line error is easy to scroll past.
+
+`--build-arg` works in every shell. If you prefer a one-liner, put `env` in front
+(`env UID=$(id -u) GID=$(id -g) docker compose ...`): that sets the variables for the
+child process instead of the shell. Note that `docker compose up --build` takes no
+`--build-arg`, so building and starting are two commands.
 
 **Why `network_mode: host`:** Docker isolates bridge networks from each other, so a
 normally-bridged container cannot reach the containerlab management bridge
@@ -150,7 +171,8 @@ directly on the host and the local machine is reachable from inside the containe
 ```bash
 tar xzf wirehand-<version>.tar.gz -C ~/docker    # safe: .env and config/inventory.yaml are NOT in the archive (only *.example files)
 cd ~/docker/wirehand
-UID=$(id -u) GID=$(id -g) docker compose up -d --build
+docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
+docker compose up -d
 curl -s http://localhost:8110/openapi.json | grep -o '"version": *"[^"]*"'
 ```
 
@@ -210,13 +232,16 @@ Missing `env:` variables fail the whole inventory load at startup - deliberately
 ### Access levels and Linux accounts
 
 `access: ro` allows `get_facts`/`run_read` only; `rw` additionally allows
-propose/confirm/rollback (config **and** exec mode). Recommended path: everything `ro`,
+propose/confirm/rollback (config **and** exec mode - a rollback is staged and confirmed
+like any other change). Recommended path: everything `ro`,
 lift devices to `rw` one at a time, first write test on a disposable lab node.
 
 For Linux devices, the SSH account is what the LLM gets: the read path can `cat`
 anything that account can read. Use a dedicated low-privilege user rather than your
 personal account, and grant targeted passwordless sudo only for commands you expect in
-changes. The read path never escalates (`sudo` is refused there).
+changes. The read path never escalates (`sudo` is refused there) and runs allow-listed
+read commands only - but an allow-listed `cat` still reads every file the account can
+read, so the account, not the allow-list, is what bounds exposure.
 
 ## Connecting the front-ends
 
@@ -236,11 +261,13 @@ system prompt:
 > device names exactly as shown by list_devices. Start broad analyses with get_facts;
 > for specific questions call run_read directly, and for long outputs always pass a
 > filter regex. Never claim a command ran unless you called a tool; base all findings
-> on tool output only. Changes: call propose_change, show the user the preview and the
-> code, then stop and wait for explicit approval; only then call confirm_change with
-> that exact code. Maintenance commands (reset, clear, process restarts) go through
-> propose_change with mode='exec', never run_read. If unsure about platform CLI syntax,
-> verify it via web search before proposing a change.
+> on tool output only. On AUTHENTICATION FAILED, report it and stop for that device; if
+> the user says the credentials are fixed, call list_devices(refresh=true) and try
+> again. Changes: call propose_change, show the user the preview and the code, then
+> stop and wait for explicit approval; only then call confirm_change with that exact
+> code. Maintenance commands (reset, clear, process restarts) go through propose_change
+> with mode='exec', never run_read. If unsure about platform CLI syntax, verify it via
+> web search before proposing a change.
 
 
 #### Extended prompt: forgotten tool switch
@@ -255,7 +282,9 @@ message. Same text as above, with the middle paragraph added:
 > device names exactly as shown by list_devices. Start broad analyses with get_facts;
 > for specific questions call run_read directly, and for long outputs always pass a
 > filter regex. Never claim a command ran unless you called a tool; base all findings
-> on tool output only.
+> on tool output only. On AUTHENTICATION FAILED, report it and stop for that device; if
+> the user says the credentials are fixed, call list_devices(refresh=true) and try
+> again.
 >
 > Tool availability: the wirehand tools (list_devices, get_facts, run_read,
 > propose_change, confirm_change, rollback_change, get_audit_log) are only present when
@@ -269,7 +298,9 @@ message. Same text as above, with the middle paragraph added:
 > normally.
 >
 > Changes: call propose_change, show the user the preview and the code, then stop and
-> wait for explicit approval; only then call confirm_change with that exact code.
+> wait for explicit approval; only then call confirm_change with that exact code. The
+> same applies to rollback_change: it only stages the undo and returns a code, so show
+> it, wait for approval, then call confirm_change.
 > Maintenance commands (reset, clear, process restarts) go through propose_change with
 > mode='exec', never run_read. If unsure about platform CLI syntax, verify it via web
 > search before proposing a change.
@@ -362,7 +393,7 @@ and destroy unused labs with `--cleanup` so their generated folders disappear.
 
 | Family | Change path | Rollback |
 |---|---|---|
-| cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`) |
+| cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed |
 | cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot only -> corrective change |
 | fortinet | config-set (persists immediately) | snapshot only |
 | linux | commands run sequentially as the login user | none - include backups in the change (`sudo cp x x.bak`) |
@@ -404,7 +435,7 @@ docker cp wirehand:/app/data ./wirehand-data-backup
 ```
 
 Each audit entry holds timestamp, event (`run_read`, `propose_change`, `confirm_change`,
-`rollback`, ...), device, the commands/lines involved and, for changes, the confirmation
+`rollback_staged`, `rollback_snapshot`, ...), device, the commands/lines involved and, for changes, the confirmation
 code and snapshot path - never credentials. The file is plain JSONL: one JSON object per
 line, greppable and jq-able.
 
@@ -416,15 +447,16 @@ changes with age).
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `PermissionError ... inventory.yaml` at startup | container uid != owner of the 600-file | rebuild with `UID=$(id -u) GID=$(id -g)`; once: `docker volume rm wirehand_wirehand_data` |
+| `PermissionError ... inventory.yaml` at startup | container uid != owner of the 600-file | rebuild with `docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)`; once: `docker volume rm wirehand_wirehand_data` |
 | `env var 'X' which is not set` | dotenv syntax (spaces, `#` in value) or `.env` edited without recreate | fix syntax; `docker compose up -d` (not `restart`) |
 | Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
 | Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
+| A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | if it really is read-only, add it to `_ALLOW` in `app/safety.py`; if it writes, it belongs in `propose_change` |
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
 | Ubuntu2/local host unreachable | sshd not listening on the address used | with host networking use `host: 127.0.0.1` |
 | Change fails with prompt/timeout errors | wrong Netmiko driver for the platform | check `kinds:` mapping (VRP5 vs VRP8 is the classic) |
-| `AUTHENTICATION FAILED` (HTTP 401) | stored credentials rejected by the device | fix them server-side: `config/inventory.yaml` (manual device) or `containerlab.credentials` for that kind, then `docker compose up -d`. The tool never retries auth failures - they are terminal by design. |
+| `AUTHENTICATION FAILED` (HTTP 401) | stored credentials rejected by the device | fix them server-side: `config/inventory.yaml` (manual device) or `containerlab.credentials` for that kind. Edits to `inventory.yaml` are picked up within `WIREHAND_CLAB_RESCAN` seconds (30 by default); `list_devices(refresh=true)` applies them at once, and only `env:` credentials need `docker compose up -d`. The tool never retries an auth failure by itself, but the device is **not** blocked: once the credentials are corrected the next call uses them and succeeds. |
 
 ## Tests
 

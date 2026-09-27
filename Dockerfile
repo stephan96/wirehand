@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 # Match the host user that owns the bind-mounted config (default uid/gid 1000).
-# Build with:  UID=$(id -u) GID=$(id -g) docker compose build
+# Build with:  docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
 ARG APP_UID=1000
 ARG APP_GID=1000
 RUN groupadd --gid ${APP_GID} appuser 2>/dev/null || true \
