@@ -32,6 +32,7 @@ from .approval import Approver, ConfigError
 from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
 from .state import ChangeStore, audit, read_audit
+from .platforms import pending_prompt
 from .transport import AuthError, Pool, check_devices
 
 logging.basicConfig(level=os.environ.get("WIREHAND_LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -65,7 +66,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.5.0",
+    version="0.5.2",
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
@@ -396,7 +397,9 @@ def confirm_change(
         raise HTTPException(404, str(exc))
     try:
         if pc.mode in ("exec", "rollback"):
-            out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120))
+            # prompts="yes": a human approved this operation, so a device that asks
+            # "Continue? [Y/N]" gets its answer instead of stalling the session.
+            out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120, prompts="yes"))
         else:
             out = pool.configure(dev, pc.lines, commit=platforms.COMMITS.get(dev.family, False))
     except AuthError as exc:
@@ -405,6 +408,18 @@ def confirm_change(
     except Exception as exc:
         audit("confirm_change_error", dev.name, code=code, error=str(exc))
         raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. Snapshot {pc.snapshot_path} is available for rollback.")
+    # Never report success while the device is still asking a question: the
+    # command has not run then, and saying "ROLLED BACK" when nothing was rolled
+    # back is worse than failing.
+    stuck = pending_prompt(out)
+    if stuck:
+        pool.reset(dev)          # the session is sitting at that question
+        audit("confirm_incomplete", dev.name, code=code, mode=pc.mode, question=stuck[0])
+        raise HTTPException(502, (
+            f"NOT COMPLETED on {dev.name}: the device asked '{stuck[0]}' and is still waiting, "
+            f"so the operation did NOT run. Nothing was applied by this call. Report this to the "
+            f"user - it needs a fix on the wirehand host (the prompt is unknown to "
+            f"platforms.CONFIRM_PROMPTS), not another attempt.\n\n{truncate(out, 4000)}"))
     audit("confirm_change", dev.name, code=code, lines=pc.lines, mode=pc.mode,
           approval=approver.mode_for(dev.confirm))
     if pc.mode == "rollback":

@@ -56,6 +56,30 @@ def test_clock_skew_window():
     assert not b.verify(stale, now).ok     # but not a code from two minutes ago
 
 
+def test_slow_model_window():
+    """A model that thinks for a while before confirm_change must not lose the race."""
+    secret = new_secret()
+    key = normalize_secret(secret)
+    shown_until = 1_000_000_020 - 1_000_000_020 % STEP_SECONDS      # a step boundary
+    code = hotp(key, shown_until // STEP_SECONDS - 1)             # read out just before rollover
+    assert Approver(secret=secret, mode="totp", max_age=120).verify(code, shown_until + 119).ok
+    late = Approver(secret=secret, mode="totp", max_age=120).verify(code, shown_until + 121)
+    assert not late.ok and "expired" in late.reason
+    assert Approver(secret=secret, mode="totp", max_age=600).verify(code, shown_until + 500).ok
+    # the future side stays a small clock-drift allowance
+    ahead = hotp(key, shown_until // STEP_SECONDS + 3)
+    assert not Approver(secret=secret, mode="totp", max_age=600).verify(ahead, shown_until).ok
+
+
+def test_used_code_stays_used_for_whole_window():
+    secret = new_secret()
+    now = 1_000_000_000.0
+    code = hotp(normalize_secret(secret), int(now // STEP_SECONDS))
+    a = Approver(secret=secret, mode="totp", max_age=300)
+    assert a.verify(code, now).ok
+    assert not a.verify(code, now + 250).ok                        # not forgotten mid-window
+
+
 def test_modes_and_per_device_override():
     a = Approver(secret=new_secret(), mode="totp")
     assert a.requires_approval(None) and a.requires_approval("totp")

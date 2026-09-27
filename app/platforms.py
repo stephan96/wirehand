@@ -1,5 +1,6 @@
 """Per-platform command bundles. One place to extend when a new device family
 shows up. Keys are the `family` property of inventory.Device."""
+import re
 
 FACTS: dict[str, list[str]] = {
     "linux": [
@@ -51,3 +52,45 @@ COMMITS: dict[str, bool] = {
     "ios": True, "eos": True, "nxos": True, "vrp": True,  # save_config
     "fortinet": False, "linux": False,
 }
+
+
+# Commands sent once when a session opens. Huawei VRP asks for confirmation on
+# maintenance commands ("Continue? [Y/N]:"); mmi-mode is the vendor's own switch
+# for exactly this case - it tells the CLI a machine is typing, and the questions
+# stop. Best effort: if the image does not know the command, nothing breaks.
+SESSION_PREP: dict[str, list[str]] = {
+    "vrp": ["mmi-mode enable"],
+    "vrpv8": ["mmi-mode enable"],
+}
+
+# Devices that ask before they act. Netmiko's send_command returns as soon as the
+# output looks like a prompt - the ']' in '[Y/N]' is enough - so the command has
+# NOT run yet and the session sits at the question until somebody answers it.
+# (question pattern, answer to go ahead, answer to back out)
+_TAIL = r"\s*(?:\[[^\]\n]{1,8}\]|\([^)\n]{1,8}\))?\s*[:?]?\s*$"
+CONFIRM_PROMPTS: list[tuple[str, str, str]] = [
+    (r"\[y/n\]" + _TAIL, "Y", "N"),            # Huawei VRP, FortiGate
+    (r"\[yes/no\]" + _TAIL, "yes", "no"),
+    (r"\(y/n\)" + _TAIL, "y", "n"),
+    (r"\[yes,no\]" + _TAIL, "yes", "no"),      # Junos
+    (r"\[confirm\]" + _TAIL, "y", "n"),        # Cisco IOS: 'clear counters [confirm]'
+    (r"\bcontinue\?" + _TAIL, "y", "n"),
+    (r"\bare you sure\?" + _TAIL, "y", "n"),
+    (r"\bproceed\??" + _TAIL, "y", "n"),
+]
+CONFIRM_PROMPTS_RX = [(re.compile(p, re.IGNORECASE), yes, no) for p, yes, no in CONFIRM_PROMPTS]
+
+
+def pending_prompt(text: str) -> tuple[str, str, str] | None:
+    """(question, answer-to-proceed, answer-to-abort) if `text` ENDS in a device
+    question that is still waiting for an answer, else None.
+
+    Only the tail is examined: a running-config may contain '[Y/N]' in some
+    description, but only a question at the very end means the session is
+    sitting at a prompt."""
+    tail = (text or "")[-200:]
+    for rx, yes, no in CONFIRM_PROMPTS_RX:
+        m = rx.search(tail)
+        if m:
+            return m.group(0).strip(), yes, no
+    return None
