@@ -85,6 +85,17 @@ class ChangeStore:
             self._pending[code] = pc
         return pc
 
+    def peek(self, code: str) -> PendingChange:
+        """Look up a staged change WITHOUT consuming it - confirm_change has to
+        check the human approval first, and a wrong code must not throw the
+        staged change away."""
+        with self._lock:
+            self._purge()
+            pc = self._pending.get(code.strip().upper())
+        if pc is None:
+            raise KeyError(f"no pending change with code '{code}' (expired after {CHANGE_TTL}s, or already applied)")
+        return pc
+
     def pop(self, code: str) -> PendingChange:
         with self._lock:
             self._purge()

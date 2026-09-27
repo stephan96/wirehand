@@ -134,8 +134,21 @@ The response ends with the 6-character code, e.g.
 
 ## 5. confirm_change - apply the staged change
 
+Unless the device is set to `confirm: off` (or `WIREHAND_CONFIRM_MODE=off`), this also
+needs `approval`: the current 6-digit code from the authenticator app holding
+`WIREHAND_TOTP_SECRET`. Without it the call is refused and the change stays staged.
+
 ```bash
-curl -s -H "$AUTH" -X POST "$WH/confirm_change?code=7F80AE"
+# with approval (the normal case)
+curl -s -H "$AUTH" -X POST "$WH/confirm_change?code=7F80AE&approval=734891"
+
+# no approval / a made-up one -> 403, change still staged
+curl -s -i -H "$AUTH" -X POST "$WH/confirm_change?code=7F80AE" | head -1
+curl -s -i -H "$AUTH" -X POST "$WH/confirm_change?code=7F80AE&approval=123456" | head -1
+
+# what the current code is (on the wirehand host, for testing - normally you read
+# this from your phone)
+docker exec wirehand python -m app.approval
 ```
 
 Propose and confirm in one go (grabs the code automatically - convenient for smoke tests,

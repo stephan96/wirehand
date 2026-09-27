@@ -99,6 +99,7 @@ def _parse_ansible(path: Path, lab: str, cfg: dict) -> list[dict]:
                 "username": user,
                 "password": pw,
                 "access": (kinds_cfg.get(kind) or {}).get("access") or cfg.get("default_access", "rw"),
+                "confirm": (kinds_cfg.get(kind) or {}).get("confirm") or cfg.get("default_confirm"),
                 "description": f"containerlab {lab} / {kind}",
                 "tags": ["clab", lab, kind],
                 "source": f"containerlab:{lab}",
@@ -126,6 +127,7 @@ def _parse_topology_json(path: Path, lab: str, cfg: dict) -> list[dict]:
             "name": f"{lab}-{node}", "host": ip, "device_type": dev_type,
             "username": user, "password": pw,
             "access": (kinds_cfg.get(kind) or {}).get("access") or cfg.get("default_access", "rw"),
+                "confirm": (kinds_cfg.get(kind) or {}).get("confirm") or cfg.get("default_confirm"),
             "description": f"containerlab {lab} / {kind}", "tags": ["clab", lab, kind],
             "source": f"containerlab:{lab}",
         })

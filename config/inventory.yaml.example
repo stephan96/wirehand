@@ -2,6 +2,9 @@
 # Manual devices. The LLM only sees: name, platform, access, description, tags.
 # Credentials: env:VARNAME -> resolved from the container environment (.env).
 # access: ro (default) | rw.
+# confirm: totp | off - who may approve a change on this device. Default comes from
+#          WIREHAND_CONFIRM_MODE; 'off' lets the model confirm its own proposal, so
+#          use it only for disposable devices.
 # device_type = Netmiko driver: linux, cisco_ios, cisco_xe, cisco_xr, cisco_nxos,
 #               huawei, huawei_vrpv8, fortinet, arista_eos, juniper_junos
 # A manual entry with the same name as a discovered containerlab node overrides it.
