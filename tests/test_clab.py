@@ -188,3 +188,24 @@ def test_unchanged_device_keeps_pooled_session(monkeypatch):
     pool.run(Device(**kw), ["uptime"])
     pool.run(Device(**kw), ["uptime"])          # equal, but a different object
     assert len(opened) == 1
+
+
+def test_clab_confirm_defaults_and_per_kind_override(tmp_path):
+    """`default_confirm` reaches discovered nodes, and a per-kind `confirm: off`
+    is not swallowed by YAML 1.1 turning it into False."""
+    make(tmp_path)
+    inv_file = tmp_path / "inventory.yaml"
+    inv_file.write_text("""devices: {}
+containerlab:
+  default_confirm: totp
+  kinds:
+    cisco_xrd: {confirm: off}
+    huawei_vrp: {access: ro}
+  credentials:
+    fortinet_fortigate: {username: admin, password: x}
+""")
+    inv = Inventory(inv_file, str(tmp_path))
+    assert inv.get("xrd-test-xrd1").confirm == "off"      # per-kind wins over the default
+    assert inv.get("xrd-test-fgt1").confirm == "totp"     # falls back to default_confirm
+    assert inv.get("hui-r11").confirm == "totp"           # ... also on the topology-json path
+    assert inv.get("hui-r11").access == "ro"              # per-kind access still applies

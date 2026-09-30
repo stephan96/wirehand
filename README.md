@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.5.2
+**Version:** 0.5.3
 
 ## Summary
 
@@ -231,15 +231,21 @@ devices:                       # manual devices; {} if you only use containerlab
     description: containerlab host
     tags: [host, linux]
 
-containerlab:
-  default_access: rw           # labs are disposable; set ro for the cautious default
-  default_confirm: off         # ... and may be changed without a one-time code; omit for totp
+containerlab:                  # defaults for every *discovered* lab node
+  default_access: rw           # ro | rw for discovered nodes; labs are disposable
+  default_confirm: off         # totp | off for discovered nodes - the global
+                               #   WIREHAND_CONFIRM_MODE applies when omitted
   long_names: false            # true -> full names like clab-xrd-test-xrd1
-  kinds:                       # per-kind overrides of driver or access
+  kinds:                       # per-kind overrides; beat the two defaults above
     huawei_vrp: { device_type: huawei_vrpv8 }   # NE40E/CE = VRP8; 'huawei' for VRP5 images
+    cisco_xrd: { access: rw, confirm: off }     # device_type | access | confirm
   credentials:                 # for kinds whose generated inventory has no password
     fortinet_fortigate: { username: admin, password: env:FGT_PASS }
 ```
+
+Discovered nodes get no `confirm:` of their own - they are not in this file - so
+`containerlab.default_confirm` (or `kinds.<kind>.confirm`) is the only place to set it
+for them. A node listed under `devices:` is a manual device and uses its own `confirm:`.
 
 `device_type` is the Netmiko driver: `linux`, `cisco_ios`, `cisco_xe`, `cisco_xr`,
 `cisco_nxos`, `huawei`, `huawei_vrpv8`, `fortinet`, `arista_eos`, `juniper_junos`.
@@ -283,9 +289,20 @@ approval is a **time-based one-time code (TOTP)** that only a human can read:
 | `totp` (default) | `code` **and** a fresh 6-digit code from your authenticator app | anything you care about |
 | `off` | `code` only - the model may apply its own proposal | disposable labs, unattended runs |
 
-`confirm: totp` / `confirm: off` per device in `inventory.yaml` (and
-`containerlab.default_confirm` for discovered nodes) overrides the global mode, so lab
-nodes can stay frictionless while real devices need a human.
+`confirm: totp` / `confirm: off` per device in [`config/inventory.yaml`](#configinventoryyaml)
+overrides the global mode, so lab nodes can stay frictionless while real devices need a
+human. Containerlab nodes are discovered rather than listed, so theirs is set once for
+the whole fleet as `containerlab.default_confirm` - or per kind as
+`containerlab.kinds.<kind>.confirm`, which wins over it. Resolution order for any device:
+
+```
+device `confirm:`  >  kinds.<kind>.confirm  >  containerlab.default_confirm  >  WIREHAND_CONFIRM_MODE
+```
+
+Write `off` unquoted if you like: YAML turns it into a boolean and Wirehand accepts that
+spelling. Anything other than `totp`/`off` fails the inventory load at startup. Until
+0.5.2 that boolean was read as "unset" on the containerlab path, so a per-kind
+`confirm: off` was silently ignored and the node kept asking for a code.
 
 ### Setting it up
 
