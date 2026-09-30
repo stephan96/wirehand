@@ -247,8 +247,62 @@ Discovered nodes get no `confirm:` of their own - they are not in this file - so
 `containerlab.default_confirm` (or `kinds.<kind>.confirm`) is the only place to set it
 for them. A node listed under `devices:` is a manual device and uses its own `confirm:`.
 
+`config/inventory.yaml.example` ships the same structure with every key spelled out,
+including the ones the example above leaves at their default.
+
+### Every key a device accepts
+
+| Key | Default | Meaning |
+|---|---|---|
+| `host` | *required* | IP or hostname; resolved inside the container |
+| `device_type` | *required* | Netmiko driver, see the list below |
+| `username` | *required* | the account the LLM effectively works as |
+| `password` | - | omit entirely when using `key_file` |
+| `key_file` | - | private key **inside the container** - see below |
+| `secret` | - | enable password; used on `cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos` |
+| `port` | `22` | SSH port |
+| `timeout` | `30` | seconds Netmiko waits for a single command |
+| `access` | `ro` | `ro` \| `rw` - whether the device may be changed at all |
+| `confirm` | `WIREHAND_CONFIRM_MODE` | `totp` \| `off` - who may approve a change |
+| `description` | `""` | free text, shown to the model |
+| `tags` | `[]` | free-form labels, shown to the model |
+
 `device_type` is the Netmiko driver: `linux`, `cisco_ios`, `cisco_xe`, `cisco_xr`,
 `cisco_nxos`, `huawei`, `huawei_vrpv8`, `fortinet`, `arista_eos`, `juniper_junos`.
+
+`env:VARNAME` works for `username`, `password` and `secret`. It does **not** work for
+`key_file`, which is a path rather than a credential.
+
+`secret` is only consulted on the four platforms listed - it triggers Netmiko's `enable()`
+when a session opens. On a device whose account already lands in privileged mode, leave
+it out.
+
+Unknown keys are refused rather than ignored, so a typo like `passwrod:` fails the load
+instead of silently producing a device without a password. The startup error is a raw
+`TypeError` naming the key, but not yet the device.
+
+### Key-based authentication
+
+`key_file` is a path *in the container*, and only two host paths are mounted: `./config`
+(read-only) and `WIREHAND_CLAB_DIR`. So the key belongs in `config/` and is referenced as
+`/app/config/<name>`:
+
+```yaml
+edge-rtr1:
+  host: 192.0.2.30
+  device_type: cisco_xr
+  username: netops
+  key_file: /app/config/id_ed25519   # no 'password:' needed
+  access: ro
+```
+
+The container runs as `appuser` with the UID the image was built with
+(`--build-arg APP_UID=$(id -u)`), so the key file has to be readable by that UID -
+`chmod 600` plus matching ownership on the host.
+
+An encrypted key works: there is no `passphrase:` key, but Paramiko falls back to
+`password` for key decryption, so put the passphrase in `password:` (`env:` and all).
+Then `password` is the passphrase, not an SSH password - the device never sees it.
 
 Missing `env:` variables fail the whole inventory load at startup - deliberately
 (fail-fast beats a device with half-empty credentials). Remove dead references.
