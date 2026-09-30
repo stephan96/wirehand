@@ -209,3 +209,41 @@ containerlab:
     assert inv.get("xrd-test-fgt1").confirm == "totp"     # falls back to default_confirm
     assert inv.get("hui-r11").confirm == "totp"           # ... also on the topology-json path
     assert inv.get("hui-r11").access == "ro"              # per-kind access still applies
+
+
+def test_bad_inventory_keys_name_the_device(tmp_path):
+    """A typo or a missing key must fail the load with a message that says WHICH
+    device is wrong - a bare TypeError from Device(**spec) does not."""
+    inv_file = tmp_path / "inventory.yaml"
+
+    def err(body: str) -> str:
+        inv_file.write_text(body)
+        try:
+            Inventory(inv_file, "")
+        except RuntimeError as exc:
+            return str(exc)
+        raise AssertionError("expected RuntimeError")
+
+    msg = err("devices:\n  core-sw1: {host: 1.1.1.1, device_type: linux, username: u, passwrod: p}\n")
+    assert "core-sw1" in msg and "passwrod" in msg and "password" in msg   # names the typo and the real key
+    assert "device_type" in err("devices:\n  core-sw1: {host: 1.1.1.1, username: u}\n")
+    assert "username" in err("devices:\n  core-sw1: {host: 1.1.1.1, device_type: linux}\n")
+
+    # every key the README documents is accepted
+    inv_file.write_text("""devices:
+  core-sw1:
+    host: 1.1.1.1
+    device_type: cisco_ios
+    username: u
+    key_file: /app/config/id_ed25519
+    secret: s
+    port: 2222
+    timeout: 60
+    access: rw
+    confirm: off
+    description: d
+    tags: [a]
+""")
+    d = Inventory(inv_file, "").get("core-sw1")
+    assert (d.port, d.timeout, d.secret, d.confirm) == (2222, 60, "s", "off")
+    assert d.netmiko_kwargs()["use_keys"] is True and "password" not in d.netmiko_kwargs()

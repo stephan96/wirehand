@@ -278,8 +278,15 @@ when a session opens. On a device whose account already lands in privileged mode
 it out.
 
 Unknown keys are refused rather than ignored, so a typo like `passwrod:` fails the load
-instead of silently producing a device without a password. The startup error is a raw
-`TypeError` naming the key, but not yet the device.
+instead of silently producing a device without a password. The error names the device, the
+key it choked on and the keys that do exist:
+
+```
+device 'core-sw1': unknown key(s) passwrod. Known keys: access, confirm, description,
+device_type, host, key_file, password, port, secret, tags, timeout, username
+```
+
+A missing `host`, `device_type` or `username` fails the same way.
 
 ### Key-based authentication
 
