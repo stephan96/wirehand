@@ -4,47 +4,49 @@
 
 **Version:** 0.5.3
 
+
 ## Summary
 
-wirehand lets an LLM front-end (Open WebUI, Onyx) work on real network devices and Linux
-servers over SSH: run show commands, analyze the output, and - with explicit human
-approval - apply configuration changes.
+**wirehand** lets an LLM front-end such as Open WebUI or Onyx work on real network
+devices and Linux servers over SSH. It can:
 
-It is a small FastAPI service that presents a handful of well-described tools via
-OpenAPI; any front-end that speaks "OpenAPI tool server" can use it. Devices come from
-containerlab auto-discovery and/or a manual inventory file, credentials stay on the
-server, and every change is staged, human-approved, snapshotted and audited.
+- run CLI commands to collect system status
+- analyze the output
+- apply configuration changes, with explicit human approval
+
+wirehand works with devices that are listed in its inventory and reachable via SSH
+from the host it runs on. Inventory entries come from a manual inventory file or from a
+Containerlab auto-discovery feature.
+
+wirehand is a small FastAPI service, shipped as a Docker container, that exposes a
+handful of well-described tools via OpenAPI. Any front-end that can use an
+"OpenAPI tool server" can use wirehand.
+
+**Platform support**
+
+wirehand uses [Netmiko](https://github.com/ktbyers/netmiko) for SSH, but only accepts
+the device types it has platform logic for (facts bundles, commit/rollback handling):
+
+| Status | `device_type` |
+|---|---|
+| Tested | `cisco_xr`, `huawei_vrpv8`, `fortinet`, `linux` |
+| Implemented, not yet tested | `cisco_ios`, `cisco_xe`, `cisco_nxos`, `huawei`, `arista_eos`, `juniper_junos` |
+
+Other Netmiko platforms are rejected when the inventory loads. Supporting them needs
+a new entry in `PLATFORMS` (`app/inventory.py`) plus the matching platform logic.
+
+**Security by design**
+
+- Credentials stay on the wirehand server; the LLM never sees them.
+- Every change is staged, human-approved via a one-time TOTP code, snapshotted and
+  audited. TOTP approval can be turned off globally or per device (e.g. for disposable
+  lab nodes); see Configuration.
 
 ## How it works
 
 ![wirehand high-level view](wirehand_high_level_view_v0.1.png)
 
-The same picture as text:
 
-```
-  LLM & Orchestration                  Tool Server                       Target Devices
-
-+----------------------+      +----------------------------+       +------------------------+
-| Linux                |      | Linux VM                   |       |                        |
-|                      |      |                            |       | +--------------------+ |
-| +------------------+ |      | +------------------------+ |   +---->| Cisco IOS XR       | |
-| | Open WebUI       | |      | | wirehand (container)   | |   |   | | (container)        | |
-| | (container)      | |      | |                        | |   |   | +--------------------+ |
-| |  +------------+  | |      | |  +------------------+  | |   +---->| Huawei VRP         | |
-| |  |Integrations|<-----http----->| FastAPI/OpenAPI  |  | |   |   | | (container)        | |
-| |  |  -> Tools  |  | |      | |  |   Tool Server    |  | |   |   | +--------------------+ |
-| |  +------------+  | |      | |  +--+---------------+  | |   +---->| Fortigate          | |
-| +------------------+ |      | |     :                  | |   |   | | (KVM / container)  | |
-| | ollama           | |      | |     :..> Inventory     | |   |   | +--------------------+ |
-| |  +------------+  | |      | |     :..> Permissions   | |   +---->| Linux              | |
-| |  | local LLM  |  | |      | |     :..> Credentials   | |   |   | |                    | |
-| |  +------------+  | |      | |     '..> Netmiko -ssh--------+   | +--------------------+ |
-| +------------------+ |      | |                        | |   '---->| to be continued... | |
-|                      |      | +------------------------+ |       | |                    | |
-|                      |      |                            |       | +--------------------+ |
-|                      |      |                            |       |                        |
-+----------------------+      +----------------------------+       +------------------------+
-```
 
 1. **LLM & Orchestration:** the user chats in Open WebUI; the model (here a local LLM
    served by ollama) decides to call a wirehand tool, which Open WebUI sends over HTTP.
@@ -174,6 +176,10 @@ directly on the host and the local machine is reachable from inside the containe
 
 ## Updating to a new version
 
+Do **not** unpack the tarball *inside* `~/docker/wirehand` - the archive contains the
+`wirehand/` folder as prefix and you would end up with a nested copy while building
+the old code. Unpack in the parent (`~/docker`).
+
 ```bash
 tar xzf wirehand-<version>.tar.gz -C ~/docker    # safe: .env and config/inventory.yaml are NOT in the archive (only *.example files)
 cd ~/docker/wirehand
@@ -186,15 +192,13 @@ curl -s http://localhost:8110/openapi.json | grep -o '"version": *"[^"]*"'
 by default, so `confirm_change` answers 503 until you either set `WIREHAND_TOTP_SECRET`
 (`docker exec wirehand python -m app.approval --new`) or set `WIREHAND_CONFIRM_MODE=off`
 to keep the old behaviour. Reading, proposing and staging keep working either way -
-only the apply step is gated. `curl -s http://localhost:8110/health` shows
-`confirm_mode` and `approval_ready`.
+only the apply step is gated.
 
-Do **not** unpack the tarball *inside* `~/docker/wirehand` - the archive contains the
-`wirehand/` folder as prefix and you would end up with a nested copy while building
-the old code. Unpack in the parent (`~/docker`).
+`curl -s http://localhost:8110/health` shows `confirm_mode` and `approval_ready`.
 
-Open WebUI caches the tool description: after an update, toggle the tool-server entry
-off/on (or re-add it) so the model sees the new tool descriptions.
+
+**Open WebUI caches the tool description: after an update, toggle the tool-server entry
+off/on (or re-add it) so the model sees the new tool descriptions.**
 
 ## Configuration
 
@@ -206,8 +210,8 @@ WIREHAND_CONFIRM_MODE=totp                    # totp (default) | off - see "Appr
 WIREHAND_TOTP_SECRET=JBSWY3DPEHPK3PXP...      # docker exec wirehand python -m app.approval --new
 WIREHAND_APPROVAL_MAX_AGE=120                 # seconds a code stays valid after the app moves on
 WIREHAND_CLAB_DIR=/home/stephan/containerlabs   # host path with your labs
-UBUNTU2_USER=netops                           # credentials referenced from inventory.yaml
-UBUNTU2_PASS=...
+UBUNTU_USER=netops                           # credentials referenced from inventory.yaml
+UBUNTU_PASS=...
 ```
 
 Dotenv rules that bite in practice: no spaces around `=`, no `export`, and everything
@@ -221,11 +225,11 @@ need `docker compose up -d` (a plain `restart` does not reread it).
 
 ```yaml
 devices:                       # manual devices; {} if you only use containerlab
-  ubuntu2:
+  UBUNTU:
     host: 127.0.0.1            # the clab host itself, via host networking
     device_type: linux
-    username: env:UBUNTU2_USER # env:VAR -> resolved from the container environment
-    password: env:UBUNTU2_PASS
+    username: env:UBUNTU_USER # env:VAR -> resolved from the container environment
+    password: env:UBUNTU_PASS
     access: ro                 # ro (default) | rw; start ro, lift deliberately
     confirm: totp              # totp | off - overrides WIREHAND_CONFIRM_MODE for this device
     description: containerlab host
@@ -650,7 +654,7 @@ changes with age).
 | "too many wrong approval codes - locked" | five refused approvals in two minutes | wait it out, or raise `WIREHAND_APPROVAL_MAX_FAILURES` / lower `WIREHAND_APPROVAL_LOCKOUT` |
 | A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | if it really is read-only, add it to `_ALLOW` in `app/safety.py`; if it writes, it belongs in `propose_change` |
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
-| Ubuntu2/local host unreachable | sshd not listening on the address used | with host networking use `host: 127.0.0.1` |
+| UBUNTU/local host unreachable | sshd not listening on the address used | with host networking use `host: 127.0.0.1` |
 | Change fails with prompt/timeout errors | wrong Netmiko driver for the platform | check `kinds:` mapping (VRP5 vs VRP8 is the classic) |
 | `AUTHENTICATION FAILED` (HTTP 401) | stored credentials rejected by the device | fix them server-side: `config/inventory.yaml` (manual device) or `containerlab.credentials` for that kind. Edits to `inventory.yaml` are picked up within `WIREHAND_CLAB_RESCAN` seconds (30 by default); `list_devices(refresh=true)` applies them at once, and only `env:` credentials need `docker compose up -d`. The tool never retries an auth failure by itself, but the device is **not** blocked: once the credentials are corrected the next call uses them and succeeds. |
 
