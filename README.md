@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.5.2
+**Version:** 0.5.3
 
 ## Summary
 
@@ -231,18 +231,85 @@ devices:                       # manual devices; {} if you only use containerlab
     description: containerlab host
     tags: [host, linux]
 
-containerlab:
-  default_access: rw           # labs are disposable; set ro for the cautious default
-  default_confirm: off         # ... and may be changed without a one-time code; omit for totp
+containerlab:                  # defaults for every *discovered* lab node
+  default_access: rw           # ro | rw for discovered nodes; labs are disposable
+  default_confirm: off         # totp | off for discovered nodes - the global
+                               #   WIREHAND_CONFIRM_MODE applies when omitted
   long_names: false            # true -> full names like clab-xrd-test-xrd1
-  kinds:                       # per-kind overrides of driver or access
+  kinds:                       # per-kind overrides; beat the two defaults above
     huawei_vrp: { device_type: huawei_vrpv8 }   # NE40E/CE = VRP8; 'huawei' for VRP5 images
+    cisco_xrd: { access: rw, confirm: off }     # device_type | access | confirm
   credentials:                 # for kinds whose generated inventory has no password
     fortinet_fortigate: { username: admin, password: env:FGT_PASS }
 ```
 
+Discovered nodes get no `confirm:` of their own - they are not in this file - so
+`containerlab.default_confirm` (or `kinds.<kind>.confirm`) is the only place to set it
+for them. A node listed under `devices:` is a manual device and uses its own `confirm:`.
+
+`config/inventory.yaml.example` ships the same structure with every key spelled out,
+including the ones the example above leaves at their default.
+
+### Every key a device accepts
+
+| Key | Default | Meaning |
+|---|---|---|
+| `host` | *required* | IP or hostname; resolved inside the container |
+| `device_type` | *required* | Netmiko driver, see the list below |
+| `username` | *required* | the account the LLM effectively works as |
+| `password` | - | omit entirely when using `key_file` |
+| `key_file` | - | private key **inside the container** - see below |
+| `secret` | - | enable password; used on `cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos` |
+| `port` | `22` | SSH port |
+| `timeout` | `30` | seconds Netmiko waits for a single command |
+| `access` | `ro` | `ro` \| `rw` - whether the device may be changed at all |
+| `confirm` | `WIREHAND_CONFIRM_MODE` | `totp` \| `off` - who may approve a change |
+| `description` | `""` | free text, shown to the model |
+| `tags` | `[]` | free-form labels, shown to the model |
+
 `device_type` is the Netmiko driver: `linux`, `cisco_ios`, `cisco_xe`, `cisco_xr`,
 `cisco_nxos`, `huawei`, `huawei_vrpv8`, `fortinet`, `arista_eos`, `juniper_junos`.
+
+`env:VARNAME` works for `username`, `password` and `secret`. It does **not** work for
+`key_file`, which is a path rather than a credential.
+
+`secret` is only consulted on the four platforms listed - it triggers Netmiko's `enable()`
+when a session opens. On a device whose account already lands in privileged mode, leave
+it out.
+
+Unknown keys are refused rather than ignored, so a typo like `passwrod:` fails the load
+instead of silently producing a device without a password. The error names the device, the
+key it choked on and the keys that do exist:
+
+```
+device 'core-sw1': unknown key(s) passwrod. Known keys: access, confirm, description,
+device_type, host, key_file, password, port, secret, tags, timeout, username
+```
+
+A missing `host`, `device_type` or `username` fails the same way.
+
+### Key-based authentication
+
+`key_file` is a path *in the container*, and only two host paths are mounted: `./config`
+(read-only) and `WIREHAND_CLAB_DIR`. So the key belongs in `config/` and is referenced as
+`/app/config/<name>`:
+
+```yaml
+edge-rtr1:
+  host: 192.0.2.30
+  device_type: cisco_xr
+  username: netops
+  key_file: /app/config/id_ed25519   # no 'password:' needed
+  access: ro
+```
+
+The container runs as `appuser` with the UID the image was built with
+(`--build-arg APP_UID=$(id -u)`), so the key file has to be readable by that UID -
+`chmod 600` plus matching ownership on the host.
+
+An encrypted key works: there is no `passphrase:` key, but Paramiko falls back to
+`password` for key decryption, so put the passphrase in `password:` (`env:` and all).
+Then `password` is the passphrase, not an SSH password - the device never sees it.
 
 Missing `env:` variables fail the whole inventory load at startup - deliberately
 (fail-fast beats a device with half-empty credentials). Remove dead references.
@@ -283,9 +350,20 @@ approval is a **time-based one-time code (TOTP)** that only a human can read:
 | `totp` (default) | `code` **and** a fresh 6-digit code from your authenticator app | anything you care about |
 | `off` | `code` only - the model may apply its own proposal | disposable labs, unattended runs |
 
-`confirm: totp` / `confirm: off` per device in `inventory.yaml` (and
-`containerlab.default_confirm` for discovered nodes) overrides the global mode, so lab
-nodes can stay frictionless while real devices need a human.
+`confirm: totp` / `confirm: off` per device in [`config/inventory.yaml`](#configinventoryyaml)
+overrides the global mode, so lab nodes can stay frictionless while real devices need a
+human. Containerlab nodes are discovered rather than listed, so theirs is set once for
+the whole fleet as `containerlab.default_confirm` - or per kind as
+`containerlab.kinds.<kind>.confirm`, which wins over it. Resolution order for any device:
+
+```
+device `confirm:`  >  kinds.<kind>.confirm  >  containerlab.default_confirm  >  WIREHAND_CONFIRM_MODE
+```
+
+Write `off` unquoted if you like: YAML turns it into a boolean and Wirehand accepts that
+spelling. Anything other than `totp`/`off` fails the inventory load at startup. Until
+0.5.2 that boolean was read as "unset" on the containerlab path, so a per-kind
+`confirm: off` was silently ignored and the node kept asking for a code.
 
 ### Setting it up
 

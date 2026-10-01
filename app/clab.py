@@ -66,6 +66,19 @@ def _short_name(lab: str, host: str) -> str:
     return host[len(prefix):] if host.startswith(prefix) else host.removeprefix("clab-")
 
 
+def _setting(kinds_cfg: dict, kind: str, cfg: dict, key: str, default=None):
+    """`kinds.<kind>.<key>` beats `default_<key>` beats the built-in default.
+
+    Tests for presence, not truthiness: `confirm: off` is a legitimate value that
+    YAML 1.1 hands us as False, and a falsy override must still win.
+    """
+    per_kind = kinds_cfg.get(kind) or {}
+    if per_kind.get(key) is not None:
+        return per_kind[key]
+    value = cfg.get(f"default_{key}")
+    return default if value is None else value
+
+
 def _parse_ansible(path: Path, lab: str, cfg: dict) -> list[dict]:
     data = yaml.safe_load(path.read_text()) or {}
     out = []
@@ -98,8 +111,8 @@ def _parse_ansible(path: Path, lab: str, cfg: dict) -> list[dict]:
                 "device_type": dev_type,
                 "username": user,
                 "password": pw,
-                "access": (kinds_cfg.get(kind) or {}).get("access") or cfg.get("default_access", "rw"),
-                "confirm": (kinds_cfg.get(kind) or {}).get("confirm") or cfg.get("default_confirm"),
+                "access": _setting(kinds_cfg, kind, cfg, "access", "rw"),
+                "confirm": _setting(kinds_cfg, kind, cfg, "confirm"),
                 "description": f"containerlab {lab} / {kind}",
                 "tags": ["clab", lab, kind],
                 "source": f"containerlab:{lab}",
@@ -126,8 +139,8 @@ def _parse_topology_json(path: Path, lab: str, cfg: dict) -> list[dict]:
         out.append({
             "name": f"{lab}-{node}", "host": ip, "device_type": dev_type,
             "username": user, "password": pw,
-            "access": (kinds_cfg.get(kind) or {}).get("access") or cfg.get("default_access", "rw"),
-                "confirm": (kinds_cfg.get(kind) or {}).get("confirm") or cfg.get("default_confirm"),
+            "access": _setting(kinds_cfg, kind, cfg, "access", "rw"),
+            "confirm": _setting(kinds_cfg, kind, cfg, "confirm"),
             "description": f"containerlab {lab} / {kind}", "tags": ["clab", lab, kind],
             "source": f"containerlab:{lab}",
         })

@@ -1,6 +1,7 @@
 # ----------------------------------------------------------------------------
 # Manual devices. The LLM only sees: name, platform, access, description, tags.
-# Credentials: env:VARNAME -> resolved from the container environment (.env).
+# Credentials: env:VARNAME -> resolved from the container environment (.env);
+#              works for username, password and secret (not for key_file).
 # access: ro (default) | rw.
 # confirm: totp | off - who may approve a change on this device. Default comes from
 #          WIREHAND_CONFIRM_MODE; 'off' lets the model confirm its own proposal, so
@@ -16,23 +17,55 @@ devices:
     username: env:LAB_SRV1_USER
     password: env:LAB_SRV1_PASS
     access: rw
+    # confirm: off            # disposable device - the model may confirm its own proposal
     description: Ubuntu lab VM (change testing target)
     tags: [lab, linux]
+
+  # Every remaining key, on one device. Defaults: port 22, timeout 30, access ro,
+  # confirm inherited from WIREHAND_CONFIRM_MODE.
+  # core-sw1:
+  #   host: 192.0.2.20
+  #   device_type: cisco_ios
+  #   username: env:CORE_SW1_USER
+  #   password: env:CORE_SW1_PASS
+  #   secret: env:CORE_SW1_ENABLE  # enable password; used on cisco_ios/cisco_xe/cisco_nxos/arista_eos
+  #   port: 2222                   # SSH port (default 22)
+  #   timeout: 60                  # seconds Netmiko waits for one command (default 30)
+  #   access: ro
+  #   confirm: totp
+  #   description: Core switch building A
+  #   tags: [prod, campus]
+
+  # Key instead of password. The key has to be readable *inside* the container, and
+  # only ./config and WIREHAND_CLAB_DIR are mounted - so keep it in config/ and make
+  # it readable by the APP_UID the image was built with. Omit password entirely.
+  # edge-rtr1:
+  #   host: 192.0.2.30
+  #   device_type: cisco_xr
+  #   username: netops
+  #   key_file: /app/config/id_ed25519
+  #   access: ro
 
 # ----------------------------------------------------------------------------
 # Containerlab discovery (folder set via WIREHAND_CLAB_DIR). Every deployed lab
 # (clab-<name>/ansible-inventory.yml) is scanned; nodes are named <lab>-<node>,
 # e.g. xrd-test-xrd1. Destroyed labs disappear within WIREHAND_CLAB_RESCAN seconds.
+# Discovered nodes are not listed in this file, so the defaults below (or the
+# per-kind overrides) are the only place to set access/confirm for them.
 # ----------------------------------------------------------------------------
 containerlab:
   default_access: rw          # labs are disposable; set ro if you prefer the cautious default
+  # default_confirm: off      # totp | off for discovered nodes; omit to inherit
+                              # WIREHAND_CONFIRM_MODE. Uncomment to let the model apply
+                              # its own proposals on lab nodes without a one-time code.
   long_names: false           # true -> use full names like clab-xrd-test-xrd1
 
-  # kind -> Netmiko driver / access overrides (built-in map covers cisco_xrd, cisco_iol,
-  # huawei_vrp, fortinet_fortigate, arista_ceos, juniper_vjunos*, linux, ...)
+  # kind -> Netmiko driver / access / confirm overrides; these beat the two defaults
+  # above (built-in map covers cisco_xrd, cisco_iol, huawei_vrp, fortinet_fortigate,
+  # arista_ceos, juniper_vjunos*, linux, ...)
   kinds:
     huawei_vrp: { device_type: huawei_vrpv8 }     # NE40E/CE = VRP8; use 'huawei' for VRP5 images
-    # cisco_xrd: { access: ro }
+    # cisco_xrd: { access: ro, confirm: totp }
 
   # credentials per kind when the generated ansible inventory has none, or to override it
   credentials:

@@ -19,7 +19,7 @@ services:
       args:
         APP_UID: "${UID:-1000}"
         APP_GID: "${GID:-1000}"
-    image: wirehand:0.5.2
+    image: wirehand:0.5.3
     container_name: wirehand
     restart: unless-stopped
     network_mode: host

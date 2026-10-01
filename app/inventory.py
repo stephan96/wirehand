@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 
 import yaml
@@ -100,6 +100,16 @@ class Device:
         return kw
 
 
+# Derived from Device so the two can never drift apart. 'name' is supplied by the
+# loader, 'source' by whoever produced the spec - neither is written by hand.
+DEVICE_KEYS = {f.name for f in fields(Device)}
+REQUIRED_KEYS = {
+    f.name for f in fields(Device)
+    if f.default is MISSING and f.default_factory is MISSING
+} - {"name"}
+WRITABLE_KEYS = DEVICE_KEYS - {"name", "source"}
+
+
 def _resolve(value):
     if isinstance(value, str) and value.startswith("env:"):
         var = value[4:]
@@ -145,6 +155,16 @@ class Inventory:
         devices: dict[str, Device] = {}
         for name, spec in specs.items():
             spec = dict(spec)
+            # Checked here rather than left to Device(**spec): a bare TypeError names
+            # the key but not the device, which does not help with twenty of them.
+            unknown = sorted(set(spec) - DEVICE_KEYS)
+            if unknown:
+                raise RuntimeError(
+                    f"device '{name}': unknown key(s) {', '.join(unknown)}. "
+                    f"Known keys: {', '.join(sorted(WRITABLE_KEYS))}")
+            missing = sorted(REQUIRED_KEYS - set(spec))
+            if missing:
+                raise RuntimeError(f"device '{name}': missing required key(s) {', '.join(missing)}")
             if spec.get("device_type") not in PLATFORMS:
                 raise RuntimeError(f"device '{name}': unsupported device_type '{spec.get('device_type')}'")
             if spec.get("access", "ro") not in ("ro", "rw"):
