@@ -1,0 +1,257 @@
+# wirehand read-path safety rules.
+#
+# These lists decide what run_read is allowed to execute. Everything they refuse
+# has to go through propose_change, which is approval-gated. Treat this file as
+# security policy: whoever can WRITE it can grant arbitrary command execution on
+# the read path. It is mounted read-only into the container (docker-compose.yml).
+#
+# Evaluation order is fixed in app/safety.py and cannot be changed from here:
+#
+#   1. hard_refusals   argument-level refusals; win even over an allow-listed verb
+#   2. blocklist       known write/privileged verbs
+#   3. allowlist       known-good read verbs
+#   4. default         refuse on a shell_families device, allow on a network CLI
+#
+# Within a section the order of entries is irrelevant: the first match wins and
+# every entry produces the same verdict. Each entry is a Python regular
+# expression, matched with re.search against the command after whitespace
+# collapse, case-insensitively unless it sets `case_sensitive: true`.
+#
+# ALWAYS single-quote a pattern, so YAML does not eat the backslashes.
+# After editing, check the file before it goes live:
+#
+#   python -m app.safety --lint            # or: docker exec wirehand python -m app.safety --lint
+#
+# A malformed file is never loaded: on startup the service refuses to come up,
+# and at runtime the previously loaded rules keep serving (see README).
+
+version: 1
+
+# Families whose CLI is a general-purpose shell. There, anything that is not on
+# the allow-list is refused (deny by default): a Linux host has thousands of
+# binaries, and a blocklist only ever names the ones somebody thought of -
+# 'touch', 'cp', 'ln -s', 'wget' and every future one would otherwise pass.
+# Network CLIs keep blocklist + default-allow: their exec view cannot start
+# arbitrary programs, and vendor read verbs are far too varied to enumerate.
+shell_families:
+  - linux
+
+
+# --- 1. Hard refusals -------------------------------------------------------
+# The allow-list matches the VERB, so an allow-listed verb carrying the wrong
+# ARGUMENT would otherwise slip through and write: `find ... -delete`, `awk
+# 'BEGIN{system("...")}'`, `ethtool -s`, `journalctl --vacuum`. These
+# argument-level checks therefore run first, for every platform family.
+# `reason` is handed back to the model verbatim, so say what to use instead.
+hard_refusals:
+  - pattern: '(\s>\s*\S|\s>>|;|&&|\|\|)'
+    reason: shell redirection/chaining not allowed on read path
+
+  - pattern: '\|\s*(sh|bash|zsh|python\d?|perl|xargs|sudo|tee)\b'
+    reason: piping into an interpreter/tee is not allowed on read path
+
+  - pattern: '[`]|\$\('
+    reason: command substitution is not allowed on read path
+
+  - pattern: '\|\s*(file|utility|append|redirect|save|tee)\b'
+    reason: pipe modifier writes to a file or runs a shell utility - use propose_change
+    note: >
+      Vendor pipe modifiers that write or shell out: IOS-XR '| file' and
+      '| utility', IOS '| append|redirect|tee', Junos '| save'.
+      '| include|exclude|begin|count' and friends stay allowed.
+
+  - pattern: '^(ip|ifconfig)\s+(?!.*\bshow\b).*\b(add|del|set|flush|replace|change)\b'
+    reason: mutating ip/ifconfig subcommand - use propose_change
+
+  - pattern: '^(bash|zsh|ash|dash|ksh|csh|tcsh|busybox|python[\d.]*|perl|ruby|node|nodejs|lua[\d.]*|tclsh|expect|php|awk|gawk|mawk|nawk)\b'
+    reason: shell/interpreter invocation can run arbitrary code - use propose_change
+    note: >
+      Interpreters take their program as an argument, so no verb check can make
+      them safe. Bare 'sh' is deliberately absent: on Cisco/Huawei it is the
+      usual abbreviation of 'show'. On Linux it is refused by the allow-list.
+
+  - pattern: '^(xargs|nohup|timeout|watch|nice|ionice|setsid|stdbuf|script|chroot|unshare|nsenter)\b'
+    reason: command wrapper can hide a write command - use propose_change
+
+  - pattern: '^env\s+\S'
+    reason: "'env' with arguments can hide a write command - use propose_change"
+
+  - pattern: '^(ssh|scp|sftp|rsync|socat|nc|ncat|netcat|telnet|curl|wget|ftp|tftp)\b'
+    reason: network/file-transfer client is not allowed on read path
+
+  - pattern: '^find\b.*\s-(delete|exec|execdir|ok|okdir|fls|fprintf?|fprint0)\b'
+    reason: "'find' with an action that writes or executes - use propose_change"
+
+  - pattern: '^journalctl\b.*--vacuum'
+    reason: "'journalctl --vacuum' deletes logs - use propose_change"
+
+  - pattern: '^dmesg\b.*(\s-[Cc]\b|--clear|--read-clear)'
+    reason: "'dmesg -C' clears the kernel ring buffer - use propose_change"
+
+  - pattern: '^(mount|umount)\s+(?!-l\b)\S'
+    reason: (un)mounting changes the system - use propose_change
+
+  - pattern: '^date\s+(-s|--set)'
+    reason: "'date -s' sets the system clock - use propose_change"
+
+  - pattern: '^hostname\s+(?!-)\S'
+    reason: "'hostname <name>' sets the hostname - use propose_change"
+
+  - pattern: '^(run|shell|system-view|guestshell|fnsysctl|event\s+manager)\b|^(start|request)\s+shell\b'
+    reason: vendor shell escape / config view - use propose_change
+    note: Vendor escapes out of the read-only exec view.
+
+  - pattern: '^(execute|exec)\s+(?!ping6?\b|traceroute\b|tracert\b|dns\b|date\b|time\b)'
+    reason: FortiGate 'execute' command - use propose_change(mode='exec')
+
+  # Case-SENSITIVE entries: the rest of this file is matched case-insensitively,
+  # which cannot tell 'ethtool -S' (statistics) from 'ethtool -s' (set!), or
+  # 'ss -k' from 'ss -K'.
+  - pattern: '^ethtool\s+(-s|-A|-C|-G|-K|-L|-N|-U|-W|-E|-f|-r|--change|--flash|--set)\b'
+    reason: "'ethtool' with a setting flag - use propose_change"
+    case_sensitive: true
+
+  - pattern: '^ss\b.*\s-K\b'
+    reason: "'ss -K' closes live sockets - use propose_change"
+    case_sensitive: true
+
+
+# --- 2. Write blocklist -----------------------------------------------------
+# Known write/privileged/disruptive verbs, refused on run_read regardless of the
+# device's access level. Entries are grouped only for readability; a group may
+# set its own `reason`, otherwise the generic blocklist message is used.
+blocklist:
+  - group: config-mode-and-commit
+    patterns:
+      - '^(conf|configure)(\s|$)'
+      - '^(commit|rollback|reload|reboot|shutdown|halt|poweroff|init\s+[06])'
+      - '^(save|startup)'
+
+  - group: save-and-copy-config
+    patterns:
+      - '^(write|wr)(\s|$)'
+      - '^copy\s'
+
+  - group: vendor-mutating-verbs
+    patterns:
+      - '^(delete|erase|format)\s'
+      - '^(no|undo)\s'
+      - '^(clear|reset)\s'
+      - '^(debug|undebug|terminal\s+monitor)'
+      - '^(execute|exec)\s+(reboot|shutdown|factoryreset|restore|backup|formatlogdisk)'
+
+  - group: filesystem-writes
+    patterns:
+      - '^(rm|mv|dd|mkfs|fdisk|parted|shred|truncate)(\s|$)'
+      - '^(chmod|chown|chgrp)\s'
+      - '^(touch|cp|ln|mkdir|rmdir|install|tar|unzip|gzip|gunzip|bzip2|xz|setfacl|patch)(\s|$)'
+
+  - group: service-management
+    patterns:
+      - '^(systemctl|service)\s+(start|stop|restart|reload|enable|disable|mask)'
+
+  - group: package-managers
+    patterns:
+      - '^(apt|apt-get|dnf|yum|pip|pip3|snap|apk)\s+(install|remove|purge|upgrade|autoremove|add|del|fix)'
+
+  - group: users-and-privileges
+    patterns:
+      - '^(useradd|userdel|usermod|passwd|groupadd|groupdel|visudo)'
+      - '^(sudo|su|doas)\s+'   # no privilege escalation on the read path
+
+  - group: firewall-writes
+    patterns:
+      - '^(iptables|nft|ufw|firewall-cmd)\s+(?!-L|-S|list|status|show)'
+
+  - group: interface-writes
+    patterns:
+      # '... show up' / '... show down' are reads; only a mutating subcommand is a write.
+      - '^(ip|ifconfig)\s+(?!.*\bshow\b).*\b(add|del|set|flush|up|down)\b'
+
+  - group: processes-and-shell-plumbing
+    patterns:
+      - '^(kill|killall|pkill)\s'
+      - '^(crontab\s+-[er]|tee\s|sed\s+-i|\S+\s*>\s*\S)'
+      - '(\|\s*(sh|bash|python\d?|perl|xargs)\b)'
+
+  - group: containers-and-labs
+    patterns:
+      - '^(docker|podman|kubectl)\s+(run|exec|rm|rmi|kill|stop|start|restart|create|build|pull|push|cp|login|update|prune|compose\s+(up|down|restart))'
+      - '^(clab|containerlab)\s+(deploy|destroy|redeploy|exec|save|tools|generate)'
+
+
+# --- 3. Read allow-list -----------------------------------------------------
+# Commands that are always acceptable even if they look suspicious. On a
+# shell_families device this is the ONLY way a command gets through, so adding a
+# verb here grants it to every such device - check that none of its arguments
+# can write before you do, and add a hard_refusal if some of them can.
+#
+# Note the two spellings: a pattern ending in '\s' requires an argument
+# ('^show\s'), one ending in '(\s|$)' also matches the bare verb ('^(ls)(\s|$)').
+allowlist:
+  - group: vendor-read-verbs
+    patterns:
+      - '^show\s'
+      - '^display\s'
+      - '^get\s'
+      - '^diagnose\s+(?!sys\s+kill)'
+
+  - group: files-and-text
+    patterns:
+      - '^(cat|less|head|tail|grep|egrep|zgrep|find|ls|stat|wc|sort|uniq|cut)(\s|$)'
+      - '^(readlink|realpath|file|md5sum|sha\d+sum)(\s|$)'
+
+  - group: filesystem-and-resources
+    patterns:
+      - '^(df|du|free|lsblk|mount|nproc)(\s|$)'
+
+  - group: host-identity-and-uptime
+    patterns:
+      - '^(uptime|w|who|id|hostname|uname|lsb_release|date|env|getent)(\s|$)'
+
+  - group: processes
+    patterns:
+      - '^(ps|lsof)(\s|$)'
+      - '^(top\s+-bn1)(\s|$)'
+
+  - group: hardware-kernel-and-logs
+    patterns:
+      - '^(lscpu|lspci|lsusb|lsmod|dmesg|journalctl)(\s|$)'
+      - '^(vmstat|iostat|mpstat)(\s|$)'
+      - '^(sysctl\s+(?!-w)\S*)(\s|$)'
+
+  - group: networking
+    patterns:
+      - '^(ss|netstat|arp|traceroute)(\s|$)'
+      - '^(ip\s+(-\S+\s+)*(addr\w*|a|link|l|route|r|neigh\w*|n|rule|-s))(\s|$)'
+      - '^(bridge\s+(link|fdb|vlan))(\s|$)'
+      - '^(ethtool)(\s|$)'
+
+  - group: name-resolution-and-reachability
+    patterns:
+      - '^(dig|nslookup|host)(\s|$)'
+      - '^(ping\s+-c\s*\d+)(\s|$)'
+      - '^(mtr\s+-r)(\s|$)'
+
+  - group: firewall-read
+    patterns:
+      - '^(iptables\s+-[LS])(\s|$)'
+      - '^(nft\s+list)(\s|$)'
+      - '^(ufw\s+status)(\s|$)'
+
+  - group: services-read
+    patterns:
+      - '^(systemctl\s+(status|list-units|list-timers|is-active|is-enabled|show|cat))(\s|$)'
+
+  - group: packages-read
+    patterns:
+      - '^(dpkg\s+-[lLs])(\s|$)'
+      - '^(rpm\s+-q\S*)(\s|$)'
+      - '^(apk\s+(info|list|version))(\s|$)'
+      - '^(pip\d?\s+(list|show|freeze))(\s|$)'
+      - '^(snap\s+list)(\s|$)'
+
+  - group: containers-and-labs-read
+    patterns:
+      - '^(docker\s+(ps|images|logs|inspect|version|stats\s+--no-stream|compose\s+ps))(\s|$)'
+      - '^((clab|containerlab)\s+(inspect|version|graph))(\s|$)'

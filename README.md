@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.5.3
+**Version:** 0.5.4
 
 
 ## Summary
@@ -87,7 +87,8 @@ output together with the hint to use `filter`.
   commands somebody thought of, and on a shell that is never all of them - `touch`, `cp`,
   `ln -s` and `wget` are exactly the kind that used to slip through. Network CLIs keep the
   blocklist and allow unknown verbs: their exec view cannot start arbitrary programs, and
-  vendor read verbs are far too varied to enumerate.
+  vendor read verbs are far too varied to enumerate. All three layers are data, not code:
+  they live in `config/safety.yaml` (see "Configuration") and are validated on load.
 - **Every write is two-stage and human-gated.** `propose_change` and `rollback_change` only
   *stage* an operation and return a confirmation code. Codes are single-use and expire after
   10 minutes.
@@ -126,7 +127,9 @@ curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
 ```
 
 `.env` and `config/inventory.yaml` are listed in `.gitignore`, so a later `git pull`
-never overwrites them.
+never overwrites them. `config/safety.yaml` (the read-path blocklist and allow-list) needs
+no copying - it ships ready to use, and `docker exec wirehand python -m app.safety --lint`
+shows what is in force.
 
 ### Development install (tarball)
 
@@ -332,6 +335,67 @@ personal account, and grant targeted passwordless sudo only for commands you exp
 changes. The read path never escalates (`sudo` is refused there) and runs allow-listed
 read commands only - but an allow-listed `cat` still reads every file the account can
 read, so the account, not the allow-list, is what bounds exposure.
+
+### `config/safety.yaml`
+
+The lists that decide what `run_read` may execute live in this file, not in the code, so
+they can be reviewed and extended without touching Python. Four sections, evaluated in a
+fixed order that the file cannot change:
+
+| Section | What it holds | On a match |
+| --- | --- | --- |
+| `hard_refusals` | argument-level checks: redirection, chaining, command substitution, `find -delete`, `ethtool -s`, vendor shell escapes, write-capable pipe modifiers | refused, with that entry's `reason` - wins even over an allow-listed verb |
+| `blocklist` | known write/privileged verbs, grouped (`package-managers`, `filesystem-writes`, ...) | refused |
+| `allowlist` | known-good read verbs, grouped (`networking`, `services-read`, ...) | allowed |
+| `shell_families` | families whose CLI is a general-purpose shell (`linux`) | nothing else runs there: no match in `allowlist` means refused |
+
+Each entry is a Python regular expression, matched with `re.search` against the command
+after whitespace collapse, case-insensitively unless the entry sets `case_sensitive: true`
+(which is how `ethtool -S` stays readable while `ethtool -s` is refused). Within a section
+the order of entries does not matter. Always single-quote a pattern so YAML keeps the
+backslashes:
+
+```yaml
+blocklist:
+  - group: package-managers
+    patterns:
+      - '^(apt|apt-get|dnf|yum|pip|pip3|snap|apk)\s+(install|remove|purge|upgrade|autoremove|add|del|fix)'
+
+allowlist:
+  - group: networking
+    patterns:
+      - '^(ss|netstat|arp|traceroute)(\s|$)'    # (\s|$) also matches the bare verb
+      - '^(ethtool)(\s|$)'                      # '\s' alone would require an argument
+```
+
+Check the file before it goes live, and after every edit:
+
+```bash
+docker exec wirehand python -m app.safety --lint      # or: python -m app.safety --lint config/safety.yaml
+```
+
+Edits are picked up within `WIREHAND_SAFETY_RESCAN` seconds (30 by default);
+`list_devices(refresh=true)` applies them at once. The rules are **fail-closed**: a file
+that is missing, unparseable, has an unknown key, an empty section or an uncompilable
+regex is never loaded. On startup that aborts the container (`docker logs wirehand` names
+the file and the offending entry); at runtime the rules already in memory keep serving and
+the error is logged, so a typo can never widen the read path.
+
+Two things to keep in mind when editing:
+
+- **This file is security policy.** Whoever can write it can grant arbitrary command
+  execution on the read path. It is mounted read-only into the container; keep it owned by
+  the admin account and out of reach of the service user.
+- **Adding a verb to `allowlist` grants it on every device of a `shell_families` family.**
+  Check that none of its *arguments* can write - that is what `hard_refusals` is for. The
+  pattern matches the verb, so `find` on the allow-list is what made `find ... -delete`
+  necessary as a hard refusal.
+
+`config/safety.yaml` is version-controlled and gets improved between versions, so a
+`git pull` replaces it - and so does unpacking a tarball that contains it. Keep local
+additions as a patch (`git diff -- config/safety.yaml > my-rules.patch`) and re-apply them
+after an update; `--lint` plus `python -m pytest tests/test_safety.py` then tells you
+whether the result is sound.
 
 ## Approving changes
 
@@ -652,7 +716,9 @@ changes with age).
 | `confirm_change` returns 403 "approval code is not valid (right now)" | phone clock drift, or the model made the number up | compare `docker exec wirehand python -m app.approval` with your app; the change stays staged, just send a fresh code |
 | "approval code is not valid - wrong, or expired" although you read it correctly | the model took longer than `WIREHAND_APPROVAL_MAX_AGE` to call `confirm_change`, or the phone clock is off | send a fresh code; raise `WIREHAND_APPROVAL_MAX_AGE` for slow models; enable automatic time on the phone |
 | "too many wrong approval codes - locked" | five refused approvals in two minutes | wait it out, or raise `WIREHAND_APPROVAL_MAX_FAILURES` / lower `WIREHAND_APPROVAL_LOCKOUT` |
-| A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | if it really is read-only, add it to `_ALLOW` in `app/safety.py`; if it writes, it belongs in `propose_change` |
+| A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | if it really is read-only, add it to the matching `allowlist` group in `config/safety.yaml` (then `python -m app.safety --lint`); if it writes, it belongs in `propose_change` |
+| Container exits at startup, log says `safety rule file not found` or names an entry in `safety.yaml` | the read-path rules are missing or malformed - wirehand refuses to run without them | `python -m app.safety --lint config/safety.yaml` on the host names file and entry; check that the `./config` bind mount is present |
+| A `safety.yaml` edit has no effect | not reloaded yet, or it was refused | wait `WIREHAND_SAFETY_RESCAN` seconds or call `list_devices(refresh=true)`; `docker logs wirehand` shows either `reloaded safety rules` or `NOT reloaded, keeping the previous ones: <reason>` |
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
 | UBUNTU/local host unreachable | sshd not listening on the address used | with host networking use `host: 127.0.0.1` |
 | Change fails with prompt/timeout errors | wrong Netmiko driver for the platform | check `kinds:` mapping (VRP5 vs VRP8 is the classic) |

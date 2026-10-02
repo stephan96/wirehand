@@ -1,11 +1,27 @@
 """Safety primitives: write-blocklist, output filtering, truncation.
 
-Deliberately dependency-free so it can be unit-tested without Netmiko.
+The rule lists themselves live in config/safety.yaml so an admin can read and
+edit them without touching Python; this module only loads, validates and
+applies them. See the header of that file for the format and the evaluation
+order.
+
+Fail-closed by design: a missing or malformed rule file raises RuntimeError on
+the first load, which aborts startup. A later edit that does not parse is
+logged and ignored - the rules already in memory keep serving.
 """
 from __future__ import annotations
 
+import logging
+import os
 import re
+import threading
+import time
 from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
+
+log = logging.getLogger("wirehand.safety")
 
 # --- Output budget --------------------------------------------------------
 # ~4 chars/token. 80k chars ~= 20k tokens: fits comfortably inside a 32k
@@ -46,107 +62,188 @@ def filter_lines(text: str, pattern: str, context: int = 0) -> str:
     return f"[filter '{pattern}': {len(keep)} of {len(lines)} lines]\n" + "\n".join(out)
 
 
-# --- Write blocklist (applies to the READ path, always) --------------------
-# Matched against each command, case-insensitive, after whitespace collapse.
-# Anything here is refused on run_read regardless of the device's access level.
-_GLOBAL = [
-    r"^(conf|configure)(\s|$)",
-    r"^(commit|rollback|reload|reboot|shutdown|halt|poweroff|init\s+[06])",
-    r"^(write|wr)(\s|$)",
-    r"^copy\s",
-    r"^(delete|erase|format)\s",
-    r"^(no|undo)\s",
-    r"^(clear|reset)\s",
-    r"^(debug|undebug|terminal\s+monitor)",
-    r"^(rm|mv|dd|mkfs|fdisk|parted|shred|truncate)(\s|$)",
-    r"^(chmod|chown|chgrp)\s",
-    r"^(touch|cp|ln|mkdir|rmdir|install|tar|unzip|gzip|gunzip|bzip2|xz|setfacl|patch)(\s|$)",
-    r"^(systemctl|service)\s+(start|stop|restart|reload|enable|disable|mask)",
-    r"^(apt|apt-get|dnf|yum|pip|pip3|snap|apk)\s+(install|remove|purge|upgrade|autoremove|add|del|fix)",
-    r"^(useradd|userdel|usermod|passwd|groupadd|groupdel|visudo)",
-    r"^(iptables|nft|ufw|firewall-cmd)\s+(?!-L|-S|list|status|show)",
-    # '... show up' / '... show down' are reads; only a mutating subcommand is a write.
-    r"^(ip|ifconfig)\s+(?!.*\bshow\b).*\b(add|del|set|flush|up|down)\b",
-    r"^(kill|killall|pkill)\s",
-    r"^(crontab\s+-[er]|tee\s|sed\s+-i|\S+\s*>\s*\S)",
-    r"^(sudo|su|doas)\s+",   # no privilege escalation on the read path
-    r"(\|\s*(sh|bash|python\d?|perl|xargs)\b)",
-    r"^(execute|exec)\s+(reboot|shutdown|factoryreset|restore|backup|formatlogdisk)",
-    r"^(save|startup)",
-    r"^(docker|podman|kubectl)\s+(run|exec|rm|rmi|kill|stop|start|restart|create|build|pull|push|cp|login|update|prune|compose\s+(up|down|restart))",
-    r"^(clab|containerlab)\s+(deploy|destroy|redeploy|exec|save|tools|generate)",
-]
-_BLOCK = [re.compile(p, re.IGNORECASE) for p in _GLOBAL]
+# --- Rule file ------------------------------------------------------------
+# Default resolves to /app/config/safety.yaml in the container (the read-only
+# bind mount) and to ./config/safety.yaml in a source checkout, so tests and a
+# local run need no environment at all.
+RULES_PATH = Path(os.environ.get("WIREHAND_SAFETY_RULES")
+                  or Path(__file__).resolve().parent.parent / "config" / "safety.yaml")
+# Seconds between mtime checks, mirroring WIREHAND_CLAB_RESCAN for the inventory.
+RESCAN_SECONDS = int(os.environ.get("WIREHAND_SAFETY_RESCAN", "30"))
 
-# --- Hard refusals: these win over the allow-list ---------------------------
-# The allow-list matches the VERB, so an allow-listed verb carrying the wrong
-# ARGUMENT used to slip through and write: `find ... -delete`, `awk
-# 'BEGIN{system("...")}'`, `ethtool -s`, `journalctl --vacuum`. Argument-level
-# checks therefore run first, for every platform family.
-_HARD = [
-    (r"(\s>\s*\S|\s>>|;|&&|\|\|)", "shell redirection/chaining not allowed on read path"),
-    (r"\|\s*(sh|bash|zsh|python\d?|perl|xargs|sudo|tee)\b",
-     "piping into an interpreter/tee is not allowed on read path"),
-    (r"[`]|\$\(", "command substitution is not allowed on read path"),
-    # Vendor pipe modifiers that write or shell out: IOS-XR '| file', '| utility',
-    # IOS '| append|redirect|tee', Junos '| save'. '| include|exclude|begin|count'
-    # and friends stay allowed.
-    (r"\|\s*(file|utility|append|redirect|save|tee)\b",
-     "pipe modifier writes to a file or runs a shell utility - use propose_change"),
-    (r"^(ip|ifconfig)\s+(?!.*\bshow\b).*\b(add|del|set|flush|replace|change)\b",
-     "mutating ip/ifconfig subcommand - use propose_change"),
-    # Interpreters take their program as an argument, so no verb check can make
-    # them safe. Bare 'sh' is deliberately absent: on Cisco/Huawei it is the
-    # usual abbreviation of 'show'. On Linux it is refused by the allow-list.
-    (r"^(bash|zsh|ash|dash|ksh|csh|tcsh|busybox|python[\d.]*|perl|ruby|node|nodejs"
-     r"|lua[\d.]*|tclsh|expect|php|awk|gawk|mawk|nawk)\b",
-     "shell/interpreter invocation can run arbitrary code - use propose_change"),
-    (r"^(xargs|nohup|timeout|watch|nice|ionice|setsid|stdbuf|script|chroot|unshare|nsenter)\b",
-     "command wrapper can hide a write command - use propose_change"),
-    (r"^env\s+\S", "'env' with arguments can hide a write command - use propose_change"),
-    (r"^(ssh|scp|sftp|rsync|socat|nc|ncat|netcat|telnet|curl|wget|ftp|tftp)\b",
-     "network/file-transfer client is not allowed on read path"),
-    (r"^find\b.*\s-(delete|exec|execdir|ok|okdir|fls|fprintf?|fprint0)\b",
-     "'find' with an action that writes or executes - use propose_change"),
-    (r"^journalctl\b.*--vacuum", "'journalctl --vacuum' deletes logs - use propose_change"),
-    (r"^dmesg\b.*(\s-[Cc]\b|--clear|--read-clear)",
-     "'dmesg -C' clears the kernel ring buffer - use propose_change"),
-    (r"^(mount|umount)\s+(?!-l\b)\S", "(un)mounting changes the system - use propose_change"),
-    (r"^date\s+(-s|--set)", "'date -s' sets the system clock - use propose_change"),
-    (r"^hostname\s+(?!-)\S", "'hostname <name>' sets the hostname - use propose_change"),
-    # Vendor escapes out of the read-only exec view.
-    (r"^(run|shell|system-view|guestshell|fnsysctl|event\s+manager)\b|^(start|request)\s+shell\b",
-     "vendor shell escape / config view - use propose_change"),
-    (r"^(execute|exec)\s+(?!ping6?\b|traceroute\b|tracert\b|dns\b|date\b|time\b)",
-     "FortiGate 'execute' command - use propose_change(mode='exec')"),
-]
-_HARD_RX = [(re.compile(p, re.IGNORECASE), why) for p, why in _HARD]
+SECTIONS = ("hard_refusals", "blocklist", "allowlist")
+_TOP_KEYS = {"version", "shell_families", *SECTIONS}
+# Used when a blocklist group names no reason of its own.
+DEFAULT_BLOCK_REASON = ("'{verb}' is a write/privileged or disruptive command - use propose_change "
+                        "(mode='exec' for reset/clear maintenance commands)")
 
-# Case-SENSITIVE checks: the allow-list is case-insensitive, so it cannot tell
-# 'ethtool -S' (statistics) from 'ethtool -s' (set!), or 'ss -k' from 'ss -K'.
-_HARD_CASE = [
-    (r"^ethtool\s+(-s|-A|-C|-G|-K|-L|-N|-U|-W|-E|-f|-r|--change|--flash|--set)\b",
-     "'ethtool' with a setting flag - use propose_change"),
-    (r"^ss\b.*\s-K\b", "'ss -K' closes live sockets - use propose_change"),
-]
-_HARD_CASE_RX = [(re.compile(p), why) for p, why in _HARD_CASE]
 
-# Commands that are always acceptable even if they look suspicious.
-_ALLOW = [
-    re.compile(p, re.IGNORECASE)
-    for p in (
-        r"^show\s", r"^display\s", r"^get\s", r"^diagnose\s+(?!sys\s+kill)",
-        r"^(cat|less|head|tail|grep|egrep|zgrep|find|ls|stat|wc|sort|uniq|cut|df|du|free|uptime|w|who|id|hostname|uname|lsb_release|date|env|ps|top\s+-bn1|ss|netstat|ip\s+(-\S+\s+)*(addr\w*|a|link|l|route|r|neigh\w*|n|rule|-s)|dig|nslookup|host|ping\s+-c\s*\d+|traceroute|mtr\s+-r|journalctl|dmesg|lsblk|lscpu|lspci|lsusb|lsmod|lsof|arp|bridge\s+(link|fdb|vlan)|mount|nproc|getent|vmstat|iostat|mpstat|md5sum|sha\d+sum|readlink|realpath|file|ethtool|iptables\s+-[LS]|nft\s+list|ufw\s+status|systemctl\s+(status|list-units|list-timers|is-active|is-enabled|show|cat)|dpkg\s+-[lLs]|rpm\s+-q\S*|apk\s+(info|list|version)|pip\d?\s+(list|show|freeze)|snap\s+list|docker\s+(ps|images|logs|inspect|version|stats\s+--no-stream|compose\s+ps)|(clab|containerlab)\s+(inspect|version|graph)|sysctl\s+(?!-w)\S*)(\s|$)",
+@dataclass(frozen=True)
+class Rule:
+    rx: re.Pattern[str]
+    reason: str      # handed to the model verbatim; "" means "use the section default"
+    group: str       # for --lint output and log messages
+
+
+@dataclass(frozen=True)
+class RuleSet:
+    hard: tuple[Rule, ...]
+    block: tuple[Rule, ...]
+    allow: tuple[Rule, ...]
+    shell_families: frozenset[str]
+    path: Path
+    sig: tuple = ()
+
+    def summary(self) -> str:
+        return (f"{len(self.hard)} hard refusals, {len(self.block)} blocklist, "
+                f"{len(self.allow)} allow-list entries, "
+                f"deny-by-default families: {', '.join(sorted(self.shell_families)) or 'none'}")
+
+
+class RuleError(RuntimeError):
+    """Malformed rule file. The message always names file and location."""
+
+
+def _sig(path: Path) -> tuple:
+    """Cheap change detector, same idea as clab.signature for the inventory."""
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ()
+
+
+def _compile(pattern, where: str, case_sensitive: bool) -> re.Pattern[str]:
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise RuleError(f"{where}: 'pattern' must be a non-empty string, not {pattern!r}")
+    try:
+        return re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
+    except re.error as exc:
+        raise RuleError(f"{where}: invalid regular expression {pattern!r}: {exc}") from None
+
+
+def _entry_keys(entry, allowed: set[str], where: str) -> None:
+    if not isinstance(entry, dict):
+        raise RuleError(f"{where}: expected a mapping with {', '.join(sorted(allowed))}, "
+                        f"not {type(entry).__name__}")
+    unknown = sorted(set(entry) - allowed)
+    if unknown:
+        raise RuleError(f"{where}: unknown key(s) {', '.join(unknown)}. "
+                        f"Known keys: {', '.join(sorted(allowed))}")
+
+
+def _load_hard(entries, file: str) -> tuple[Rule, ...]:
+    """hard_refusals: one pattern per entry, each with its own reason."""
+    rules = []
+    for i, entry in enumerate(entries):
+        where = f"{file}: hard_refusals[{i}]"
+        _entry_keys(entry, {"pattern", "reason", "note", "case_sensitive"}, where)
+        reason = entry.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise RuleError(f"{where}: 'reason' is required and is shown to the model - "
+                            "say what the command would do and what to use instead")
+        rules.append(Rule(_compile(entry.get("pattern"), where, bool(entry.get("case_sensitive"))),
+                          reason.strip(), "hard_refusals"))
+    return tuple(rules)
+
+
+def _load_groups(entries, section: str, file: str) -> tuple[Rule, ...]:
+    """blocklist / allowlist: named groups of patterns sharing one reason."""
+    rules = []
+    for i, entry in enumerate(entries):
+        where = f"{file}: {section}[{i}]"
+        _entry_keys(entry, {"group", "patterns", "reason", "note", "case_sensitive"}, where)
+        group = entry.get("group")
+        if not isinstance(group, str) or not group.strip():
+            raise RuleError(f"{where}: 'group' must be a non-empty name")
+        where = f"{file}: {section} group '{group}'"
+        patterns = entry.get("patterns")
+        if not isinstance(patterns, list) or not patterns:
+            raise RuleError(f"{where}: 'patterns' must be a non-empty list")
+        reason = (entry.get("reason") or "").strip()
+        case_sensitive = bool(entry.get("case_sensitive"))
+        for j, pattern in enumerate(patterns):
+            rules.append(Rule(_compile(pattern, f"{where}, patterns[{j}]", case_sensitive),
+                              reason, group.strip()))
+    return tuple(rules)
+
+
+def load_rules(path: Path | None = None) -> RuleSet:
+    """Read and validate the rule file. Raises RuleError on any problem."""
+    path = Path(path) if path else RULES_PATH
+    file = str(path)
+    sig = _sig(path)
+    if not path.is_file():
+        raise RuleError(f"{file}: safety rule file not found. run_read refuses every command "
+                        "without it; in Docker it comes from the ./config bind mount "
+                        "(see docker-compose.yml) or from WIREHAND_SAFETY_RULES")
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise RuleError(f"{file}: not valid YAML: {exc}") from None
+    except OSError as exc:
+        raise RuleError(f"{file}: cannot be read: {exc}") from None
+    if not isinstance(raw, dict):
+        raise RuleError(f"{file}: expected a mapping at the top level with the keys "
+                        f"{', '.join(sorted(_TOP_KEYS))}")
+    unknown = sorted(set(raw) - _TOP_KEYS)
+    if unknown:
+        raise RuleError(f"{file}: unknown top-level key(s) {', '.join(unknown)}. "
+                        f"Known keys: {', '.join(sorted(_TOP_KEYS))}")
+    for section in SECTIONS:
+        # Empty sections are refused rather than defaulted: a truncated file must
+        # not read as 'no write commands are blocked'.
+        if not isinstance(raw.get(section), list) or not raw.get(section):
+            raise RuleError(f"{file}: section '{section}' is missing or empty - "
+                            "it must be a non-empty list")
+    families = raw.get("shell_families")
+    if not isinstance(families, list) or any(not isinstance(f, str) for f in families):
+        raise RuleError(f"{file}: 'shell_families' must be a list of family names "
+                        "(use an empty list to switch deny-by-default off everywhere)")
+    return RuleSet(
+        hard=_load_hard(raw["hard_refusals"], file),
+        block=_load_groups(raw["blocklist"], "blocklist", file),
+        allow=_load_groups(raw["allowlist"], "allowlist", file),
+        shell_families=frozenset(f.strip().lower() for f in families),
+        path=path,
+        sig=sig,
     )
-]
 
-# Families whose CLI is a general-purpose shell. There, anything that is not on
-# the allow-list is refused (deny by default): a Linux host has thousands of
-# binaries, and a blocklist only ever names the ones somebody thought of -
-# 'touch', 'cp', 'ln -s', 'wget' and every future one used to pass. Network
-# CLIs keep blocklist + default-allow: their exec view cannot start arbitrary
-# programs, and vendor read verbs are far too varied to enumerate.
-SHELL_FAMILIES = frozenset({"linux"})
+
+_lock = threading.Lock()
+_rules: RuleSet | None = None
+_last_check = 0.0
+
+
+def rules() -> RuleSet:
+    """The rules in force. First call loads them (and propagates a RuleError so
+    startup fails loudly); later calls re-read the file when it changed on
+    disk, keeping the previous rules if the new content is broken."""
+    global _rules, _last_check
+    with _lock:
+        if _rules is None:
+            _rules = load_rules()
+            _last_check = time.time()
+            log.info("loaded safety rules from %s: %s", _rules.path, _rules.summary())
+        elif time.time() - _last_check >= RESCAN_SECONDS:
+            _last_check = time.time()
+            if _sig(_rules.path) != _rules.sig:
+                try:
+                    _rules = load_rules(_rules.path)
+                    log.info("reloaded safety rules from %s: %s", _rules.path, _rules.summary())
+                except RuleError as exc:
+                    log.error("safety rules NOT reloaded, keeping the previous ones: %s", exc)
+        return _rules
+
+
+def reload() -> RuleSet:
+    """Force a re-read now (used by the refresh path and by tests)."""
+    global _rules, _last_check
+    with _lock:
+        _rules = load_rules(_rules.path if _rules else None)
+        _last_check = time.time()
+        log.info("reloaded safety rules from %s: %s", _rules.path, _rules.summary())
+        return _rules
 
 
 @dataclass
@@ -164,22 +261,20 @@ def check_read_command(cmd: str, family: str = "") -> Verdict:
     c = " ".join(cmd.strip().split())
     if not c:
         return Verdict(False, "empty command")
+    rs = rules()
     # 1. Hard refusals - argument-level, they win even for allow-listed verbs.
-    for rx, why in _HARD_RX:
-        if rx.search(c):
-            return Verdict(False, why)
-    for rx, why in _HARD_CASE_RX:
-        if rx.search(c):
-            return Verdict(False, why)
+    for rule in rs.hard:
+        if rule.rx.search(c):
+            return Verdict(False, rule.reason)
     # 2. Blocklist - a known write verb, refused with a precise reason.
-    for rx in _BLOCK:
-        if rx.search(c):
-            return Verdict(False, f"'{c.split()[0]}' is a write/privileged or disruptive command - use propose_change (mode='exec' for reset/clear maintenance commands)")
+    for rule in rs.block:
+        if rule.rx.search(c):
+            return Verdict(False, rule.reason or DEFAULT_BLOCK_REASON.format(verb=c.split()[0]))
     # 3. Allow-list - known-good read verbs.
-    if any(rx.search(c) for rx in _ALLOW):
+    if any(rule.rx.search(c) for rule in rs.allow):
         return Verdict(True)
     # 4. Anything else: refused on shell-like devices, allowed on network CLIs.
-    if family in SHELL_FAMILIES:
+    if family in rs.shell_families:
         return Verdict(False, f"'{c.split()[0]}' is not on the read allow-list for {family} devices - "
                               "run_read only runs known read-only commands there; use propose_change for the rest")
     return Verdict(True)
@@ -193,3 +288,30 @@ def split_commands(block: str) -> list[str]:
         if line and not line.startswith(("#", "!")):
             out.append(line)
     return out
+
+
+def _main(argv: list[str]) -> int:
+    """`python -m app.safety --lint [path]` - validate a rule file before it
+    goes live. Exits non-zero with a precise message if it would be refused."""
+    args = [a for a in argv if a not in ("--lint", "-l")]
+    if len(argv) == len(args) or len(args) > 1:
+        print("usage: python -m app.safety --lint [path/to/safety.yaml]")
+        return 2
+    path = Path(args[0]) if args else RULES_PATH
+    try:
+        rs = load_rules(path)
+    except RuleError as exc:
+        print(f"INVALID: {exc}")
+        return 1
+    print(f"OK: {rs.path}\n     {rs.summary()}")
+    for section, rule_list in (("blocklist", rs.block), ("allowlist", rs.allow)):
+        groups: dict[str, int] = {}
+        for rule in rule_list:
+            groups[rule.group] = groups.get(rule.group, 0) + 1
+        print(f"     {section}: " + ", ".join(f"{g} ({n})" for g, n in groups.items()))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(_main(sys.argv[1:]))

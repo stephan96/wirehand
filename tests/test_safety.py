@@ -65,3 +65,101 @@ def test_filter_and_truncate():
     assert "line 49" in out and "line 60" in out and "line 70" not in out
     assert "matched 0" in filter_lines(txt, "nope")
     assert "truncated" in truncate("x" * 200, 100)
+
+
+# --- rule file loading ------------------------------------------------------
+import time
+
+import pytest
+
+from app import safety
+
+MINIMAL = """
+version: 1
+shell_families: [linux]
+hard_refusals:
+  - pattern: '^danger\\b'
+    reason: refused
+blocklist:
+  - group: g
+    patterns: ['^write(\\s|$)']
+allowlist:
+  - group: g
+    patterns: ['^show\\s']
+"""
+
+
+def _write(tmp_path, text, name="safety.yaml"):
+    p = tmp_path / name
+    p.write_text(text)
+    return p
+
+
+def test_shipped_rule_file_loads():
+    """The file the project ships must always be valid - this is what `--lint` checks."""
+    rs = safety.load_rules()
+    assert rs.shell_families == frozenset({"linux"})
+    assert rs.hard and rs.block and rs.allow
+    assert safety._main(["--lint"]) == 0
+
+
+def test_minimal_file_drives_the_verdicts(tmp_path):
+    rs = safety.load_rules(_write(tmp_path, MINIMAL))
+    assert len(rs.hard) == 1 and len(rs.block) == 1 and len(rs.allow) == 1
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("", "expected a mapping"),
+    ("version: 1\n{", "not valid YAML"),
+    # YAML 1.1 turns a bare no/off/yes into a boolean - a reason must still be text
+    (MINIMAL.replace("    reason: refused", "    reason: no"), "'reason' is required"),
+    (MINIMAL + "allow_list: []\n", "unknown top-level key(s) allow_list"),
+    (MINIMAL.replace("shell_families: [linux]", ""), "'shell_families' must be a list"),
+    (MINIMAL.replace("  - group: g\n    patterns: ['^show\\s']", ""), "section 'allowlist' is missing or empty"),
+    (MINIMAL.replace("'^show\\s'", "'^show(\\s'"), "invalid regular expression"),
+    (MINIMAL.replace("    reason: refused", "    note: x"), "'reason' is required"),
+    (MINIMAL.replace("  - group: g\n    patterns: ['^write(\\s|$)']", "  - group: g\n    patterns: []"),
+     "'patterns' must be a non-empty list"),
+    (MINIMAL.replace("    patterns: ['^show\\s']", "    pattern: '^show\\s'"), "unknown key(s) pattern"),
+])
+def test_malformed_files_are_refused_with_a_precise_message(tmp_path, text, expected):
+    """Fail closed: every one of these raises instead of loading a partial ruleset."""
+    with pytest.raises(safety.RuleError) as exc:
+        safety.load_rules(_write(tmp_path, text))
+    assert expected in str(exc.value)
+
+
+def test_missing_file_is_refused(tmp_path):
+    with pytest.raises(safety.RuleError, match="not found"):
+        safety.load_rules(tmp_path / "nope.yaml")
+    assert safety._main(["--lint", str(tmp_path / "nope.yaml")]) == 1
+
+
+def test_edit_is_picked_up_and_a_broken_edit_keeps_the_old_rules(tmp_path, caplog):
+    """mtime rescan, same contract as the inventory: a bad edit never widens
+    the read path - the previously loaded rules keep serving."""
+    path = _write(tmp_path, MINIMAL)
+    saved = (safety._rules, safety._last_check, safety.RESCAN_SECONDS)
+    try:
+        safety.RESCAN_SECONDS = 0
+        safety._rules, safety._last_check = None, 0.0
+        safety.RULES_PATH = path
+        assert not safety.check_read_command("danger now").allowed
+        assert safety.check_read_command("ls", "linux").allowed is False   # not allow-listed here
+
+        # a real edit takes effect without a restart
+        path.write_text(MINIMAL.replace("'^show\\s'", "'^ls(\\s|$)'"))
+        time.sleep(0.01)
+        assert safety.check_read_command("ls", "linux").allowed
+
+        # a broken edit does not
+        path.write_text("version: 1\nhard_refusals: [")
+        time.sleep(0.01)
+        with caplog.at_level("ERROR"):
+            assert safety.check_read_command("ls", "linux").allowed
+        assert "keeping the previous ones" in caplog.text
+    finally:
+        safety.RULES_PATH = safety.Path(safety.os.environ.get("WIREHAND_SAFETY_RULES")
+                                        or safety.Path(safety.__file__).resolve().parent.parent
+                                        / "config" / "safety.yaml")
+        safety._rules, safety._last_check, safety.RESCAN_SECONDS = saved
