@@ -28,8 +28,8 @@ services:
       - .env                        # WIREHAND_API_KEY, WIREHAND_CLAB_DIR, manual device creds (chmod 600)
     environment:
       WIREHAND_INVENTORY: /app/config/inventory.yaml
-      WIREHAND_SAFETY_RULES: /app/config/safety.yaml   # read-path blocklist/allow-list; a broken file stops startup
-      WIREHAND_SAFETY_RESCAN: "30"    # seconds between checks for safety.yaml edits
+      WIREHAND_SAFETY_RULES: /app/config/safety       # read-path rules: common.yaml + one file per device_type; a broken file stops startup
+      WIREHAND_SAFETY_RESCAN: "30"    # seconds between checks for edits in config/safety/
       WIREHAND_CLAB_DIR: /clab        # container-side path of the containerlab folder (mounted below)
       WIREHAND_CLAB_RESCAN: "30"      # seconds between checks for deployed/destroyed labs
       WIREHAND_DATA: /app/data

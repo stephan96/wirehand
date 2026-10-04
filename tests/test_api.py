@@ -38,8 +38,12 @@ c = TestClient(main.app)
 assert c.get("/list_devices").status_code == 401
 assert "r1" in c.get("/list_devices", headers=H).text
 assert "out of show version" in c.get("/get_facts", params={"device": "r1"}, headers=H).text
-r = c.get("/run_read", params={"device": "r1,s1", "commands": "show running-config", "filter": "loopback", "context": 1}, headers=H)
+# A command both platforms accept; the fake pool answers anything with 'running' in it.
+r = c.get("/run_read", params={"device": "r1,s1", "commands": "cat /tmp/running-config", "filter": "loopback", "context": 1}, headers=H)
 assert "Loopback0" in r.text and "uplink" not in r.text and "=== s1" in r.text, r.text
+# Read rules are per device_type: a vendor read verb is no Linux read.
+r = c.get("/run_read", params={"device": "r1,s1", "commands": "show running-config"}, headers=H)
+assert r.status_code == 403 and "s1: 'show running-config'" in r.text and "r1:" not in r.text, r.text
 assert c.get("/run_read", params={"device": "s1", "commands": "sudo reboot"}, headers=H).status_code == 403
 assert c.get("/run_read", params={"device": "nope", "commands": "uptime"}, headers=H).status_code == 404
 

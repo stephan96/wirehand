@@ -88,7 +88,8 @@ output together with the hint to use `filter`.
   `ln -s` and `wget` are exactly the kind that used to slip through. Network CLIs keep the
   blocklist and allow unknown verbs: their exec view cannot start arbitrary programs, and
   vendor read verbs are far too varied to enumerate. All three layers are data, not code:
-  they live in `config/safety.yaml` (see "Configuration") and are validated on load.
+  they live in `config/safety/` - one file per device type plus a shared `common.yaml`
+  (see "Configuration") - and are validated on load.
 - **Every write is two-stage and human-gated.** `propose_change` and `rollback_change` only
   *stage* an operation and return a confirmation code. Codes are single-use and expire after
   10 minutes.
@@ -127,9 +128,8 @@ curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
 ```
 
 `.env` and `config/inventory.yaml` are listed in `.gitignore`, so a later `git pull`
-never overwrites them. `config/safety.yaml` (the read-path blocklist and allow-list) needs
-no copying - it ships ready to use, and `docker exec wirehand python -m app.safety --lint`
-shows what is in force.
+never overwrites them. The read-path rules in `config/safety/` need no copying - they ship
+ready to use, and `docker exec wirehand python -m app.safety --lint` shows what is in force.
 
 ### Development install (tarball)
 
@@ -336,18 +336,39 @@ changes. The read path never escalates (`sudo` is refused there) and runs allow-
 read commands only - but an allow-listed `cat` still reads every file the account can
 read, so the account, not the allow-list, is what bounds exposure.
 
-### `config/safety.yaml`
+### `config/safety/` - read-path rules per device type
 
-The lists that decide what `run_read` may execute live in this file, not in the code, so
-they can be reviewed and extended without touching Python. Four sections, evaluated in a
-fixed order that the file cannot change:
+The lists that decide what `run_read` may execute live in this directory, not in the
+code, so they can be reviewed and extended without touching Python. There is one file per
+supported `device_type` - the same name you write in `inventory.yaml` - plus one file that
+applies to all of them:
 
-| Section | What it holds | On a match |
+| File | Applies to |
+| --- | --- |
+| `common.yaml` | every device: redirection, chaining, command substitution, piping into an interpreter, write-capable pipe modifiers (`\| file`, `\| save`, ...), interpreters (`bash`, `python`, `tclsh`), `ssh`/`telnet`/`curl` |
+| `linux.yaml` | `linux` - deny by default, with the full Linux allow-list |
+| `cisco_ios.yaml`, `cisco_xe.yaml`, `cisco_xr.yaml`, `cisco_nxos.yaml` | the Cisco platforms, each with its own shell escapes (`run`, `guestshell`, `event manager`) |
+| `huawei.yaml`, `huawei_vrpv8.yaml` | Huawei VRP5 / VRP8 (`system-view`, `undo`, `save`) |
+| `fortinet.yaml` | FortiGate (`execute`, `fnsysctl`) |
+| `arista_eos.yaml`, `juniper_junos.yaml` | Arista EOS, Junos (`start shell`) |
+| `local/<name>.yaml` | optional, your own additions - see below |
+
+A device of type `cisco_xr` is checked against `common.yaml` + `cisco_xr.yaml` (+
+`local/common.yaml` + `local/cisco_xr.yaml` if present), so a rule in `cisco_xr.yaml`
+never affects a Huawei or a Linux box. Every file has the same three sections, evaluated
+in a fixed order that the files cannot change; a device file also sets the default:
+
+| Key | What it holds | On a match |
 | --- | --- | --- |
-| `hard_refusals` | argument-level checks: redirection, chaining, command substitution, `find -delete`, `ethtool -s`, vendor shell escapes, write-capable pipe modifiers | refused, with that entry's `reason` - wins even over an allow-listed verb |
-| `blocklist` | known write/privileged verbs, grouped (`package-managers`, `filesystem-writes`, ...) | refused |
-| `allowlist` | known-good read verbs, grouped (`networking`, `services-read`, ...) | allowed |
-| `shell_families` | families whose CLI is a general-purpose shell (`linux`) | nothing else runs there: no match in `allowlist` means refused |
+| `hard_refusals` | argument-level checks: `find -delete`, `ethtool -s`, vendor shell escapes, ... | refused, with that entry's `reason` - wins even over an allow-listed verb |
+| `blocklist` | known write/privileged verbs, grouped (`package-managers`, `config-mode-and-commit`, ...) | refused |
+| `allowlist` | known-good read verbs, grouped (`networking`, `read-verbs`, ...) | allowed |
+| `default` (device files only) | `deny` or `allow` | what happens to a command that matches nothing |
+
+`linux` ships with `default: deny`: nothing runs there unless the allow-list names it. The
+network platforms ship with `default: allow`, because their exec view cannot start
+arbitrary programs - on them the allow-list only documents the read verbs. Switching a
+platform to `default: deny` makes it allow-list only, so extend its `allowlist` first.
 
 Each entry is a Python regular expression, matched with `re.search` against the command
 after whitespace collapse, case-insensitively unless the entry sets `case_sensitive: true`
@@ -356,6 +377,7 @@ the order of entries does not matter. Always single-quote a pattern so YAML keep
 backslashes:
 
 ```yaml
+# config/safety/linux.yaml
 blocklist:
   - group: package-managers
     patterns:
@@ -368,34 +390,61 @@ allowlist:
       - '^(ethtool)(\s|$)'                      # '\s' alone would require an argument
 ```
 
-Check the file before it goes live, and after every edit:
+Check the rules before they go live, and after every edit. `--explain` answers "why was
+this refused?" by naming the file, the entry and the reason:
 
 ```bash
-docker exec wirehand python -m app.safety --lint      # or: python -m app.safety --lint config/safety.yaml
+docker exec wirehand python -m app.safety --lint      # or: python -m app.safety --lint config/safety
+docker exec wirehand python -m app.safety --explain huawei_vrpv8 'system-view'
+#   huawei_vrpv8: 'system-view'
+#     REFUSED by hard_refusals in huawei_vrpv8.yaml
+#     pattern: '^system-view\b'
+#     reason:  vendor config view - use propose_change
 ```
 
 Edits are picked up within `WIREHAND_SAFETY_RESCAN` seconds (30 by default);
-`list_devices(refresh=true)` applies them at once. The rules are **fail-closed**: a file
-that is missing, unparseable, has an unknown key, an empty section or an uncompilable
-regex is never loaded. On startup that aborts the container (`docker logs wirehand` names
-the file and the offending entry); at runtime the rules already in memory keep serving and
-the error is logged, so a typo can never widen the read path.
+`list_devices(refresh=true)` applies them at once. The rules are **fail-closed**: if any
+file is unparseable, has an unknown key, a missing section or an uncompilable regex - or
+if a supported `device_type` has no file of its own - nothing is loaded. On startup that
+aborts the container (`docker logs wirehand` names the file and the offending entry); at
+runtime the rules already in memory keep serving and the error is logged, so a typo can
+never widen the read path.
 
 Two things to keep in mind when editing:
 
-- **This file is security policy.** Whoever can write it can grant arbitrary command
-  execution on the read path. It is mounted read-only into the container; keep it owned by
-  the admin account and out of reach of the service user.
-- **Adding a verb to `allowlist` grants it on every device of a `shell_families` family.**
-  Check that none of its *arguments* can write - that is what `hard_refusals` is for. The
+- **These files are security policy.** Whoever can write them can grant arbitrary command
+  execution on the read path. They are mounted read-only into the container; keep them
+  owned by the admin account and out of reach of the service user.
+- **Adding a verb to `linux.yaml`'s `allowlist` grants it on every Linux device.** Check
+  that none of its *arguments* can write - that is what `hard_refusals` is for. The
   pattern matches the verb, so `find` on the allow-list is what made `find ... -delete`
   necessary as a hard refusal.
 
-`config/safety.yaml` is version-controlled and gets improved between versions, so a
-`git pull` replaces it - and so does unpacking a tarball that contains it. Keep local
-additions as a patch (`git diff -- config/safety.yaml > my-rules.patch`) and re-apply them
-after an update; `--lint` plus `python -m pytest tests/test_safety.py` then tells you
-whether the result is sound.
+#### Local additions: `config/safety/local/`
+
+The shipped files are version-controlled and get improved between versions, so a
+`git pull` replaces them. Put your own rules in `config/safety/local/<name>.yaml` instead,
+where `<name>` is `common` or a `device_type`. That directory is in `.gitignore` and not
+part of a release, so updates leave it alone:
+
+```yaml
+# config/safety/local/linux.yaml - only the sections you need
+allowlist:
+  - group: site-tools
+    patterns:
+      - '^(jq)(\s|$)'
+
+hard_refusals:
+  - pattern: '^cat\s+/etc/app/secrets'
+    reason: application secrets are off limits on the read path
+```
+
+A local file can only **add** entries to its device type (or to every type, for
+`local/common.yaml`): it cannot remove a shipped rule and cannot set `default`. A file
+whose name is not `common` or a supported `device_type` is refused rather than ignored,
+so a typo such as `cisco-xr.yaml` shows up in `--lint` instead of silently not applying.
+After an update, `--lint` plus `python -m pytest tests/test_safety.py` tells you whether
+the result is sound.
 
 ## Approving changes
 
@@ -716,9 +765,9 @@ changes with age).
 | `confirm_change` returns 403 "approval code is not valid (right now)" | phone clock drift, or the model made the number up | compare `docker exec wirehand python -m app.approval` with your app; the change stays staged, just send a fresh code |
 | "approval code is not valid - wrong, or expired" although you read it correctly | the model took longer than `WIREHAND_APPROVAL_MAX_AGE` to call `confirm_change`, or the phone clock is off | send a fresh code; raise `WIREHAND_APPROVAL_MAX_AGE` for slow models; enable automatic time on the phone |
 | "too many wrong approval codes - locked" | five refused approvals in two minutes | wait it out, or raise `WIREHAND_APPROVAL_MAX_FAILURES` / lower `WIREHAND_APPROVAL_LOCKOUT` |
-| A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | if it really is read-only, add it to the matching `allowlist` group in `config/safety.yaml` (then `python -m app.safety --lint`); if it writes, it belongs in `propose_change` |
-| Container exits at startup, log says `safety rule file not found` or names an entry in `safety.yaml` | the read-path rules are missing or malformed - wirehand refuses to run without them | `python -m app.safety --lint config/safety.yaml` on the host names file and entry; check that the `./config` bind mount is present |
-| A `safety.yaml` edit has no effect | not reloaded yet, or it was refused | wait `WIREHAND_SAFETY_RESCAN` seconds or call `list_devices(refresh=true)`; `docker logs wirehand` shows either `reloaded safety rules` or `NOT reloaded, keeping the previous ones: <reason>` |
+| A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | `python -m app.safety --explain linux '<command>'` shows why; if it really is read-only, add it to `config/safety/local/linux.yaml` (then `python -m app.safety --lint`); if it writes, it belongs in `propose_change` |
+| Container exits at startup, log says `safety rule directory not found`, `no rule file for ...` or names an entry in `config/safety/` | the read-path rules are missing or malformed, or a device type has no file - wirehand refuses to run without them | `python -m app.safety --lint config/safety` on the host names file and entry; check that the `./config` bind mount is present |
+| An edit in `config/safety/` has no effect | not reloaded yet, or it was refused | wait `WIREHAND_SAFETY_RESCAN` seconds or call `list_devices(refresh=true)`; `docker logs wirehand` shows either `reloaded safety rules` or `NOT reloaded, keeping the previous ones: <reason>` |
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
 | UBUNTU/local host unreachable | sshd not listening on the address used | with host networking use `host: 127.0.0.1` |
 | Change fails with prompt/timeout errors | wrong Netmiko driver for the platform | check `kinds:` mapping (VRP5 vs VRP8 is the classic) |

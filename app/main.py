@@ -250,10 +250,10 @@ def run_read(
     # Resolve every device BEFORE running anything: an unknown name in a list
     # must not leave the earlier devices already executed. What counts as a safe
     # read depends on the platform - a Linux shell needs the strict allow-list,
-    # a vendor exec view does not - so check each command per target family.
+    # a vendor exec view does not - so check each command per target device type.
     devs = [_device(n) for n in names]
     refused = [(d.name, c, v.reason) for d in devs for c in cmds
-               if not (v := check_read_command(c, d.family)).allowed]
+               if not (v := check_read_command(c, d.device_type)).allowed]
     if refused:
         msg = "; ".join(f"{d}: '{c}': {r}" for d, c, r in refused)
         raise HTTPException(403, f"refused on read path: {msg}")
