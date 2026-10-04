@@ -25,6 +25,12 @@
 #   3. allowlist       known-good read verbs
 #   4. default         the device file's 'default:' - deny (allow-list only) or allow
 #
+# A pipeline is checked stage by stage, each stage like a command of its own
+# ('^' anchors at the start of the stage): 'cat x | crontab -' is refused on
+# Linux because 'crontab' is not on the allow-list, not waved through because
+# 'cat' is. hard_refusals additionally run against the whole line once, which
+# is what lets a pattern such as '\|\s*sh\b' see the pipe itself.
+#
 # Within a section the order of entries is irrelevant: the first match wins and
 # every entry produces the same verdict. Each entry is a Python regular
 # expression, matched with re.search against the command after whitespace
@@ -48,8 +54,13 @@ version: 1
 # another host. Vendor- and OS-specific refusals live in the device files.
 # `reason` is handed to the model verbatim, so say what to use instead.
 hard_refusals:
-  - pattern: '(\s>\s*\S|\s>>|;|&&|\|\|)'
-    reason: shell redirection/chaining not allowed on read path
+  - pattern: '[>;&]|\|\||<\('
+    reason: shell redirection/chaining/background ('>', ';', '&', '||', '<(') not allowed on read path - use filter= to narrow output
+    note: >
+      Any '>' at all, not only ' > ': 'ls 2>/tmp/x' and 'cat x>/tmp/y' write a
+      file just as well. A single '&' backgrounds the first command and runs
+      the second one; '<(...)' runs a command like '$(...)'. A '>' inside a
+      vendor filter regex is refused too - the filter parameter does that job.
 
   - pattern: '\|\s*(sh|bash|zsh|python\d?|perl|xargs|sudo|tee)\b'
     reason: piping into an interpreter/tee is not allowed on read path

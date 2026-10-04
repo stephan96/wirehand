@@ -20,6 +20,30 @@ hard_refusals:
   - pattern: '^(ip|ifconfig)\s+(?!.*\bshow\b).*\b(add|del|set|flush|replace|change)\b'
     reason: mutating ip/ifconfig subcommand - use propose_change
 
+  - pattern: '^ip\b.*(\s-(b|ba\w*|fo\w*)\b|\b(netns|vrf)\s+exec\b)'
+    reason: "'ip -batch/-force' or 'ip netns|vrf exec' runs arbitrary commands - use propose_change"
+    note: >
+      -batch reads ip commands (writes included) from a file; 'netns exec' and
+      'vrf exec' start any program.
+
+  - pattern: '^bridge\b.*\b(add|del|delete|replace|set|append|flush|change)\b'
+    reason: mutating bridge subcommand - use propose_change
+
+  - pattern: '^arp\b.*\s(-[a-z]*[dsf]\b|--delete|--set|--file)'
+    reason: "'arp -d/-s/-f' changes the ARP table - use propose_change"
+
+  - pattern: '^sysctl\b.*(\s-[a-z]*[wpf]\b|\s--(write|load|system)\b|\s[^-\s]\S*=)'
+    reason: "'sysctl' with -w/-p/--system or key=value changes kernel settings - use propose_change"
+    note: >
+      procps-ng sysctl writes a 'key=value' argument even without -w, and -p /
+      --system load whole files of settings.
+
+  - pattern: '^sort\b.*(\s-[a-z]*o|\s--output|\s--compress-program)'
+    reason: "'sort -o' writes a file and --compress-program runs one - use propose_change"
+
+  - pattern: '^uniq\b(\s+(-\S*[fsw]\s+\S+|-\S*[^\sfsw]))*\s+[^-\s]\S*\s+[^-\s]\S*'
+    reason: "'uniq IN OUT' writes its second file argument - use propose_change"
+
   - pattern: '^(xargs|nohup|timeout|watch|nice|ionice|setsid|stdbuf|script|chroot|unshare|nsenter)\b'
     reason: command wrapper can hide a write command - use propose_change
 
@@ -29,30 +53,55 @@ hard_refusals:
   - pattern: '^find\b.*\s-(delete|exec|execdir|ok|okdir|fls|fprintf?|fprint0)\b'
     reason: "'find' with an action that writes or executes - use propose_change"
 
-  - pattern: '^journalctl\b.*--vacuum'
-    reason: "'journalctl --vacuum' deletes logs - use propose_change"
-
-  - pattern: '^dmesg\b.*(\s-[Cc]\b|--clear|--read-clear)'
-    reason: "'dmesg -C' clears the kernel ring buffer - use propose_change"
+  - pattern: '^journalctl\b.*--(vacuum|rotate|flush|sync|relinquish-var|smart-relinquish-var|setup-keys|update-catalog|cursor-file)'
+    reason: "'journalctl' with a maintenance option deletes, rotates or writes journal files - use propose_change"
 
   - pattern: '^(mount|umount)\s+(?!-l\b)\S'
     reason: (un)mounting changes the system - use propose_change
 
-  - pattern: '^date\s+(-s|--set)'
-    reason: "'date -s' sets the system clock - use propose_change"
+  - pattern: '^date\b.*\s(-s|--set)\b|^date\s+(-u\s+|--utc\s+|--universal\s+)?\d'
+    reason: "'date -s' / 'date MMDDhhmm' sets the system clock - use propose_change"
 
   - pattern: '^hostname\s+(?!-)\S'
     reason: "'hostname <name>' sets the hostname - use propose_change"
 
+  - pattern: '^(clab|containerlab)\s+graph\b'
+    reason: "'containerlab graph' starts a web server or writes a file - use propose_change"
+
   # Case-SENSITIVE entries: the rest of this file is matched case-insensitively,
   # which cannot tell 'ethtool -S' (statistics) from 'ethtool -s' (set!), or
   # 'ss -k' from 'ss -K'.
-  - pattern: '^ethtool\s+(-s|-A|-C|-G|-K|-L|-N|-U|-W|-E|-f|-r|--change|--flash|--set)\b'
-    reason: "'ethtool' with a setting flag - use propose_change"
+  - pattern: '^ethtool\s+(-s|-A|-C|-G|-K|-L|-N|-U|-W|-E|-X|-f|-r|-t|-p|--change\S*|--flash|--set\S*|--config\S*|--reset|--test|--identify|--pause|--coalesce|--ring|--offload|--features|--negotiate|--per-queue)\b'
+    reason: "'ethtool' with a setting, reset or self-test flag - use propose_change"
     case_sensitive: true
 
   - pattern: '^ss\b.*\s-K\b'
     reason: "'ss -K' closes live sockets - use propose_change"
+    case_sensitive: true
+
+  - pattern: '^dmesg\b.*(\s-[a-zA-Z]*[CcnDE]|\s--(clear|read-clear|console-level|console-off|console-on)\b)'
+    reason: "'dmesg' with -C/-c/-n/-D/-E clears the ring buffer or changes console logging - use propose_change"
+    case_sensitive: true
+
+  - pattern: '^hostname\b.*\s(-F|--file|-b|--boot)\b'
+    reason: "'hostname -F/-b' sets the hostname - use propose_change"
+    case_sensitive: true
+
+  - pattern: '^(ip6?tables|iptables-legacy|ip6tables-legacy)\b.*(\s-[a-zA-Z]*[ADIRFZNXPE]|\s--(append|delete|insert|replace|flush|zero|new-chain|delete-chain|policy|rename-chain)\b)'
+    reason: "'iptables' with a rule-changing command (-A/-D/-I/-F/-Z/...) - use propose_change"
+    case_sensitive: true
+    note: >
+      '-L -Z' lists AND zeroes the counters; only -L/-S with their options are reads.
+
+  - pattern: '^rpm\b.*--(setperms|setugids|setcaps|restore|import|initdb|rebuilddb|install|upgrade|erase|freshen|reinstall|addsign|resign|delsign)\b'
+    reason: "'rpm' with a modifying option - use propose_change"
+
+  - pattern: '^less\b.*\s(-[a-zA-Z]*[oO]|--log-file|--LOG-FILE)'
+    reason: "'less -o' copies its input to a file - use propose_change"
+    case_sensitive: true
+
+  - pattern: '^file\b.*\s(-[a-zA-Z]*C|--compile)'
+    reason: "'file -C' writes a compiled magic file - use propose_change"
     case_sensitive: true
 
 
@@ -140,7 +189,9 @@ allowlist:
   - group: networking
     patterns:
       - '^(ss|netstat|arp|traceroute)(\s|$)'
-      - '^(ip\s+(-\S+\s+)*(addr\w*|a|link|l|route|r|neigh\w*|n|rule|-s))(\s|$)'
+      # The object is required: a bare option such as '-s' must not satisfy the
+      # pattern, or 'ip -s netns exec ...' would pass as 'ip -s'.
+      - '^(ip\s+(-\S+\s+)*(addr\w*|a|link|l|route|r|ro|neigh\w*|n|rule|ru))(\s|$)'
       - '^(bridge\s+(link|fdb|vlan))(\s|$)'
       - '^(ethtool)(\s|$)'
 
@@ -171,4 +222,4 @@ allowlist:
   - group: containers-and-labs-read
     patterns:
       - '^(docker\s+(ps|images|logs|inspect|version|stats\s+--no-stream|compose\s+ps))(\s|$)'
-      - '^((clab|containerlab)\s+(inspect|version|graph))(\s|$)'
+      - '^((clab|containerlab)\s+(inspect|version))(\s|$)'

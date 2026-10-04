@@ -370,6 +370,58 @@ class Verdict:
     reason: str = ""
     section: str = ""           # hard_refusals | blocklist | allowlist | default
     rule: Rule | None = None    # the entry that decided; None for the default
+    stage: str = ""             # the pipeline stage that decided
+
+
+def pipeline_stages(c: str) -> list[str]:
+    """Split a command at every '|' that the shell would treat as a pipe, i.e.
+    outside quotes and not backslash-escaped, so `grep -E 'a|b' f` stays one
+    stage. With unbalanced quotes the shell's view is unclear, so split at every
+    '|' instead - more stages means more checks, never fewer."""
+    stages, cur, quote, i = [], [], "", 0
+    while i < len(c):
+        ch = c[i]
+        if ch == "\\" and quote != "'" and i + 1 < len(c):
+            cur.append(c[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            quote = "" if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "|":
+            stages.append("".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(ch)
+        i += 1
+    stages.append("".join(cur))
+    if quote:
+        stages = c.split("|")
+    return [s.strip() for s in stages]
+
+
+def _check_stage(s: str, policy: Policy) -> Verdict:
+    # 1. Hard refusals - argument-level, they win even for allow-listed verbs.
+    for rule in policy.hard:
+        if rule.rx.search(s):
+            return Verdict(False, rule.reason, "hard_refusals", rule, s)
+    # 2. Blocklist - a known write verb, refused with a precise reason.
+    for rule in policy.block:
+        if rule.rx.search(s):
+            return Verdict(False, rule.reason or DEFAULT_BLOCK_REASON.format(verb=s.split()[0]),
+                           "blocklist", rule, s)
+    # 3. Allow-list - known-good read verbs.
+    for rule in policy.allow:
+        if rule.rx.search(s):
+            return Verdict(True, "", "allowlist", rule, s)
+    # 4. Anything else: the device file's default.
+    if policy.default == "deny":
+        return Verdict(False, f"'{s.split()[0]}' is not on the read allow-list for {policy.device_type} devices - "
+                              "run_read only runs known read-only commands there; use propose_change for the rest",
+                       "default", None, s)
+    return Verdict(True, "", "default", None, s)
 
 
 def check_read_command(cmd: str, device_type: str) -> Verdict:
@@ -377,6 +429,11 @@ def check_read_command(cmd: str, device_type: str) -> Verdict:
 
     `device_type` is inventory.Device.device_type. One without a policy is
     refused - the inventory only admits supported types, so this is a bug guard.
+
+    Every stage of a pipeline is checked on its own, exactly like a command: on
+    a shell `cat x | crontab -` runs crontab, so an allow-listed first verb must
+    not carry the rest through. On a network CLI the stages are pipe modifiers
+    (`include`, `begin`), which pass the same way a read verb does.
     """
     c = " ".join(cmd.strip().split())
     if not c:
@@ -384,25 +441,19 @@ def check_read_command(cmd: str, device_type: str) -> Verdict:
     policy = rules().policies.get(device_type)
     if policy is None:
         return Verdict(False, f"no read-path safety rules for device type '{device_type}'")
-    # 1. Hard refusals - argument-level, they win even for allow-listed verbs.
+    # Hard refusals first against the whole line: some span stages ('| sh', '| file').
     for rule in policy.hard:
         if rule.rx.search(c):
-            return Verdict(False, rule.reason, "hard_refusals", rule)
-    # 2. Blocklist - a known write verb, refused with a precise reason.
-    for rule in policy.block:
-        if rule.rx.search(c):
-            return Verdict(False, rule.reason or DEFAULT_BLOCK_REASON.format(verb=c.split()[0]),
-                           "blocklist", rule)
-    # 3. Allow-list - known-good read verbs.
-    for rule in policy.allow:
-        if rule.rx.search(c):
-            return Verdict(True, "", "allowlist", rule)
-    # 4. Anything else: the device file's default.
-    if policy.default == "deny":
-        return Verdict(False, f"'{c.split()[0]}' is not on the read allow-list for {device_type} devices - "
-                              "run_read only runs known read-only commands there; use propose_change for the rest",
-                       "default")
-    return Verdict(True, "", "default")
+            return Verdict(False, rule.reason, "hard_refusals", rule, c)
+    first = None
+    for s in pipeline_stages(c):
+        if not s:
+            return Verdict(False, "empty pipeline stage - nothing between two '|'", "hard_refusals", None, c)
+        v = _check_stage(s, policy)
+        if not v.allowed:
+            return v
+        first = first or v
+    return first
 
 
 def split_commands(block: str) -> list[str]:
@@ -445,6 +496,8 @@ def _explain(device_type: str, command: str) -> int:
         return 2
     v = check_read_command(command, device_type)
     print(f"{device_type}: {command!r}\n  {'ALLOWED' if v.allowed else 'REFUSED'}", end="")
+    if not v.allowed and v.stage and v.stage != " ".join(command.split()):
+        print(f" at pipeline stage {v.stage!r}", end="")
     if v.rule:
         where = v.section if v.section == "hard_refusals" else f"{v.section} group '{v.rule.group}'"
         print(f" by {where} in {v.rule.source}\n  pattern: '{v.rule.rx.pattern}'")

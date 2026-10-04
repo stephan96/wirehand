@@ -24,30 +24,36 @@ hard_refusals:
 # Known write/privileged/disruptive verbs, refused on run_read regardless of the
 # device's access level. A group may set its own `reason`, otherwise the generic
 # blocklist message is used.
+#
+# The CLI accepts any unambiguous abbreviation ('config t', 'wr', 'cop'), so a
+# verb is written as its shortest distinctive prefix plus '[a-z]*' - matching
+# only the full word would let every shorter spelling through.
 blocklist:
   - group: config-mode-and-commit
     patterns:
-      - '^(conf|configure)(\s|$)'
-      - '^(commit|rollback|reload|reboot|shutdown)'
+      - '^con[a-z]*(\s|$)'                  # conf t, config t, configure ... - and IOS 'connect'
+      - '^(commit|rollback|rel[a-z]*|reboot|shutdown)' # rel* = reload
       - '^(save|startup)'
 
   - group: save-and-copy-config
     patterns:
-      - '^(write|wr)(\s|$)'
-      - '^copy\s'
+      - '^wr[a-z]*(\s|$)'                   # write memory/erase, wr
+      - '^cop[a-z]*\s'
 
   - group: vendor-mutating-verbs
     patterns:
-      - '^(delete|erase|format)\s'
+      - '^(del[a-z]*|era[a-z]*|form[a-z]*)\s'
       - '^no\s'
-      - '^(clear|reset)\s'
-      - '^(debug|undebug|terminal\s+monitor)'
+      - '^(cle[a-z]*|reset)\s'
+      - '^(deb|undeb|un?\s+all|term[a-z]*\s+mon)' # debug, undebug, u all, terminal monitor
+      - '^clo[a-z]*\s+set\b'                # clock set
 
 
 # --- 3. Read allow-list -----------------------------------------------------
 # With 'default: allow' this list decides nothing: a command that survives the
 # blocklist runs anyway. It documents the read verbs and is what takes over when
-# 'default' is switched to deny.
+# 'default' is switched to deny - then pipe modifiers need an entry too, since
+# every pipeline stage is checked like a command.
 allowlist:
   - group: read-verbs
     patterns:
@@ -55,3 +61,7 @@ allowlist:
       - '^ping\s'
       - '^traceroute\s'
       - '^dir(\s|$)'
+
+  - group: pipe-modifiers
+    patterns:
+      - '^(include|exclude|begin|section|count|inc|exc|beg|sec|i|e|b|s|no-more|json)(\s|$)'

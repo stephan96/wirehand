@@ -82,8 +82,8 @@ output together with the hint to use `filter`.
   command substitution, `find -delete`, `awk 'BEGIN{system(...)}'`, `ethtool -s`,
   `journalctl --vacuum`, vendor shell escapes such as IOS-XR `run` or Junos `start shell`,
   and write-capable pipe modifiers such as `| file`, `| utility`, `| save`), then the write
-  blocklist (configure, commit, rm, sudo, ...), then the allow-list. On **Linux devices the
-  allow-list is the last word**: what is not on it is refused. A blocklist can only name the
+  blocklist (configure, commit, rm, sudo, ...), then the allow-list - for every stage of a
+  pipeline. On **Linux devices the allow-list is the last word**: what is not on it is refused. A blocklist can only name the
   commands somebody thought of, and on a shell that is never all of them - `touch`, `cp`,
   `ln -s` and `wget` are exactly the kind that used to slip through. Network CLIs keep the
   blocklist and allow unknown verbs: their exec view cannot start arbitrary programs, and
@@ -198,6 +198,12 @@ to keep the old behaviour. Reading, proposing and staging keep working either wa
 only the apply step is gated.
 
 `curl -s http://localhost:8110/health` shows `confirm_mode` and `approval_ready`.
+
+**Upgrading to 0.5.4 with `git pull`:** `config/inventory.yaml` is no longer tracked
+by git (it is in `.gitignore` now, like `.env`). On a clone that still has the tracked
+copy, the pull that removes it from git also deletes the file - copy it aside first
+(`cp config/inventory.yaml ~/inventory.yaml.bak`) and put it back afterwards. The
+tarball route is not affected.
 
 
 **Open WebUI caches the tool description: after an update, toggle the tool-server entry
@@ -345,12 +351,12 @@ applies to all of them:
 
 | File | Applies to |
 | --- | --- |
-| `common.yaml` | every device: redirection, chaining, command substitution, piping into an interpreter, write-capable pipe modifiers (`\| file`, `\| save`, ...), interpreters (`bash`, `python`, `tclsh`), `ssh`/`telnet`/`curl` |
+| `common.yaml` | every device: redirection and chaining in any spelling (`>`, `;`, `&`, `\|\|`), command and process substitution, piping into an interpreter, write-capable pipe modifiers (`\| file`, `\| save`, ...), interpreters (`bash`, `python`, `tclsh`), `ssh`/`telnet`/`curl` |
 | `linux.yaml` | `linux` - deny by default, with the full Linux allow-list |
 | `cisco_ios.yaml`, `cisco_xe.yaml`, `cisco_xr.yaml`, `cisco_nxos.yaml` | the Cisco platforms, each with its own shell escapes (`run`, `guestshell`, `event manager`) |
-| `huawei.yaml`, `huawei_vrpv8.yaml` | Huawei VRP5 / VRP8 (`system-view`, `undo`, `save`) |
-| `fortinet.yaml` | FortiGate (`execute`, `fnsysctl`) |
-| `arista_eos.yaml`, `juniper_junos.yaml` | Arista EOS, Junos (`start shell`) |
+| `huawei.yaml`, `huawei_vrpv8.yaml` | Huawei VRP5 / VRP8 (`system-view`/`sys`, `undo`, `save`, `reset`) |
+| `fortinet.yaml` | FortiGate (`config`, `execute`, `diagnose ... kill/clear`, `sudo`, `fnsysctl`) |
+| `arista_eos.yaml`, `juniper_junos.yaml` | Arista EOS, Junos (`start shell`, `request`, `restart`, op-mode `set`/`file`) |
 | `local/<name>.yaml` | optional, your own additions - see below |
 
 A device of type `cisco_xr` is checked against `common.yaml` + `cisco_xr.yaml` (+
@@ -364,6 +370,16 @@ in a fixed order that the files cannot change; a device file also sets the defau
 | `blocklist` | known write/privileged verbs, grouped (`package-managers`, `config-mode-and-commit`, ...) | refused |
 | `allowlist` | known-good read verbs, grouped (`networking`, `read-verbs`, ...) | allowed |
 | `default` (device files only) | `deny` or `allow` | what happens to a command that matches nothing |
+
+**A pipeline is checked stage by stage**, each stage like a command of its own:
+`cat x | crontab -` is refused on Linux because `crontab` is not on the allow-list - the
+allowed `cat` in front does not carry it through. The split follows shell quoting, so
+`grep -E 'a|b' file` stays one stage. On a network CLI the stages are pipe modifiers
+(`| include`, `| match`), which the device files list in an allow-list group of their own.
+
+**Network CLIs accept abbreviations** - `config t`, `sys`, `exe reboot`, `wr` - so the
+vendor files write a write verb as its shortest distinctive prefix plus `[a-z]*`
+(`'^con[a-z]*(\s|$)'`) rather than the full word. Keep that in mind when you add one.
 
 `linux` ships with `default: deny`: nothing runs there unless the allow-list names it. The
 network platforms ship with `default: allow`, because their exec view cannot start

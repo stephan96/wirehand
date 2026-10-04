@@ -14,7 +14,7 @@ default: allow
 
 # --- 1. Hard refusals -------------------------------------------------------
 hard_refusals:
-  - pattern: '^(start|request)\s+shell\b'
+  - pattern: '^(sta[a-z]*|req[a-z]*)\s+sh[a-z]*\b'
     reason: vendor shell escape - use propose_change
     note: >
       'start shell' drops to the FreeBSD/Linux shell. '| save' is refused in
@@ -25,29 +25,50 @@ hard_refusals:
 # Known write/privileged/disruptive verbs, refused on run_read regardless of the
 # device's access level. A group may set its own `reason`, otherwise the generic
 # blocklist message is used.
+#
+# The CLI accepts any unambiguous abbreviation ('config t', 'wr', 'cop'), so a
+# verb is written as its shortest distinctive prefix plus '[a-z]*' - matching
+# only the full word would let every shorter spelling through.
 blocklist:
   - group: config-mode-and-commit
     patterns:
-      - '^(conf|configure)(\s|$)'
+      - '^(con[a-z]*|ed[a-z]*)(\s|$)'       # configure, edit
       - '^(commit|rollback|reload|reboot|shutdown)'
       - '^(save|startup)'
 
+  - group: request
+    reason: "Junos 'request' changes the system (request system reboot/zeroize/software add) - use propose_change(mode='exec')"
+    patterns:
+      - '^req[a-z]*\s+(?!sup[a-z]*\s+inf)'  # all but 'request support information'
+
+  - group: restart
+    reason: "Junos 'restart' restarts a daemon - use propose_change(mode='exec')"
+    patterns:
+      - '^rest[a-z]*(\s|$)'
+
+  - group: op-mode-writes
+    patterns:
+      - '^set\s+(?!cli\b)'                  # set date, set chassis ... - 'set cli' is session-only
+      - '^fil[a-z]*\s+(?!(list|show|compare|checksum)\b)' # file delete/copy/rename/archive
+      - '^op\s'                             # runs an op script
+
   - group: save-and-copy-config
     patterns:
-      - '^(write|wr)(\s|$)'
-      - '^copy\s'
+      - '^wr[a-z]*(\s|$)'
+      - '^cop[a-z]*\s'
 
   - group: vendor-mutating-verbs
     patterns:
-      - '^(delete|erase|format)\s'
-      - '^(clear|reset)\s'
+      - '^(del[a-z]*|era[a-z]*|form[a-z]*)\s'
+      - '^(cle[a-z]*|reset)\s'
       - '^(debug|undebug|terminal\s+monitor)'
 
 
 # --- 3. Read allow-list -----------------------------------------------------
 # With 'default: allow' this list decides nothing: a command that survives the
 # blocklist runs anyway. It documents the read verbs and is what takes over when
-# 'default' is switched to deny.
+# 'default' is switched to deny - then pipe modifiers need an entry too, since
+# every pipeline stage is checked like a command.
 allowlist:
   - group: read-verbs
     patterns:
@@ -55,3 +76,8 @@ allowlist:
       - '^ping\s.*\bcount\s+\d+'
       - '^traceroute\s'
       - '^file\s+(list|show)\s'
+      - '^request\s+support\s+information(\s|$)'
+
+  - group: pipe-modifiers
+    patterns:
+      - '^(match|except|count|last|no-more|display|find|trim|resolve|compare)(\s|$)'

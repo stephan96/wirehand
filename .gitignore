@@ -3,4 +3,5 @@ config/keys/
 data/
 __pycache__/
 .env.*
+config/inventory.yaml
 config/safety/local/

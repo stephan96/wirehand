@@ -19,48 +19,73 @@ hard_refusals:
     note: >
       'fnsysctl' runs shell utilities on the FortiOS file system.
 
-  - pattern: '^(execute|exec)\s+(?!ping6?\b|traceroute\b|tracert\b|dns\b|date\b|time\b)'
+  - pattern: '^exe[a-z]*\s+(?!(ping6?|traceroute|tracert|dns)\b|(date|time)$)'
     reason: FortiGate 'execute' command - use propose_change(mode='exec')
     note: >
-      'execute' is FortiOS's maintenance verb (reboot, backup, factoryreset,
-      ...); only its diagnostics stay on the read path.
+      'execute' (also 'exe', 'exec') is FortiOS's maintenance verb: reboot,
+      backup, factoryreset, ... Only its diagnostics stay on the read path,
+      and 'execute date'/'execute time' only without an argument - with one
+      they set the clock.
+
+  - pattern: '^sudo\b'
+    reason: "'sudo' runs a command in another VDOM or the global scope - use propose_change"
+    note: >
+      'sudo global execute reboot' would otherwise pass: every rule here
+      anchors at the start of the line.
+
+  - pattern: '^diag[a-z]*\s.*\b(kill|killall|clear|flush|delete|del|reset|restart|reboot|shutdown|format|erase|purge|down|up|set|unset|test|upgrade|write)\b'
+    reason: "'diagnose' subcommand that kills, clears, resets or changes state - use propose_change(mode='exec')"
+    note: >
+      'diagnose' is mostly read-only, but not entirely: 'diag sys kill',
+      'diag sys session clear', 'diag test application <daemon> 99' (restart),
+      'diag vpn tunnel down'.
 
 
 # --- 2. Write blocklist -----------------------------------------------------
 # Known write/privileged/disruptive verbs, refused on run_read regardless of the
 # device's access level. A group may set its own `reason`, otherwise the generic
 # blocklist message is used.
+#
+# The CLI accepts any unambiguous abbreviation ('config t', 'wr', 'cop'), so a
+# verb is written as its shortest distinctive prefix plus '[a-z]*' - matching
+# only the full word would let every shorter spelling through.
 blocklist:
   - group: config-mode-and-commit
     patterns:
-      - '^(conf|configure)(\s|$)'
+      - '^con[a-z]*(\s|$)'                  # config system ... enters configuration
       - '^(commit|rollback|reload|reboot|shutdown)'
       - '^(save|startup)'
 
   - group: save-and-copy-config
     patterns:
-      - '^(write|wr)(\s|$)'
-      - '^copy\s'
+      - '^wr[a-z]*(\s|$)'
+      - '^cop[a-z]*\s'
 
   - group: vendor-mutating-verbs
     patterns:
-      - '^(delete|erase|format)\s'
-      - '^(clear|reset)\s'
+      - '^(del[a-z]*|era[a-z]*|form[a-z]*)\s'
+      - '^(cle[a-z]*|reset)\s'
       - '^(debug|undebug|terminal\s+monitor)'
 
   - group: fortinet-execute
     patterns:
-      - '^(execute|exec)\s+(reboot|shutdown|factoryreset|restore|backup|formatlogdisk)'
+      - '^exe[a-z]*\s+(reboot|shutdown|factoryreset|restore|backup|formatlogdisk)'
 
 
 # --- 3. Read allow-list -----------------------------------------------------
 # With 'default: allow' this list decides nothing: a command that survives the
 # blocklist runs anyway. It documents the read verbs and is what takes over when
-# 'default' is switched to deny.
+# 'default' is switched to deny - then pipe modifiers need an entry too, since
+# every pipeline stage is checked like a command.
 allowlist:
   - group: read-verbs
     patterns:
       - '^get\s'
       - '^show\s'
-      - '^diagnose\s+(?!sys\s+kill)'
-      - '^(execute|exec)\s+(ping6?|traceroute|tracert)\s'
+      - '^diag[a-z]*\s'
+      - '^exe[a-z]*\s+(ping6?|traceroute|tracert)\s'
+      - '^exe[a-z]*\s+(date|time)$'
+
+  - group: pipe-modifiers
+    patterns:
+      - '^grep(\s|$)'

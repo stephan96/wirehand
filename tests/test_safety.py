@@ -99,6 +99,124 @@ def test_network_cli_keeps_working_but_cannot_escape():
         assert not check_read_command(c, dt).allowed, (dt, c)
 
 
+def test_pipeline_stages_split_like_the_shell():
+    from app.safety import pipeline_stages
+    assert pipeline_stages("ps aux | grep sshd | head -5") == ["ps aux", "grep sshd", "head -5"]
+    assert pipeline_stages("grep -E 'a|b' f") == ["grep -E 'a|b' f"]
+    assert pipeline_stages('grep "a|b" f | wc -l') == ['grep "a|b" f', "wc -l"]
+    assert pipeline_stages("grep a\\|b f") == ["grep a\\|b f"]
+    # unbalanced quote: split everywhere, never fewer checks
+    assert pipeline_stages("grep \"a|crontab -") == ['grep "a', "crontab -"]
+
+
+def test_every_pipeline_stage_is_checked_on_linux():
+    for c in ["cat /tmp/x | crontab -", "ls | awk 'BEGIN{system(\"touch /tmp/x\")}'",
+              "cat /etc/hosts | dd of=/tmp/x", "ps aux | grep x | at now", "grep \"a|crontab -",
+              "ls | | wc -l", "cat /etc/hosts | find / -delete"]:
+        assert not check_read_command(c, "linux").allowed, c
+    for c in ["ps aux | grep sshd | head -5", "grep -E 'a|b' /etc/hosts", "grep a\\|b /etc/hosts",
+              "journalctl -n 50 --no-pager | grep -i error | tail -n 5", "sort /etc/passwd | uniq -c"]:
+        assert check_read_command(c, "linux").allowed, c
+    v = check_read_command("cat /tmp/x | crontab -", "linux")
+    assert v.stage == "crontab -" and "'crontab' is not on the read allow-list" in v.reason
+
+
+@pytest.mark.parametrize("dt", sorted(PLATFORMS))
+def test_redirection_and_background_in_any_spelling(dt):
+    for c in ["ls 2>/tmp/x", "cat x>/tmp/y", "show run >disk0:x", "ls & touch /tmp/x",
+              "cat <(touch /tmp/x)", "show run >> x"]:
+        assert not check_read_command(c, dt).allowed, (dt, c)
+
+
+def test_linux_verbs_with_a_writing_argument():
+    for c in ["sysctl -p", "sysctl --system", "sysctl kernel.panic=1", "sysctl -w a.b=1",
+              "ip -s netns exec n touch /tmp/x", "ip -batch /tmp/f", "ip -b /tmp/f", "ip vrf exec x id",
+              "ip -force -b /tmp/f", "sort -o /tmp/x /etc/hosts", "sort --output=/tmp/x f",
+              "sort --compress-program=sh f", "uniq /etc/hosts /tmp/x", "uniq -f 2 a /tmp/x",
+              "date 010112002025", "date -u 0101120025", "date --set=12:00", "dmesg -n 1", "dmesg -D",
+              "dmesg -Tc", "dmesg --console-off", "journalctl --rotate", "journalctl --flush",
+              "journalctl --cursor-file=/tmp/c", "hostname -F /tmp/x", "hostname -b x",
+              "ethtool -t eth0", "ethtool --reset eth0", "ethtool --set-eee eth0 eee off",
+              "ethtool -X eth0 equal 2", "arp -d 10.0.0.1", "arp -s 10.0.0.1 aa:bb:cc:dd:ee:ff",
+              "arp -f /tmp/ethers", "bridge fdb add aa:bb:cc:dd:ee:ff dev eth0",
+              "bridge link set dev eth0 cost 4", "iptables -L -Z", "iptables -F", "iptables -nL -Z",
+              "iptables -S --flush", "rpm -q --setperms bash", "less -o /tmp/x /etc/hosts",
+              "file -C -m /tmp/magic", "clab graph -t x.yml", "containerlab graph --dot"]:
+        assert not check_read_command(c, "linux").allowed, c
+    for c in ["sysctl -a", "sysctl -n net.ipv4.ip_forward", "ip -s link", "ip -s -s link show eth0",
+              "ip -brief addr", "ip route get 1.1.1.1", "ip ro", "date +%s", "date -d 2025-01-01",
+              "date -u", "dmesg -T", "dmesg -H --level=err", "journalctl -u ssh -n 20 --no-pager",
+              "uniq -c /etc/hosts", "uniq -f 2 /etc/hosts", "sort -n /etc/hosts", "sort -rk2 f",
+              "hostname -f", "ethtool -S eth0", "ethtool -i eth0", "ethtool -a eth0", "arp -an",
+              "bridge fdb show", "iptables -L -n -v", "iptables -S", "iptables -L INPUT --line-numbers",
+              "less /etc/hosts", "file /bin/ls", "rpm -qa", "containerlab inspect --all"]:
+        assert check_read_command(c, "linux").allowed, c
+
+
+@pytest.mark.parametrize("dt,cmds", [
+    ("cisco_ios", ["config t", "confi t", "configure terminal", "conf t", "connect 10.0.0.1", "wr",
+                   "wri mem", "relo", "reload in 5", "cop run start", "del flash:x", "cle counters",
+                   "clock set 10:00:00 1 jan 2025", "u all", "term mon"]),
+    ("cisco_xe", ["config t", "relo"]),
+    ("cisco_nxos", ["config t", "relo"]),
+    ("arista_eos", ["config", "relo"]),
+    ("cisco_xr", ["config", "admin reload location all", "admin", "admin config"]),
+    ("huawei", ["sys", "sy", "system-view", "sa", "save", "startup saved-configuration x.cfg",
+                "reset saved-configuration", "un sh", "undo info-center enable", "reb", "clock datetime 10:00:00 2025-01-01"]),
+    ("huawei_vrpv8", ["sys", "system-view immediately", "res saved-configuration"]),
+    ("juniper_junos", ["request system zeroize", "req sys reboot", "request system software add x.tgz",
+                       "restart routing", "rest chassis-control", "set date 202501011200", "configure",
+                       "con", "edit", "file delete /var/tmp/x", "file copy a b", "op x", "start shell",
+                       "request routing-engine login other", "show configuration | request message all"]),
+    ("fortinet", ["config system admin", "conf sys global", "exe reboot", "exec reboot", "execu factoryreset",
+                  "execute date 2020-01-01", "execute time 10:00:00", "diag sys kill 11 1",
+                  "diagnose sys session clear", "diag test application ipsmonitor 99",
+                  "diagnose vpn tunnel down x", "sudo global execute reboot"]),
+])
+def test_vendor_write_verbs_in_every_spelling(dt, cmds):
+    for c in cmds:
+        assert not check_read_command(c, dt).allowed, (dt, c)
+
+
+@pytest.mark.parametrize("dt,cmds", [
+    ("cisco_ios", ["show running-config | include hostname", "sh ip int br | i up", "show run | sec bgp",
+                   "show clock", "show run | no-more"]),
+    ("cisco_xr", ["admin show platform", "show run | i hostname", "show configuration commit list"]),
+    ("huawei", ["display version", "dis cur | include sysname",
+                "display current-configuration | include undo", "display clock"]),
+    ("juniper_junos", ["request support information", "set cli screen-length 0", "file list /var/tmp",
+                       "file show /var/log/messages", "show route | match 1.1.1.1 | count",
+                       "show configuration | display set", "show system rollback compare 0 1"]),
+    ("fortinet", ["execute date", "execute time", "exe ping 1.1.1.1", "execute traceroute 1.1.1.1",
+                  "diag sys top 1", "diagnose sys session list", "diagnose debug crashlog read",
+                  "get system status | grep Version", "show full-configuration"]),
+])
+def test_vendor_reads_keep_working(dt, cmds):
+    for c in cmds:
+        assert check_read_command(c, dt).allowed, (dt, c)
+
+
+def test_network_default_deny_keeps_pipe_modifiers(tmp_path):
+    """Switching a vendor to 'default: deny' must not break '| include' -
+    every stage is checked, so the pipe modifiers are on the allow-list."""
+    import shutil
+    root = tmp_path / "safety"
+    shutil.copytree(safety.RULES_PATH, root, ignore=shutil.ignore_patterns("local"))
+    for dt in NETWORK:
+        f = root / f"{dt}.yaml"
+        f.write_text(f.read_text().replace("default: allow", "default: deny"))
+    saved = (safety._rules, safety.RULES_PATH)
+    try:
+        safety._rules, safety.RULES_PATH = None, root
+        for dt, c in [("cisco_xr", "show run | include hostname"), ("huawei", "display cur | i sysname"),
+                      ("juniper_junos", "show route | match x | count"), ("fortinet", "get system status | grep V")]:
+            assert check_read_command(c, dt).allowed, (dt, c)
+        assert not check_read_command("show run | frobnicate", "cisco_xr").allowed
+        assert not check_read_command("frobnicate", "cisco_xr").allowed
+    finally:
+        safety._rules, safety.RULES_PATH = saved
+
+
 def test_unknown_device_type_is_refused():
     assert not check_read_command("show version", "").allowed
     assert "no read-path safety rules" in check_read_command("show version", "cisco_foo").reason
