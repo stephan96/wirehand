@@ -199,12 +199,6 @@ only the apply step is gated.
 
 `curl -s http://localhost:8110/health` shows `confirm_mode` and `approval_ready`.
 
-**Upgrading to 0.5.4 with `git pull`:** `config/inventory.yaml` is no longer tracked
-by git (it is in `.gitignore` now, like `.env`). On a clone that still has the tracked
-copy, the pull that removes it from git also deletes the file - copy it aside first
-(`cp config/inventory.yaml ~/inventory.yaml.bak`) and put it back afterwards. The
-tarball route is not affected.
-
 
 **Open WebUI caches the tool description: after an update, toggle the tool-server entry
 off/on (or re-add it) so the model sees the new tool descriptions.**
