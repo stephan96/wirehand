@@ -19,45 +19,25 @@ from pathlib import Path
 
 import yaml
 
+from . import platforms
+
 log = logging.getLogger("wirehand.clab")
 
 CLAB_DIR = os.environ.get("WIREHAND_CLAB_DIR", "")
 
-# containerlab kind -> Netmiko device_type. Override/extend via inventory.yaml
-# `containerlab.kinds`. Kinds not listed (and not overridden) are skipped.
-KIND_MAP: dict[str, str] = {
-    "cisco_xrd": "cisco_xr",
-    "cisco_xrv9k": "cisco_xr",
-    "cisco_xrv": "cisco_xr",
-    "cisco_iol": "cisco_ios",
-    "cisco_csr1000v": "cisco_xe",
-    "cisco_c8000v": "cisco_xe",
-    "cisco_cat9kv": "cisco_xe",
-    "cisco_n9kv": "cisco_nxos",
-    "huawei_vrp": "huawei_vrpv8",
-    "fortinet_fortigate": "fortinet",
-    "arista_ceos": "arista_eos",
-    "arista_veos": "arista_eos",
-    "juniper_vjunosrouter": "juniper_junos",
-    "juniper_vjunosswitch": "juniper_junos",
-    "juniper_vmx": "juniper_junos",
-    "juniper_vsrx": "juniper_junos",
-    "linux": "linux",
-    "sonic-vs": "linux",
-    "generic_vm": "linux",
-}
+# containerlab kind -> Netmiko device_type, and the kind's well-known default
+# credentials (used only when the generated inventory carries none), come from
+# the `containerlab.kinds` of config/platforms/<device_type>.yaml. Both can be
+# overridden in inventory.yaml (`containerlab.kinds` / `containerlab.credentials`);
+# kinds mapped nowhere are skipped.
+def _device_type(kinds_cfg: dict, kind: str) -> str | None:
+    return (kinds_cfg.get(kind) or {}).get("device_type") or platforms.registry().kinds.get(kind)
 
-# Well-known default credentials per kind, used only when the generated
-# inventory carries none. Override in inventory.yaml `containerlab.credentials`.
-DEFAULT_CREDS: dict[str, tuple[str, str]] = {
-    "cisco_xrd": ("clab", "clab@123"),
-    "cisco_xrv9k": ("clab", "clab@123"),
-    "cisco_iol": ("admin", "admin"),
-    "huawei_vrp": ("admin", "admin"),
-    "fortinet_fortigate": ("admin", "admin"),
-    "arista_ceos": ("admin", "admin"),
-    "linux": ("clab", "clab@123"),
-}
+
+def _default_creds(kind: str) -> tuple[str | None, str | None]:
+    dt = platforms.registry().kinds.get(kind)
+    creds = platforms.get(dt).kinds.get(kind) if dt else None
+    return creds or (None, None)
 
 
 def _short_name(lab: str, host: str) -> str:
@@ -85,7 +65,7 @@ def _parse_ansible(path: Path, lab: str, cfg: dict) -> list[dict]:
     kinds_cfg = cfg.get("kinds", {})
     creds_cfg = cfg.get("credentials", {})
     for kind, group in (data.get("all", {}).get("children") or {}).items():
-        dev_type = (kinds_cfg.get(kind) or {}).get("device_type") or KIND_MAP.get(kind)
+        dev_type = _device_type(kinds_cfg, kind)
         if not dev_type:
             log.info("lab %s: kind '%s' not mapped, skipping", lab, kind)
             continue
@@ -96,7 +76,7 @@ def _parse_ansible(path: Path, lab: str, cfg: dict) -> list[dict]:
             user = creds_cfg[kind].get("username", user)
             pw = creds_cfg[kind].get("password", pw)
         if not user or pw is None:
-            du, dp = DEFAULT_CREDS.get(kind, (None, None))
+            du, dp = _default_creds(kind)
             user, pw = user or du, pw if pw is not None else dp
         if not user:
             log.warning("lab %s: no credentials for kind '%s', skipping", lab, kind)
@@ -127,12 +107,12 @@ def _parse_topology_json(path: Path, lab: str, cfg: dict) -> list[dict]:
     creds_cfg = cfg.get("credentials", {})
     for node, nv in (data.get("nodes") or {}).items():
         kind = nv.get("kind", "")
-        dev_type = (kinds_cfg.get(kind) or {}).get("device_type") or KIND_MAP.get(kind)
+        dev_type = _device_type(kinds_cfg, kind)
         ip = nv.get("mgmt-ipv4-address")
         if not dev_type or not ip:
             continue
         c = creds_cfg.get(kind) or {}
-        du, dp = DEFAULT_CREDS.get(kind, (None, None))
+        du, dp = _default_creds(kind)
         user, pw = c.get("username", du), c.get("password", dp)
         if not user:
             continue

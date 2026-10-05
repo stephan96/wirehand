@@ -28,7 +28,7 @@ devices:
   #   device_type: cisco_ios
   #   username: env:CORE_SW1_USER
   #   password: env:CORE_SW1_PASS
-  #   secret: env:CORE_SW1_ENABLE  # enable password; used on cisco_ios/cisco_xe/cisco_nxos/arista_eos
+  #   secret: env:CORE_SW1_ENABLE  # enable password; used where config/platforms/ sets session.enable
   #   port: 2222                   # SSH port (default 22)
   #   timeout: 60                  # seconds Netmiko waits for one command (default 30)
   #   access: ro
@@ -61,8 +61,9 @@ containerlab:
   long_names: false           # true -> use full names like clab-xrd-test-xrd1
 
   # kind -> Netmiko driver / access / confirm overrides; these beat the two defaults
-  # above (built-in map covers cisco_xrd, cisco_iol, huawei_vrp, fortinet_fortigate,
-  # arista_ceos, juniper_vjunos*, linux, ...)
+  # above (the shipped map is the containerlab.kinds of config/platforms/*.yaml:
+  # cisco_xrd, cisco_iol, huawei_vrp, fortinet_fortigate, arista_ceos, juniper_vjunos*,
+  # linux, ...)
   kinds:
     huawei_vrp: { device_type: huawei_vrpv8 }     # NE40E/CE = VRP8; use 'huawei' for VRP5 images
     # cisco_xrd: { access: ro, confirm: totp }

@@ -27,104 +27,6 @@ import yaml
 
 log = logging.getLogger("wirehand.platforms")
 
-FACTS: dict[str, list[str]] = {
-    "linux": [
-        "hostname", "uptime", "uname -a", "cat /etc/os-release",
-        "ip -brief address", "ip route", "ss -tulpn", "df -h", "free -m",
-        "systemctl list-units --type=service --state=failed --no-pager",
-        "journalctl -p warning -n 30 --no-pager",
-    ],
-    "ios": [
-        "show version", "show ip interface brief", "show ip route summary",
-        "show cdp neighbors", "show logging | tail 30",
-    ],
-    "xr": [
-        "show version", "show ipv4 interface brief", "show route summary",
-        "show bgp summary", "show lldp neighbors", "show logging last 30",
-    ],
-    "nxos": ["show version", "show interface brief", "show ip route summary", "show cdp neighbors"],
-    "vrp": ["display version", "display ip interface brief", "display ip routing-table statistics", "display lldp neighbor brief"],
-    "vrpv8": ["display version", "display ip interface brief", "display ip routing-table statistics", "display bgp peer", "display lldp neighbor brief", "display logbuffer size 30"],
-    "fortinet": ["get system status", "get system interface physical", "get router info routing-table all", "get system performance status"],
-    "eos": ["show version", "show ip interface brief", "show ip route summary", "show lldp neighbors"],
-    "junos": ["show version", "show interfaces terse", "show route summary", "show lldp neighbors"],
-}
-
-# Command whose output we snapshot before a change (None = linux, handled per file list)
-SNAPSHOT: dict[str, str | None] = {
-    "linux": None,
-    "ios": "show running-config",
-    "xr": "show running-config",
-    "nxos": "show running-config",
-    "vrp": "display current-configuration",
-    "vrpv8": "display current-configuration",
-    "fortinet": "show full-configuration",
-    "eos": "show running-config",
-    "junos": "show configuration",
-}
-
-# Native rollback of the most recent commit, where the platform has one.
-ROLLBACK_LAST: dict[str, list[str] | None] = {
-    "xr": ["rollback configuration last 1"],
-    "vrpv8": ["rollback configuration last 1"],
-    "junos": ["configure", "rollback 1", "commit and-quit"],
-    "ios": None, "nxos": None, "vrp": None, "fortinet": None, "eos": None, "linux": None,
-}
-
-# Does the change need an explicit commit/save step?
-COMMITS: dict[str, bool] = {
-    "xr": True, "vrpv8": True, "junos": True,
-    "ios": True, "eos": True, "nxos": True, "vrp": True,  # save_config
-    "fortinet": False, "linux": False,
-}
-
-
-# Commands sent once when a session opens. Huawei VRP asks for confirmation on
-# maintenance commands ("Continue? [Y/N]:"); mmi-mode is the vendor's own switch
-# for exactly this case - it tells the CLI a machine is typing, and the questions
-# stop. Best effort: if the image does not know the command, nothing breaks.
-SESSION_PREP: dict[str, list[str]] = {
-    "vrp": ["mmi-mode enable"],
-    "vrpv8": ["mmi-mode enable"],
-}
-
-# Devices that ask before they act. Netmiko's send_command returns as soon as the
-# output looks like a prompt - the ']' in '[Y/N]' is enough - so the command has
-# NOT run yet and the session sits at the question until somebody answers it.
-# (question pattern, answer to go ahead, answer to back out)
-_TAIL = r"\s*(?:\[[^\]\n]{1,8}\]|\([^)\n]{1,8}\))?\s*[:?]?\s*$"
-CONFIRM_PROMPTS: list[tuple[str, str, str]] = [
-    (r"\[y/n\]" + _TAIL, "Y", "N"),            # Huawei VRP, FortiGate
-    (r"\[yes/no\]" + _TAIL, "yes", "no"),
-    (r"\(y/n\)" + _TAIL, "y", "n"),
-    (r"\[yes,no\]" + _TAIL, "yes", "no"),      # Junos
-    (r"\[confirm\]" + _TAIL, "y", "n"),        # Cisco IOS: 'clear counters [confirm]'
-    (r"\bcontinue\?" + _TAIL, "y", "n"),
-    (r"\bare you sure\?" + _TAIL, "y", "n"),
-    (r"\bproceed\??" + _TAIL, "y", "n"),
-]
-CONFIRM_PROMPTS_RX = [(re.compile(p, re.IGNORECASE), yes, no) for p, yes, no in CONFIRM_PROMPTS]
-
-
-def pending_prompt(text: str) -> tuple[str, str, str] | None:
-    """(question, answer-to-proceed, answer-to-abort) if `text` ENDS in a device
-    question that is still waiting for an answer, else None.
-
-    Only the tail is examined: a running-config may contain '[Y/N]' in some
-    description, but only a question at the very end means the session is
-    sitting at a prompt."""
-    tail = (text or "")[-200:]
-    for rx, yes, no in CONFIRM_PROMPTS_RX:
-        m = rx.search(tail)
-        if m:
-            return m.group(0).strip(), yes, no
-    return None
-
-
-# =========================================================================
-# config/platforms/ loader
-# =========================================================================
-
 # Default resolves to /app/config/platforms in the container (the read-only bind
 # mount) and to ./config/platforms in a source checkout, so tests and a local run
 # need no environment at all.
@@ -462,3 +364,54 @@ def get(device_type: str) -> Platform:
         return registry().platforms[device_type]
     except KeyError:
         raise KeyError(f"unsupported device_type '{device_type}' - one of: {', '.join(known())}") from None
+
+
+def pending_prompt(text: str, device_type: str | None = None) -> tuple[str, str, str] | None:
+    """(question, answer-to-proceed, answer-to-abort) if `text` ENDS in a device
+    question that is still waiting for an answer, else None.
+
+    Checks the prompts of `device_type` (its own, then common.yaml's), or only
+    common.yaml's when no or an unknown type is given. Only the tail is examined:
+    a running-config may contain '[Y/N]' in some description, but only a question
+    at the very end means the session is sitting at a prompt."""
+    reg = registry()
+    p = reg.platforms.get(device_type) if device_type else None
+    tail = (text or "")[-200:]
+    for pr in (p.prompts if p else reg.prompts):
+        m = pr.rx.search(tail)
+        if m:
+            return m.group(0).strip(), pr.proceed, pr.abort
+    return None
+
+
+USAGE = "usage: python -m app.platforms --lint [path/to/config/platforms]"
+
+
+def _lint(path: Path) -> int:
+    try:
+        reg = load_platforms(path)
+    except PlatformError as exc:
+        print(f"INVALID: {exc}")
+        return 1
+    print(f"OK: {reg.path}\n    {reg.summary()}\n")
+    print(f"    {'device_type':<15} {'apply':<11} {'finish':<7} {'rollback':<9} {'enable':<7} "
+          f"{'facts':>5} {'guards':>6}  containerlab kinds")
+    for dt, p in sorted(reg.platforms.items()):
+        print(f"    {dt:<15} {p.apply:<11} {p.finish:<7} {'native' if p.rollback_last else '-':<9} "
+              f"{'yes' if p.enable else '-':<7} {len(p.facts):>5} {len(p.refuse):>6}  "
+              + (", ".join(sorted(p.kinds)) or "-"))
+    return 0
+
+
+def _main(argv: list[str]) -> int:
+    """`--lint` validates a platform directory before it goes live and exits
+    non-zero with a precise message if it would be refused."""
+    if argv[:1] in (["--lint"], ["-l"]) and len(argv) <= 2:
+        return _lint(Path(argv[1]) if len(argv) == 2 else PLATFORMS_PATH)
+    print(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(_main(sys.argv[1:]))

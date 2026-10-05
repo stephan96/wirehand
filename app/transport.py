@@ -45,7 +45,8 @@ class _Session:
             return self.conn
         log.info("connecting to %s (%s)", self.device.name, self.device.device_type)
         self.conn = ConnectHandler(**self.device.netmiko_kwargs())
-        if self.device.secret and self.device.family in ("ios", "nxos", "eos"):
+        plat = self.device.platform
+        if self.device.secret and plat.enable:
             self.conn.enable()
         # Do NOT call disable_paging() here: Netmiko's session_preparation already
         # handles paging per platform. A second invocation re-runs config dialogs on
@@ -55,10 +56,10 @@ class _Session:
             self.conn.find_prompt()
         except Exception:
             pass
-        # Per-platform session setup (Huawei: mmi-mode, so maintenance commands
-        # stop asking "Continue? [Y/N]"). Never fatal - an image that does not
-        # know the command just answers with an error we ignore.
-        for cmd in platforms.SESSION_PREP.get(self.device.family, []):
+        # Per-platform session setup (session.prep; Huawei: mmi-mode, so maintenance
+        # commands stop asking "Continue? [Y/N]"). Never fatal - an image that does
+        # not know the command just answers with an error we ignore.
+        for cmd in plat.prep:
             try:
                 self.conn.send_command(cmd, read_timeout=15)
             except Exception as exc:
@@ -161,7 +162,7 @@ class Pool:
         if prompts not in ("yes", "no"):
             return out
         for _ in range(MAX_PROMPT_ANSWERS):
-            hit = pending_prompt(out)
+            hit = pending_prompt(out, device.device_type)
             if hit is None:
                 return out
             question, yes, no = hit
@@ -181,37 +182,33 @@ class Pool:
             self._close_async(s)
 
     def configure(self, device: Device, lines: list[str], commit: bool) -> str:
-        """Apply configuration lines. Platform specifics:
-        - linux: lines are shell commands run sequentially in exec mode
-        - xr/vrpv8: send_config_set + commit
-        - ios/eos/nxos: send_config_set + save_config
-        - fortinet/vrp/junos: send_config_set (fortinet persists immediately)
+        """Apply configuration lines, as the platform's change.apply/finish say:
+        - apply shell:  every line is a command of its own, in exec mode
+        - apply config_set, then finish
+            commit: commit, then leave config mode       (IOS-XR, VRP8, Junos)
+            save:   leave config mode, then save_config  (IOS, NX-OS, EOS, VRP5)
+            none:   nothing - the lines close their own blocks (FortiOS 'end')
+        `commit=False` skips the commit/save step.
         """
         s = self._get(device)
         with s.lock:
             conn = self._open_or_raise(s)
-            fam = device.family
+            plat = device.platform
             try:
-                if fam == "linux":
+                if plat.shell:
                     chunks = []
                     for ln in lines:
                         chunks.append(f"$ {ln}\n" + (conn.send_command(ln, read_timeout=CMD_TIMEOUT) or ""))
                     out = "\n".join(chunks)
                 else:
                     out = conn.send_config_set(lines, read_timeout=CMD_TIMEOUT, exit_config_mode=False)
-                    if fam in ("xr", "vrpv8", "junos"):
+                    if plat.finish == "commit":
                         out += "\n" + (conn.commit() if commit else "")
                         conn.exit_config_mode()
-                    elif fam in ("ios", "eos", "nxos"):
+                    elif plat.finish == "save":
                         conn.exit_config_mode()
                         if commit:
                             out += "\n" + conn.save_config()
-                    elif fam == "vrp":
-                        conn.exit_config_mode()
-                        if commit:
-                            out += "\n" + conn.save_config()
-                    else:  # fortinet: blocks carry their own 'end'; nothing to exit
-                        pass
                 # A config session can end on a question too ('Save? [Y/N]').
                 out = self._settle(conn, device, out, CMD_TIMEOUT, "yes")
             finally:

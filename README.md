@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.5.4
+**Version:** 0.5.5
 
 
 ## Summary
@@ -32,8 +32,10 @@ the device types it has platform logic for (facts bundles, commit/rollback handl
 | Tested | `cisco_xr`, `huawei_vrpv8`, `fortinet`, `linux` |
 | Implemented, not yet tested | `cisco_ios`, `cisco_xe`, `cisco_nxos`, `huawei`, `arista_eos`, `juniper_junos` |
 
-Other Netmiko platforms are rejected when the inventory loads. Supporting them needs
-a new entry in `PLATFORMS` (`app/inventory.py`) plus the matching platform logic.
+Other Netmiko platforms are rejected when the inventory loads. Supporting one needs a
+file in `config/platforms/` and its read-path rules in `config/safety/` - no Python, as
+long as it applies changes the way one of the existing platforms does (see
+"`config/platforms/`" under Configuration).
 
 **Security by design**
 
@@ -128,8 +130,10 @@ curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
 ```
 
 `.env` and `config/inventory.yaml` are listed in `.gitignore`, so a later `git pull`
-never overwrites them. The read-path rules in `config/safety/` need no copying - they ship
-ready to use, and `docker exec wirehand python -m app.safety --lint` shows what is in force.
+never overwrites them. The read-path rules in `config/safety/` and the platform definitions
+in `config/platforms/` need no copying - they ship ready to use, and
+`docker exec wirehand python -m app.safety --lint` / `python -m app.platforms --lint` show
+what is in force.
 
 ### Development install (tarball)
 
@@ -280,8 +284,9 @@ including the ones the example above leaves at their default.
 `env:VARNAME` works for `username`, `password` and `secret`. It does **not** work for
 `key_file`, which is a path rather than a credential.
 
-`secret` is only consulted on the four platforms listed - it triggers Netmiko's `enable()`
-when a session opens. On a device whose account already lands in privileged mode, leave
+`secret` is only consulted on platforms whose `config/platforms/` file sets
+`session.enable: true` (`cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos`) - it triggers
+Netmiko's `enable()` when a session opens. On a device whose account already lands in privileged mode, leave
 it out.
 
 Unknown keys are refused rather than ignored, so a typo like `passwrod:` fails the load
@@ -455,6 +460,69 @@ whose name is not `common` or a supported `device_type` is refused rather than i
 so a typo such as `cisco-xr.yaml` shows up in `--lint` instead of silently not applying.
 After an update, `--lint` plus `python -m pytest tests/test_safety.py` tells you whether
 the result is sound.
+
+### `config/platforms/` - how wirehand works with each device type
+
+Everything wirehand does differently per platform - apart from the read-path rules - is
+described here, again one file per supported `device_type` plus a `common.yaml`. **The set
+of files is the list of supported device types:** a `device_type` without a file is
+rejected when the inventory loads, and every file needs its counterpart in
+`config/safety/` (and the other way round).
+
+| Key | What it decides |
+| --- | --- |
+| `facts` | the commands `get_facts` runs |
+| `snapshot` | the command whose output is saved before every change (`null` on Linux) |
+| `session.enable` | call `enable()` when the device has a `secret` |
+| `session.prep` | commands sent once when a session opens (Huawei: `mmi-mode enable`) |
+| `change.apply` | `config_set` (Netmiko config mode) or `shell` (each line is a command) |
+| `change.finish` | after `config_set`: `commit`, `save`, or `none` (FortiOS blocks close themselves) |
+| `change.rollback_last` | native rollback of the last commit, or `null` (snapshot only) |
+| `change.balance_end` | append missing `end` lines to open `config` blocks (FortiOS) |
+| `change.refuse_in_config` | lines a config change must not contain (they leave config mode, commit or reboot), with the reason shown to the model |
+| `prompts` | device questions and the answers to them; shared ones in `common.yaml` |
+| `comment_prefixes` | lines of a proposed change that are dropped as comments (`#`, `!`) |
+| `containerlab.kinds` | the containerlab kinds that map to this `device_type`, with their default credentials |
+
+`extends: cisco_ios` lets a file start from another one and override only what differs
+(that is all `cisco_xe.yaml` does). `change.apply` and `change.finish` name behaviours that
+are implemented in code - a new platform that fits one of them needs no Python; one that
+does not (a different commit dialogue, say) needs a code change first.
+
+```yaml
+# config/platforms/huawei_vrpv8.yaml (abridged)
+version: 1
+name: Huawei VRP8
+facts: [display version, display ip interface brief, display bgp peer]
+snapshot: display current-configuration
+session:
+  prep: [mmi-mode enable]
+change:
+  apply: config_set
+  finish: commit
+  rollback_last: [rollback configuration last 1]
+  refuse_in_config:
+    reason: the tool handles mode changes and commit
+    patterns: ['^(commit|end|configure|conf|write|reload|reboot)(\s|$)']
+containerlab:
+  kinds:
+    huawei_vrp: {username: admin, password: admin}
+```
+
+The files are read **once, at startup** - unlike the safety rules, they decide how pooled
+sessions are opened and changes committed, so an edit takes effect with
+`docker compose restart wirehand`. They are fail-closed in the same way: an unknown key, a
+missing required key, an uncompilable regex, a file name that is not a Netmiko driver, a
+containerlab kind claimed by two files or a contradiction (a native rollback on a platform
+without commits) stops the container, and the log names file and key. Check before
+restarting:
+
+```bash
+docker exec wirehand python -m app.platforms --lint   # or: python -m app.platforms --lint config/platforms
+```
+
+Quote prompt answers and reasons that look like booleans (`'Y'`, `'yes'`, `'no'`) - YAML
+reads a bare `yes`/`no` as true/false, and the loader refuses that rather than guess.
 
 ## Approving changes
 
@@ -640,7 +708,9 @@ property, not a tool limitation.
 The file `config/inventory.yaml` is **never written by the tool** - it is your file, and
 it is mounted read-only into the container.
 
-## containerlab kind mapping (built in)
+## containerlab kind mapping
+
+Shipped in the `containerlab.kinds` of `config/platforms/*.yaml`:
 
 | clab kind | Netmiko driver | default creds |
 |---|---|---|
@@ -655,7 +725,8 @@ it is mounted read-only into the container.
 | linux, sonic-vs, generic_vm | linux | clab / clab@123 |
 
 Precedence: `containerlab.credentials` in inventory.yaml > generated
-`ansible_user`/`ansible_password` > the built-in defaults above. Unmapped kinds are
+`ansible_user`/`ansible_password` > the defaults above; `containerlab.kinds` in
+inventory.yaml can map a kind to a different driver. Unmapped kinds are
 skipped with a log line (`docker logs wirehand`).
 
 ## Reachability check and overlapping lab subnets
@@ -683,7 +754,9 @@ and destroy unused labs with `--cleanup` so their generated folders disappear.
 
 ## Platform behavior for changes
 
-| Family | Change path | Rollback |
+Set per device type by `change.*` in `config/platforms/`:
+
+| device_type | Change path | Rollback |
 |---|---|---|
 | cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed; VRP needs `mmi-mode` (see below) |
 | cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot only -> corrective change |
@@ -708,16 +781,17 @@ and the next command becomes its answer. Until 0.5.1 wirehand reported "ROLLED B
 exactly this, while the device had rolled back nothing.
 
 Two things prevent it now. Sessions to VRP devices open with **`mmi-mode enable`**
-(`platforms.SESSION_PREP`) - Huawei's own switch for "a machine is typing", which stops
+(`session.prep` in `config/platforms/`) - Huawei's own switch for "a machine is typing", which stops
 the questions at the source. And any question that still appears is **answered**
-(`platforms.CONFIRM_PROMPTS`): `yes` when a human has approved the operation via
-`confirm_change`, `no` on the read path, where an unexpected question is backed out of
+(`prompts` in `config/platforms/common.yaml`): `proceed` when a human has approved the operation via
+`confirm_change`, `abort` on the read path, where an unexpected question is backed out of
 rather than agreed to. If a question is still standing afterwards, `confirm_change`
 returns HTTP 502 `NOT COMPLETED`, drops the session and logs `confirm_incomplete` -
 it never claims work that did not happen.
 
 IOS-XR needs neither: `rollback configuration last 1` runs there without asking. To teach
-wirehand a new question, add the pattern and its two answers to `CONFIRM_PROMPTS`.
+wirehand a new question, add the pattern and its two answers to `prompts` - in
+`common.yaml`, or in one platform's file if only that platform asks it - and restart.
 
 ## Audit log & snapshots
 
@@ -770,13 +844,15 @@ changes with age).
 | Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
 | Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
-| `confirm_change` returns 502 `NOT COMPLETED: the device asked ...` | the platform asks a question wirehand does not know | add the pattern to `CONFIRM_PROMPTS` in `app/platforms.py`; nothing was applied, the session was dropped |
+| `confirm_change` returns 502 `NOT COMPLETED: the device asked ...` | the platform asks a question wirehand does not know | add the pattern to `prompts` in `config/platforms/` and restart; nothing was applied, the session was dropped |
 | `confirm_change` returns 503 with a setup hint | `WIREHAND_CONFIRM_MODE=totp` but no usable `WIREHAND_TOTP_SECRET` | generate one (`docker exec wirehand python -m app.approval --new`), put it in `.env`, `docker compose up -d` - or set `WIREHAND_CONFIRM_MODE=off` |
 | `confirm_change` returns 403 "approval code is not valid (right now)" | phone clock drift, or the model made the number up | compare `docker exec wirehand python -m app.approval` with your app; the change stays staged, just send a fresh code |
 | "approval code is not valid - wrong, or expired" although you read it correctly | the model took longer than `WIREHAND_APPROVAL_MAX_AGE` to call `confirm_change`, or the phone clock is off | send a fresh code; raise `WIREHAND_APPROVAL_MAX_AGE` for slow models; enable automatic time on the phone |
 | "too many wrong approval codes - locked" | five refused approvals in two minutes | wait it out, or raise `WIREHAND_APPROVAL_MAX_FAILURES` / lower `WIREHAND_APPROVAL_LOCKOUT` |
 | A harmless-looking Linux command gets a 403 | the read path is allow-list only for Linux devices | `python -m app.safety --explain linux '<command>'` shows why; if it really is read-only, add it to `config/safety/local/linux.yaml` (then `python -m app.safety --lint`); if it writes, it belongs in `propose_change` |
 | Container exits at startup, log says `safety rule directory not found`, `no rule file for ...` or names an entry in `config/safety/` | the read-path rules are missing or malformed, or a device type has no file - wirehand refuses to run without them | `python -m app.safety --lint config/safety` on the host names file and entry; check that the `./config` bind mount is present |
+| Container exits at startup, log names a file in `config/platforms/` | a platform file is missing a key, has an unknown one, or contradicts itself | `python -m app.platforms --lint config/platforms` on the host names file and key |
+| An edit in `config/platforms/` has no effect | platform files are read at startup only | `docker compose restart wirehand` |
 | An edit in `config/safety/` has no effect | not reloaded yet, or it was refused | wait `WIREHAND_SAFETY_RESCAN` seconds or call `list_devices(refresh=true)`; `docker logs wirehand` shows either `reloaded safety rules` or `NOT reloaded, keeping the previous ones: <reason>` |
 | Device missing from `list_devices` | lab not deployed (no `clab-*` dir), unmapped kind, or stale scan | deploy the lab; check `docker logs`; `list_devices(refresh=true)` |
 | UBUNTU/local host unreachable | sshd not listening on the address used | with host networking use `host: 127.0.0.1` |
@@ -787,7 +863,7 @@ changes with age).
 
 ```bash
 pip install -r requirements.txt pytest httpx
-python -m pytest tests/                  # read path, approval codes, device prompts, containerlab discovery
+python -m pytest tests/                  # read path, platform files, approval codes, device prompts, containerlab discovery
 PYTHONPATH=. python tests/test_api.py    # full propose/confirm/rollback/approval flow against a fake pool
 ```
 

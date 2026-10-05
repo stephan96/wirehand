@@ -59,6 +59,8 @@ async def lifespan(app: FastAPI):
         log.warning("WIREHAND_CONFIRM_MODE=off - the model can apply its own proposals without a human")
     else:
         log.info("changes require a one-time approval code (WIREHAND_CONFIRM_MODE=totp)")
+    plats = platforms.registry()   # raises PlatformError -> startup fails, which is the point
+    log.info("platforms: %s (%s)", plats.summary(), plats.path)
     rules = safety.rules()   # raises RuleError -> startup fails, which is the point
     log.info("read-path safety rules: %s (%s)", rules.summary(), rules.path)
     log.info("loaded %d devices (inventory.yaml=%s, containerlab=%s)", len(inventory.all()), inventory.path, inventory.clab_dir or "off")
@@ -68,7 +70,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.5.4",
+    version="0.5.5",
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
@@ -205,7 +207,7 @@ def list_devices(
          ), dependencies=[Depends(auth)])
 def get_facts(device: str = Query(..., description="Device name from list_devices")) -> str:
     dev = _device(device)
-    cmds = platforms.FACTS.get(dev.family, ["show version"])
+    cmds = list(dev.platform.facts)
     try:
         res = pool.run(dev, cmds)
     except AuthError as exc:
@@ -307,28 +309,26 @@ def propose_change(body: ProposeIn) -> str:
     dev = _device(body.device)
     if not dev.writable:
         raise HTTPException(403, f"device '{dev.name}' is read-only (access=ro)")
-    lines = [ln.rstrip() for ln in body.config.splitlines() if ln.strip() and not ln.strip().startswith(("#", "!"))]
+    plat = dev.platform
+    lines = [ln.rstrip() for ln in body.config.splitlines() if ln.strip() and not ln.strip().startswith(plat.comment_prefixes)]
     if not lines:
         raise HTTPException(400, "config is empty")
     if body.mode not in ("config", "exec"):
         raise HTTPException(400, "mode must be 'config' or 'exec'")
-    if body.mode == "config" and dev.family not in ("linux", "fortinet"):
-        forbidden = [ln for ln in lines if ln.strip().lower().split()[0] in ("commit", "end", "configure", "conf", "write", "reload", "reboot")]
-        if forbidden:
-            raise HTTPException(400, f"do not include {forbidden} - the tool handles mode changes and commit")
-    if body.mode == "config" and dev.family == "fortinet":
-        bad = [ln for ln in lines if ln.strip().lower().split()[0] in ("execute", "reload", "reboot")]
-        if bad:
-            raise HTTPException(400, f"not allowed in a config change: {bad}")
-        # FortiOS applies a section only at 'end' - balance missing ends automatically.
-        opens = sum(1 for ln in lines if ln.strip().lower().startswith("config "))
-        ends = sum(1 for ln in lines if ln.strip().lower() == "end")
-        if opens > ends:
-            lines = lines + ["end"] * (opens - ends)
+    if body.mode == "config":
+        refused = plat.refused_lines(lines)      # change.refuse_in_config
+        if refused:
+            raise HTTPException(400, f"do not include {refused} - {plat.refuse_reason}")
+        if plat.balance_end:
+            # FortiOS applies a section only at 'end' - balance missing ends automatically.
+            opens = sum(1 for ln in lines if ln.strip().lower().startswith("config "))
+            ends = sum(1 for ln in lines if ln.strip().lower() == "end")
+            if opens > ends:
+                lines = lines + ["end"] * (opens - ends)
 
-    snap_cmd = platforms.SNAPSHOT.get(dev.family)
+    snap_cmd = plat.snapshot
     try:
-        snapshot = pool.run(dev, [snap_cmd])[0][1] if snap_cmd else "(linux: no config snapshot; per-file backups are your responsibility - include them in the change, e.g. 'sudo cp /etc/x /etc/x.bak')"
+        snapshot = pool.run(dev, [snap_cmd])[0][1] if snap_cmd else "(no config snapshot on this platform; per-file backups are your responsibility - include them in the change, e.g. 'sudo cp /etc/x /etc/x.bak')"
     except AuthError as exc:
         audit("auth_failed", dev.name)
         raise HTTPException(401, str(exc))
@@ -342,7 +342,7 @@ def propose_change(body: ProposeIn) -> str:
     # already present. Honest beats clever here.)
     if body.mode == "exec":
         preview = "Maintenance commands (user/exec view):\n" + "\n".join(f"  > {ln}" for ln in lines)
-    elif dev.family == "linux":
+    elif plat.shell:
         preview = "Commands to run:\n" + "\n".join(f"  $ {ln}" for ln in lines)
     else:
         preview = "Configuration lines to send:\n" + "\n".join(f"  + {ln}" for ln in lines)
@@ -404,7 +404,7 @@ def confirm_change(
             # "Continue? [Y/N]" gets its answer instead of stalling the session.
             out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120, prompts="yes"))
         else:
-            out = pool.configure(dev, pc.lines, commit=platforms.COMMITS.get(dev.family, False))
+            out = pool.configure(dev, pc.lines, commit=dev.platform.commits)
     except AuthError as exc:
         audit("auth_failed", dev.name, code=code)
         raise HTTPException(401, str(exc))
@@ -414,15 +414,15 @@ def confirm_change(
     # Never report success while the device is still asking a question: the
     # command has not run then, and saying "ROLLED BACK" when nothing was rolled
     # back is worse than failing.
-    stuck = pending_prompt(out)
+    stuck = pending_prompt(out, dev.device_type)
     if stuck:
         pool.reset(dev)          # the session is sitting at that question
         audit("confirm_incomplete", dev.name, code=code, mode=pc.mode, question=stuck[0])
         raise HTTPException(502, (
             f"NOT COMPLETED on {dev.name}: the device asked '{stuck[0]}' and is still waiting, "
             f"so the operation did NOT run. Nothing was applied by this call. Report this to the "
-            f"user - it needs a fix on the wirehand host (the prompt is unknown to "
-            f"platforms.CONFIRM_PROMPTS), not another attempt.\n\n{truncate(out, 4000)}"))
+            f"user - it needs a fix on the wirehand host (the prompt is unknown to the "
+            f"'prompts' in config/platforms/), not another attempt.\n\n{truncate(out, 4000)}"))
     audit("confirm_change", dev.name, code=code, lines=pc.lines, mode=pc.mode,
           approval=approver.mode_for(dev.confirm))
     if pc.mode == "rollback":
@@ -431,7 +431,7 @@ def confirm_change(
                         f"saved as {pc.snapshot_path}.\n\n{out}", MAX_OUT)
     if pc.mode == "exec":
         return truncate(f"EXECUTED on {dev.name} (code {code}, exec mode - nothing was committed).\n\n{out}", MAX_OUT)
-    rb = "native rollback available via rollback_change" if platforms.ROLLBACK_LAST.get(dev.family) else "no native rollback on this platform - rollback_change returns the snapshot for manual restore"
+    rb = "native rollback available via rollback_change" if dev.platform.rollback_last else "no native rollback on this platform - rollback_change returns the snapshot for manual restore"
     return truncate(f"APPLIED on {dev.name} (code {code}). {rb}.\n\n{out}", MAX_OUT)
 
 
@@ -450,7 +450,7 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
     dev = _device(device)
     if not dev.writable:
         raise HTTPException(403, f"device '{dev.name}' is read-only (access=ro)")
-    cmds = platforms.ROLLBACK_LAST.get(dev.family)
+    cmds = list(dev.platform.rollback_last or [])
     if not cmds:
         # No native rollback: returning the snapshot changes nothing on the device.
         snap = changes.latest_snapshot(dev.name)
@@ -464,7 +464,7 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
     # A native rollback overwrites the running configuration - that is a write, so
     # it goes through the same human-approved two-stage gate as any other change
     # instead of applying on a single call.
-    snap_cmd = platforms.SNAPSHOT.get(dev.family)
+    snap_cmd = dev.platform.snapshot
     try:
         snapshot = pool.run(dev, [snap_cmd])[0][1] if snap_cmd else "(no config snapshot for this platform)"
     except AuthError as exc:

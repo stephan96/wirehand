@@ -1,39 +1,162 @@
-"""config/platforms/ must describe exactly what the Python tables did."""
-from app import clab, platforms
-from app.inventory import PLATFORMS
+"""config/platforms/: the shipped files, and the loader that guards them."""
+import pytest
+
+from app import platforms
+from app.platforms import PlatformError, load_platforms, pending_prompt
 
 
-def test_yaml_matches_the_python_tables():
-    reg = platforms.load_platforms()
-    assert set(reg.platforms) == set(PLATFORMS)
-    for dt, fam in PLATFORMS.items():
-        p = reg.platforms[dt]
-        assert list(p.facts) == platforms.FACTS[fam], dt
-        assert p.snapshot == platforms.SNAPSHOT[fam], dt
-        assert (list(p.rollback_last) if p.rollback_last else None) == platforms.ROLLBACK_LAST[fam], dt
-        assert p.commits == platforms.COMMITS[fam], dt
-        assert list(p.prep) == platforms.SESSION_PREP.get(fam, []), dt
-        assert p.enable == (fam in ("ios", "nxos", "eos")), dt
-        assert p.shell == (fam == "linux"), dt
-        assert p.balance_end == (fam == "fortinet"), dt
-        assert [(x.rx.pattern, x.proceed, x.abort) for x in p.prompts] == \
-               [(rx.pattern, y, n) for rx, y, n in platforms.CONFIRM_PROMPTS_RX], dt
-        assert p.comment_prefixes == ("#", "!"), dt
-    assert reg.kinds == clab.KIND_MAP
-    creds = {k: c for p in reg.platforms.values() for k, c in p.kinds.items() if c}
-    assert creds == clab.DEFAULT_CREDS
+def test_shipped_platform_directory_loads():
+    """The files the project ships must always be valid - this is what `--lint` checks."""
+    reg = load_platforms()
+    assert set(reg.platforms) == {
+        "linux", "cisco_ios", "cisco_xe", "cisco_xr", "cisco_nxos", "huawei", "huawei_vrpv8",
+        "fortinet", "arista_eos", "juniper_junos"}
+    assert {dt for dt, p in reg.platforms.items() if p.rollback_last} == {"cisco_xr", "huawei_vrpv8", "juniper_junos"}
+    assert {dt for dt, p in reg.platforms.items() if p.shell} == {"linux"}
+    assert {dt for dt, p in reg.platforms.items() if p.enable} == {"cisco_ios", "cisco_xe", "cisco_nxos", "arista_eos"}
+    assert {dt for dt, p in reg.platforms.items() if not p.commits} == {"linux", "fortinet"}
+    assert all(p.refuse for p in reg.platforms.values() if not p.shell)
+    assert platforms._main(["--lint"]) == 0
 
 
-def test_guards_match_the_old_verb_lists():
-    reg = platforms.load_platforms()
-    old_cfg = ("commit", "end", "configure", "conf", "write", "reload", "reboot")
-    old_fgt = ("execute", "reload", "reboot")
-    words = set(old_cfg + old_fgt) | {"config", "interface", "set", "edit", "next", "commit-x", "endx"}
-    for dt, p in reg.platforms.items():
-        if p.shell:
-            assert not p.refuse
-            continue
-        verbs = old_fgt if dt == "fortinet" else old_cfg
-        for w in words:
-            for line in (w, f"{w} x", f"  {w.upper()}"):
-                assert bool(p.refused_lines([line])) == (w in verbs), (dt, line)
+def test_extends_inherits_and_containerlab_does_not():
+    reg = load_platforms()
+    ios, xe = reg.platforms["cisco_ios"], reg.platforms["cisco_xe"]
+    assert xe.name == "Cisco IOS-XE" and xe.facts == ios.facts and xe.finish == ios.finish
+    assert xe.sources == ("cisco_ios.yaml", "cisco_xe.yaml")
+    assert "cisco_iol" in ios.kinds and "cisco_iol" not in xe.kinds and "cisco_c8000v" in xe.kinds
+    assert reg.kinds["cisco_iol"] == "cisco_ios" and reg.kinds["cisco_c8000v"] == "cisco_xe"
+
+
+def test_containerlab_kinds_and_default_credentials():
+    reg = load_platforms()
+    assert reg.kinds["huawei_vrp"] == "huawei_vrpv8" and reg.kinds["sonic-vs"] == "linux"
+    assert reg.platforms["cisco_xr"].kinds == {"cisco_xrd": ("clab", "clab@123"),
+                                               "cisco_xrv9k": ("clab", "clab@123"), "cisco_xrv": None}
+
+
+def test_platform_prompts_come_before_the_common_ones():
+    xr = platforms.get("cisco_xr")
+    assert [p.proceed for p in xr.prompts][:2] == ["Y", "yes"]       # common.yaml's, in order
+    assert pending_prompt("Commit? [yes,no] (yes)", "juniper_junos")[1] == "yes"
+    assert pending_prompt("Commit? [yes,no] (yes)", "no_such_type")[1] == "yes"   # falls back to common
+
+
+# --- loader: a minimal tree, then one defect at a time ----------------------
+COMMON = """
+version: 1
+comment_prefixes: ['#']
+prompts:
+  - {pattern: '\\[y/n\\]', proceed: 'Y', abort: 'N'}
+"""
+
+CFG = """
+version: 1
+name: Test
+facts: [show version]
+snapshot: show running-config
+session: {enable: true, prep: []}
+change:
+  apply: config_set
+  finish: commit
+  rollback_last: [rollback configuration last 1]
+  refuse_in_config: {reason: refused, patterns: ['^end(\\s|$)']}
+containerlab:
+  kinds:
+    cisco_xrd: {username: u, password: p}
+"""
+
+SHELL = """
+version: 1
+name: Shell
+facts: [uptime]
+snapshot: null
+change: {apply: shell, finish: none, rollback_last: null}
+"""
+
+
+def _tree(tmp_path, **files):
+    files = {"common": COMMON, "cisco_xr": CFG, "linux": SHELL, **files}
+    for name, text in files.items():
+        if text is not None:
+            (tmp_path / f"{name}.yaml").write_text(text)
+    return tmp_path
+
+
+def test_minimal_tree(tmp_path):
+    reg = load_platforms(_tree(tmp_path))
+    xr = reg.platforms["cisco_xr"]
+    assert xr.comment_prefixes == ("#",) and xr.commits and xr.enable
+    assert xr.refused_lines(["interface Lo0", " END", "end-policy"]) == [" END"]
+    assert reg.kinds == {"cisco_xrd": "cisco_xr"}
+    assert not reg.platforms["linux"].commits
+
+
+@pytest.mark.parametrize("files, message", [
+    ({"common": None}, "common.yaml is missing"),
+    ({"cisco_xr": CFG.replace("version: 1", "version: 2")}, "'version: 1' is required"),
+    ({"cisco_xr": CFG + "colour: red\n"}, "unknown key(s) colour"),
+    ({"cisco_xr": CFG.replace("facts: [show version]", "facts: []")}, "facts: must not be empty"),
+    ({"cisco_xr": CFG.replace("snapshot: show running-config\n", "")}, "'snapshot' is required"),
+    ({"cisco_xr": CFG.replace("finish: commit", "finish: maybe")}, "change.finish must be one of"),
+    ({"cisco_xr": CFG.replace("apply: config_set", "apply: telnet")}, "change.apply must be one of"),
+    ({"cisco_xr": CFG.replace("  refuse_in_config: {reason: refused, patterns: ['^end(\\s|$)']}\n", "")},
+     "refuse_in_config is required"),
+    ({"cisco_xr": CFG.replace("'^end(\\s|$)'", "'^end(\\s'")}, "invalid regular expression"),
+    ({"cisco_xr": CFG.replace("finish: commit", "finish: none")}, "no commits to roll back"),
+    ({"linux": SHELL.replace("finish: none", "finish: save")}, "set change.finish: none"),
+    ({"cisco_xr": CFG.replace("{username: u, password: p}", "{username: u}")}, "both 'username' and 'password'"),
+    ({"cisco_ios": SHELL + "containerlab: {kinds: {cisco_xrd: {}}}\n"}, "already mapped by"),
+    ({"cisco_ios": "version: 1\nname: X\nextends: nope\n"}, "extends 'nope'"),
+    ({"cisco_ios": "version: 1\nname: X\nextends: cisco_xe\n",
+      "cisco_xe": "version: 1\nname: Y\nextends: cisco_xr\n"}, "only one level"),
+    ({"common": COMMON.replace("proceed: 'Y'", "proceed: yes").replace("abort: 'N'", "abort: no")},
+     "must be a non-empty string - quote it"),
+    ({"cisco_xr": None, "cisco_foo": CFG}, "not a Netmiko device_type"),
+])
+def test_malformed_files_are_refused_with_a_precise_message(tmp_path, files, message):
+    if message.startswith("not a Netmiko") and platforms._netmiko_types() is None:
+        pytest.skip("netmiko not installed")
+    with pytest.raises(PlatformError) as exc:
+        load_platforms(_tree(tmp_path, **files))
+    assert message in str(exc.value), str(exc.value)
+
+
+def test_yml_suffix_is_refused_not_skipped(tmp_path):
+    _tree(tmp_path)
+    (tmp_path / "arista_eos.yml").write_text(CFG)
+    with pytest.raises(PlatformError, match="must end in .yaml"):
+        load_platforms(tmp_path)
+
+
+# --- transport.configure follows change.apply / change.finish -----------------
+@pytest.mark.parametrize("device_type, calls", [
+    ("cisco_xr", ["config_set", "commit", "exit_config_mode"]),
+    ("huawei_vrpv8", ["config_set", "commit", "exit_config_mode"]),
+    ("juniper_junos", ["config_set", "commit", "exit_config_mode"]),
+    ("cisco_ios", ["config_set", "exit_config_mode", "save_config"]),
+    ("huawei", ["config_set", "exit_config_mode", "save_config"]),
+    ("fortinet", ["config_set"]),
+    ("linux", ["send_command"]),
+])
+def test_configure_follows_the_platform_file(monkeypatch, device_type, calls):
+    transport = pytest.importorskip("app.transport")
+    from app.inventory import Device
+
+    class FakeConn:
+        def __init__(self): self.calls = []
+        def is_alive(self): return True
+        def find_prompt(self): return "#"
+        def send_command(self, cmd, **kw): self.calls.append("send_command"); return "ok"
+        def send_config_set(self, lines, **kw): self.calls.append("config_set"); return "ok"
+        def commit(self): self.calls.append("commit"); return "committed"
+        def save_config(self): self.calls.append("save_config"); return "saved"
+        def exit_config_mode(self): self.calls.append("exit_config_mode")
+        def disconnect(self): pass
+    conn = FakeConn()
+    monkeypatch.setattr(transport, "ConnectHandler", lambda **kw: conn)
+    dev = Device(name="d", host="h", device_type=device_type, username="u", password="p")
+    pool = transport.Pool()
+    pool.configure(dev, ["line one"], commit=dev.platform.commits)
+    session_prep = len(dev.platform.prep)          # mmi-mode on Huawei goes through send_command
+    assert conn.calls[session_prep:] == calls, conn.calls
