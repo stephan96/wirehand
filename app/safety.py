@@ -22,7 +22,7 @@ from pathlib import Path
 
 import yaml
 
-from .inventory import PLATFORMS
+from . import platforms
 
 log = logging.getLogger("wirehand.safety")
 
@@ -275,7 +275,7 @@ def load_rules(path: Path | None = None) -> RuleSet:
         raise RuleError(f"{root}: safety rule directory not found. run_read refuses every command "
                         "without it; in Docker it comes from the ./config bind mount "
                         "(see docker-compose.yml) or from WIREHAND_SAFETY_RULES")
-    known = sorted(PLATFORMS)
+    known = platforms.known()
     shipped = _rule_files(root)
     unknown = sorted(set(shipped) - {COMMON, *known})
     if unknown:

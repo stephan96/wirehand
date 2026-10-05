@@ -235,7 +235,7 @@ def test_bad_inventory_keys_name_the_device(tmp_path):
     host: 1.1.1.1
     device_type: cisco_ios
     username: u
-    key_file: /app/config/id_ed25519
+    password: p
     secret: s
     port: 2222
     timeout: 60
@@ -246,4 +246,4 @@ def test_bad_inventory_keys_name_the_device(tmp_path):
 """)
     d = Inventory(inv_file, "").get("core-sw1")
     assert (d.port, d.timeout, d.secret, d.confirm) == (2222, 60, "s", "off")
-    assert d.netmiko_kwargs()["use_keys"] is True and "password" not in d.netmiko_kwargs()
+    assert d.netmiko_kwargs()["password"] == "p" and "key_file" not in d.netmiko_kwargs()

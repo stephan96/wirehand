@@ -1,0 +1,40 @@
+# wirehand platform definition for device_type: fortinet (FortiGate / FortiOS)
+# Format: see common.yaml.
+
+version: 1
+name: FortiGate
+
+facts:
+  - get system status
+  - get system interface physical
+  - get router info routing-table all
+  - get system performance status
+
+snapshot: show full-configuration
+
+session:
+  enable: false
+  prep: []
+
+change:
+  apply: config_set
+  # FortiOS applies and persists a 'config ...' block at its 'end' - there is no
+  # separate commit or save, and no config mode to leave afterwards.
+  finish: none
+  rollback_last: null
+  # A block without its 'end' is never applied: missing ends are appended.
+  balance_end: true
+  # FortiOS has no config mode: every line runs at the top level, so these are
+  # what a change could otherwise execute. 'config' and 'end' are how FortiOS
+  # changes are written, so they are allowed here.
+  refuse_in_config:
+    reason: not allowed in a config change - use mode='exec' for operational commands
+    patterns:
+      - '^exe[a-z]*(\s|$)'            # execute (reboot, factoryreset, ...)
+      - '^dia[a-z]*(\s|$)'            # diagnose (sys kill, ...)
+      - '^(sudo|fnsysctl)(\s|$)'
+      - '^(reload|reboot)(\s|$)'
+
+containerlab:
+  kinds:
+    fortinet_fortigate: {username: admin, password: admin}

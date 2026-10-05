@@ -1,0 +1,110 @@
+# wirehand platform definitions - the part shared by EVERY device type.
+#
+# These files describe how wirehand works with each kind of device: what
+# get_facts runs, how a change is snapshotted, applied, committed and rolled back,
+# and which questions a device may ask on the way. The read-path rules (what
+# run_read may execute) are separate, in config/safety/.
+#
+# Layout of config/platforms/:
+#
+#   common.yaml              this file - settings for every device type
+#   <device_type>.yaml       one file per supported Netmiko device_type (linux.yaml,
+#                            cisco_xr.yaml, huawei_vrpv8.yaml, fortinet.yaml, ...).
+#                            The file name IS the device_type from inventory.yaml,
+#                            and the set of files IS the list of supported types:
+#                            a device_type without a file is rejected.
+#
+# Every platform file also needs its counterpart in config/safety/, and the
+# other way round - otherwise the service refuses to start.
+#
+# Keys of a platform file (cisco_xr.yaml is a complete example):
+#
+#   version: 1
+#   name: <display name>                     required
+#   extends: <device_type>                   optional: start from that file, then
+#                                            override; 'session' and 'change' merge
+#                                            key by key, everything else is replaced.
+#                                            'containerlab' is never inherited.
+#   facts: [<command>, ...]                  required, what get_facts runs
+#   snapshot: <command> | null               required, saved before every change
+#   session:
+#     enable: true|false                     call enable() when the device has a 'secret'
+#     prep: [<command>, ...]                 sent once when a session opens
+#   change:
+#     apply: config_set | shell              config_set: Netmiko config mode
+#                                            shell: every line is a command of its own
+#     finish: commit | save | none           after config_set: commit (and leave config
+#                                            mode), leave config mode and save, or
+#                                            nothing (the lines close their own blocks)
+#     rollback_last: [<command>, ...] | null native rollback of the last commit
+#     balance_end: true|false                append missing 'end' lines for open
+#                                            'config ...' blocks (FortiOS)
+#     refuse_in_config:                      required with apply: config_set
+#       reason: <shown to the model>
+#       patterns: ['<regex>', ...]           a config line matching one is refused
+#     drop_trailing: ['<regex>', ...]        trailing lines matching one are dropped from
+#                                            a config change ('end' - the tool leaves
+#                                            config mode itself)
+#     last_line_only: ['<regex>', ...]       dropped at the end like drop_trailing, but
+#                                            refused anywhere else ('end' in the middle
+#                                            leaves config mode uncommitted)
+#   comment_prefixes: ['#', ...]             optional, replaces the value below
+#   prompts: [...]                           optional, checked before the ones below
+#   containerlab:
+#     kinds:                                 containerlab kinds that map to this type
+#       <kind>: {username: u, password: p}   with their well-known default credentials,
+#       <kind>: {}                           or without any
+#
+# apply/finish name behaviours implemented in app/platforms.py and app/transport.py;
+# a new platform that fits them needs no Python. Patterns are Python regular
+# expressions, matched case-insensitively with re.search. ALWAYS single-quote a
+# pattern, so YAML does not eat the backslashes.
+#
+# These files are read once, at startup. After an edit:
+#
+#   python -m app.platforms --lint         # or: docker exec wirehand python -m app.platforms --lint
+#   docker compose restart wirehand
+#
+# A malformed file stops the service from starting (see README).
+
+version: 1
+
+# Lines of a proposed change that start with one of these are dropped as comments.
+comment_prefixes: ['#', '!']
+
+# Questions a device may ask instead of doing the work ("Continue? [Y/N]:").
+# Netmiko's send_command returns as soon as the output looks like a prompt - the
+# ']' in '[Y/N]' is enough - so the command has NOT run yet and the session sits
+# at the question until somebody answers it. Only the end of the output is
+# checked; the code appends an optional '[...]'/'(...)' default and ':'/'?' to
+# every pattern. `proceed` is sent when a human approved the operation
+# (confirm_change), `abort` everywhere else (read paths must not change anything).
+# Quote both answers: YAML reads a bare Y, N, yes or no as true/false.
+prompts:
+  - pattern: '\[y/n\]'
+    proceed: 'Y'
+    abort: 'N'
+    note: Huawei VRP, FortiGate
+  - pattern: '\[yes/no\]'
+    proceed: 'yes'
+    abort: 'no'
+  - pattern: '\(y/n\)'
+    proceed: 'y'
+    abort: 'n'
+  - pattern: '\[yes,no\]'
+    proceed: 'yes'
+    abort: 'no'
+    note: Junos
+  - pattern: '\[confirm\]'
+    proceed: 'y'
+    abort: 'n'
+    note: "Cisco IOS: 'clear counters [confirm]'"
+  - pattern: '\bcontinue\?'
+    proceed: 'y'
+    abort: 'n'
+  - pattern: '\bare you sure\?'
+    proceed: 'y'
+    abort: 'n'
+  - pattern: '\bproceed\??'
+    proceed: 'y'
+    abort: 'n'

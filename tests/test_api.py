@@ -94,9 +94,19 @@ assert p.status_code == 200 and "+ end" in p.text and "lldp-reception" in p.text
 code3 = p.text.split("code: ")[1][:6]
 a = c.post("/confirm_change", params={"code": code3}, headers=H)
 assert a.status_code == 200 and main.pool.configured[-1][1][-1] == "end", a.text
-# ios still rejects end
-p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\nend"}, headers=H)
-assert p.status_code == 400, p.text
+# non-FortiGate platforms still refuse exec commands inside a config change
+p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\ndo reload"}, headers=H)
+assert p.status_code == 400 and "do reload" in p.text, p.text
+# a closing 'end' is dropped (the tool leaves config mode and commits itself), and the preview says so
+p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\n description x\n exit\nend"}, headers=H)
+assert p.status_code == 200 and "+ end" not in p.text and "dropped from the end: ' exit', 'end'" in p.text, p.text
+n = len(main.pool.configured)
+a = c.post("/confirm_change", params={"code": p.text.split("code: ")[1][:6]}, headers=H)
+assert a.status_code == 200 and main.pool.configured[n][1] == ["interface Lo1", " description x"], main.pool.configured
+assert c.post("/propose_change", json={"device": "r1", "config": "end"}, headers=H).status_code == 400
+# ... but in the middle it would leave config mode uncommitted (XR then asks and the session hangs)
+p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\nend\ninterface Lo2"}, headers=H)
+assert p.status_code == 400 and "only allowed as the last line" in p.text, p.text
 print("FORTINET BLOCKS OK")
 # auth failure: 401 (not 502), no auto-retry inside the call, recoverable wording, audited
 from app.transport import AuthError

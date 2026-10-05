@@ -3,9 +3,10 @@ import time
 import pytest
 
 from app import safety
-from app.inventory import PLATFORMS
+from app import platforms
 from app.safety import check_read_command, filter_lines, split_commands, truncate
 
+PLATFORMS = platforms.known()
 NETWORK = sorted(set(PLATFORMS) - {"linux"})
 
 

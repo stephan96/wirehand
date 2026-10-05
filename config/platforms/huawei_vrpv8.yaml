@@ -1,0 +1,50 @@
+# wirehand platform definition for device_type: huawei_vrpv8 (Huawei VRP8: NE40E, CE)
+# Format: see common.yaml.
+
+version: 1
+name: Huawei VRP8
+
+facts:
+  - display version
+  - display ip interface brief
+  - display ip routing-table statistics
+  - display bgp peer
+  - display lldp neighbor brief
+  - display logbuffer size 30
+
+snapshot: display current-configuration
+
+session:
+  enable: false
+  # See huawei.yaml: stops the "Continue? [Y/N]:" questions on maintenance commands.
+  prep:
+    - mmi-mode enable
+
+change:
+  apply: config_set
+  finish: commit
+  rollback_last:
+    - rollback configuration last 1
+  balance_end: false
+  # Closing lines models like to add. The tool leaves config mode itself, and on
+  # a committing platform leaving with uncommitted changes makes the device ask
+  # first - so a trailing return/quit is dropped (the preview says so).
+  drop_trailing:
+    - '^quit$'
+  # ... and 'return' anywhere else is refused: it leaves system-view with the
+  # change uncommitted, VRP8 asks whether to commit, and the session hangs.
+  last_line_only:
+    - '^return$'
+  # Matched against every line of a change made in system-view. 'quit' and
+  # 'return' only leave a view, so they are allowed.
+  refuse_in_config:
+    reason: the tool enters and leaves system-view and commits/saves itself, and user-view commands do not belong in a config change - use mode='exec' for maintenance commands
+    patterns:
+      - '^run(\s|$)'                  # 'run <cmd>' runs a user-view command from system-view
+      - '^com(m(it?)?)?(\s|$)'        # commit
+      - '^sa(ve?)?(\s|$)'             # save
+      - '^reb[a-z]*(\s|$)'            # reboot
+
+containerlab:
+  kinds:
+    huawei_vrp: {username: admin, password: admin}

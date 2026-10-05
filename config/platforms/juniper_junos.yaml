@@ -1,0 +1,47 @@
+# wirehand platform definition for device_type: juniper_junos (Juniper Junos)
+# Format: see common.yaml.
+
+version: 1
+name: Juniper Junos
+
+facts:
+  - show version
+  - show interfaces terse
+  - show route summary
+  - show lldp neighbors
+
+snapshot: show configuration
+
+session:
+  enable: false
+  prep: []
+
+change:
+  apply: config_set
+  finish: commit
+  rollback_last:
+    - configure
+    - rollback 1
+    - commit and-quit
+  balance_end: false
+  # Closing lines models like to add. The tool leaves config mode itself, and on
+  # a committing platform leaving with uncommitted changes makes the device ask
+  # first - so a trailing exit/quit/top is dropped (the preview says so).
+  drop_trailing:
+    - '^(exit(\s+configuration-mode)?|quit|top)$'
+  # Matched against every line of a change made in configuration mode ('set ...'
+  # statements). 'top'/'up'/'exit' only move within the hierarchy, so they are
+  # allowed unless they carry one of the commands below.
+  refuse_in_config:
+    reason: the tool enters configuration mode and commits itself - write 'set'/'delete' statements only; use rollback_change for rollbacks and mode='exec' for operational commands
+    patterns:
+      - '^((top|up(\s+\d+)?)\s+)?run(\s|$)'                 # run <op command> from config mode
+      - '^((top|up(\s+\d+)?)\s+)?com(m(it?)?)?(\s|$)'       # commit
+      - '^((top|up(\s+\d+)?)\s+)?(rollback|load)(\s|$)'     # replace the candidate configuration
+
+containerlab:
+  kinds:
+    juniper_vjunosrouter: {}
+    juniper_vjunosswitch: {}
+    juniper_vmx: {}
+    juniper_vsrx: {}

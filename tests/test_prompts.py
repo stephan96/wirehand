@@ -5,7 +5,8 @@ the ']' in '[Y/N]' is enough - so the command has not run, the session waits at
 the question, and wirehand used to report success anyway. Observed on Huawei
 VRPv8: rollback_change said "ROLLED BACK" while the device was still asking.
 """
-from app.platforms import CONFIRM_PROMPTS_RX, SESSION_PREP, pending_prompt
+from app import platforms
+from app.platforms import pending_prompt
 
 # Verbatim device output (VRPv8 NE40E V800R023, IOS-XR 24.2.2 from the lab).
 VRP_ROLLBACK = ("Warning: This operation will revert configuration changes to the previous status. "
@@ -40,8 +41,8 @@ def test_only_the_tail_counts():
 
 def test_vrp_gets_mmi_mode_on_session_open():
     """Huawei's own switch for 'a machine is typing' - it stops the questions."""
-    assert SESSION_PREP["vrpv8"] == ["mmi-mode enable"] == SESSION_PREP["vrp"]
-    assert "ios" not in SESSION_PREP and "xr" not in SESSION_PREP
+    assert platforms.get("huawei_vrpv8").prep == ("mmi-mode enable",) == platforms.get("huawei").prep
+    assert platforms.get("cisco_ios").prep == () == platforms.get("cisco_xr").prep
 
 
 # The rest needs netmiko (app.transport imports it). Skipped where it is absent,
@@ -69,7 +70,7 @@ class FakeConn:
 
 
 class _Dev:
-    name, family = "vrp1", "vrpv8"
+    name, device_type = "vrp1", "huawei_vrpv8"
 
 
 def test_settle_answers_yes_for_an_approved_change():

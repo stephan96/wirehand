@@ -19,7 +19,7 @@ services:
       args:
         APP_UID: "${UID:-1000}"
         APP_GID: "${GID:-1000}"
-    image: wirehand:0.5.4
+    image: wirehand:0.5.5
     container_name: wirehand
     restart: unless-stopped
     network_mode: host
@@ -28,6 +28,7 @@ services:
       - .env                        # WIREHAND_API_KEY, WIREHAND_CLAB_DIR, manual device creds (chmod 600)
     environment:
       WIREHAND_INVENTORY: /app/config/inventory.yaml
+      WIREHAND_PLATFORMS: /app/config/platforms       # per-device_type facts, commit/rollback, prompts, clab kinds; read at startup
       WIREHAND_SAFETY_RULES: /app/config/safety       # read-path rules: common.yaml + one file per device_type; a broken file stops startup
       WIREHAND_SAFETY_RESCAN: "30"    # seconds between checks for edits in config/safety/
       WIREHAND_CLAB_DIR: /clab        # container-side path of the containerlab folder (mounted below)

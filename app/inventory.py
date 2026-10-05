@@ -12,26 +12,11 @@ from pathlib import Path
 
 import yaml
 
-from . import clab
+from . import clab, platforms
 
 INVENTORY_PATH = Path(os.environ.get("WIREHAND_INVENTORY", "/app/config/inventory.yaml"))
 CLAB_DIR = os.environ.get("WIREHAND_CLAB_DIR", "")
 RESCAN_SECONDS = int(os.environ.get("WIREHAND_CLAB_RESCAN", "30"))
-
-# Netmiko device_type -> platform family used for facts bundles / commit logic
-PLATFORMS = {
-    "linux": "linux",
-    "cisco_ios": "ios",
-    "cisco_xe": "ios",
-    "cisco_xr": "xr",
-    "cisco_nxos": "nxos",
-    "huawei": "vrp",
-    "huawei_vrpv8": "vrpv8",
-    "fortinet": "fortinet",
-    "arista_eos": "eos",
-    "juniper_junos": "junos",
-}
-
 
 @dataclass
 class Device:
@@ -40,7 +25,6 @@ class Device:
     device_type: str
     username: str
     password: str | None = None
-    key_file: str | None = None
     secret: str | None = None
     port: int = 22
     access: str = "ro"  # ro | rw
@@ -53,8 +37,9 @@ class Device:
     source: str = "inventory.yaml"
 
     @property
-    def family(self) -> str:
-        return PLATFORMS.get(self.device_type, self.device_type)
+    def platform(self) -> platforms.Platform:
+        """How wirehand works with this device (config/platforms/<device_type>.yaml)."""
+        return platforms.get(self.device_type)
 
     @property
     def writable(self) -> bool:
@@ -90,9 +75,6 @@ class Device:
             _d = _os.environ.get("WIREHAND_DATA", "/app/data")
             kw["session_log"] = f"{_d}/session-{self.name}.log"
             kw["session_log_file_mode"] = "append"
-        if self.key_file:
-            kw["use_keys"] = True
-            kw["key_file"] = self.key_file
         if self.password:
             kw["password"] = self.password
         if self.secret:
@@ -165,8 +147,9 @@ class Inventory:
             missing = sorted(REQUIRED_KEYS - set(spec))
             if missing:
                 raise RuntimeError(f"device '{name}': missing required key(s) {', '.join(missing)}")
-            if spec.get("device_type") not in PLATFORMS:
-                raise RuntimeError(f"device '{name}': unsupported device_type '{spec.get('device_type')}'")
+            if spec.get("device_type") not in platforms.known():
+                raise RuntimeError(f"device '{name}': unsupported device_type '{spec.get('device_type')}' - "
+                                   f"one of: {', '.join(platforms.known())} (config/platforms/)")
             if spec.get("access", "ro") not in ("ro", "rw"):
                 raise RuntimeError(f"device '{name}': access must be 'ro' or 'rw'")
             if "confirm" in spec and spec["confirm"] is not None:

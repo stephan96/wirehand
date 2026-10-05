@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------------------
 # Manual devices. The LLM only sees: name, platform, access, description, tags.
 # Credentials: env:VARNAME -> resolved from the container environment (.env);
-#              works for username, password and secret (not for key_file).
+#              works for username, password and secret.
 # access: ro (default) | rw.
 # confirm: totp | off - who may approve a change on this device. Default comes from
 #          WIREHAND_CONFIRM_MODE; 'off' lets the model confirm its own proposal, so
@@ -28,23 +28,13 @@ devices:
   #   device_type: cisco_ios
   #   username: env:CORE_SW1_USER
   #   password: env:CORE_SW1_PASS
-  #   secret: env:CORE_SW1_ENABLE  # enable password; used on cisco_ios/cisco_xe/cisco_nxos/arista_eos
+  #   secret: env:CORE_SW1_ENABLE  # enable password; used where config/platforms/ sets session.enable
   #   port: 2222                   # SSH port (default 22)
   #   timeout: 60                  # seconds Netmiko waits for one command (default 30)
   #   access: ro
   #   confirm: totp
   #   description: Core switch building A
   #   tags: [prod, campus]
-
-  # Key instead of password. The key has to be readable *inside* the container, and
-  # only ./config and WIREHAND_CLAB_DIR are mounted - so keep it in config/ and make
-  # it readable by the APP_UID the image was built with. Omit password entirely.
-  # edge-rtr1:
-  #   host: 192.0.2.30
-  #   device_type: cisco_xr
-  #   username: netops
-  #   key_file: /app/config/id_ed25519
-  #   access: ro
 
 # ----------------------------------------------------------------------------
 # Containerlab discovery (folder set via WIREHAND_CLAB_DIR). Every deployed lab
@@ -61,8 +51,9 @@ containerlab:
   long_names: false           # true -> use full names like clab-xrd-test-xrd1
 
   # kind -> Netmiko driver / access / confirm overrides; these beat the two defaults
-  # above (built-in map covers cisco_xrd, cisco_iol, huawei_vrp, fortinet_fortigate,
-  # arista_ceos, juniper_vjunos*, linux, ...)
+  # above (the shipped map is the containerlab.kinds of config/platforms/*.yaml:
+  # cisco_xrd, cisco_iol, huawei_vrp, fortinet_fortigate, arista_ceos, juniper_vjunos*,
+  # linux, ...)
   kinds:
     huawei_vrp: { device_type: huawei_vrpv8 }     # NE40E/CE = VRP8; use 'huawei' for VRP5 images
     # cisco_xrd: { access: ro, confirm: totp }

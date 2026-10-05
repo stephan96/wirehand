@@ -1,0 +1,50 @@
+# wirehand platform definition for device_type: cisco_ios (Cisco IOS)
+# Format: see common.yaml. cisco_xe.yaml extends this file.
+
+version: 1
+name: Cisco IOS
+
+facts:
+  - show version
+  - show ip interface brief
+  - show ip route summary
+  - show cdp neighbors
+  - show logging | tail 30
+
+snapshot: show running-config
+
+session:
+  enable: true
+  prep: []
+
+change:
+  apply: config_set
+  finish: save
+  rollback_last: null
+  balance_end: false
+  # Closing lines models like to add. The tool leaves config mode itself, and on
+  # a committing platform leaving with uncommitted changes makes the device ask
+  # first - so a trailing end/exit is dropped (the preview says so).
+  drop_trailing:
+    - '^exit$'
+  # ... and 'end' anywhere else is refused: it would leave config mode with
+  # the change uncommitted.
+  last_line_only:
+    - '^end$'
+  # Matched against every line of a config change. The CLI accepts any
+  # unambiguous abbreviation, so a verb is its shortest distinctive prefix plus
+  # [a-z]*; '(\s|$)' keeps config words that merely start the same way
+  # (config-register, wrr-queue, end-policy) out of it.
+  refuse_in_config:
+    reason: the tool enters and leaves config mode and commits/saves itself, and exec commands do not belong in a config change - use mode='exec' for maintenance commands
+    patterns:
+      - '^conf[a-z]*(\s|$)'           # conf t, config, configure
+      - '^com(m(it?)?)?(\s|$)'        # commit (not 'comment')
+      - '^wr[a-z]*(\s|$)'             # wr, write
+      - '^relo[a-z]*(\s|$)'           # reload
+      - '^reb[a-z]*(\s|$)'            # reboot
+      - '^do(\s|$)'                   # 'do <cmd>' runs an exec command from config mode
+
+containerlab:
+  kinds:
+    cisco_iol: {username: admin, password: admin}
