@@ -94,9 +94,11 @@ assert p.status_code == 200 and "+ end" in p.text and "lldp-reception" in p.text
 code3 = p.text.split("code: ")[1][:6]
 a = c.post("/confirm_change", params={"code": code3}, headers=H)
 assert a.status_code == 200 and main.pool.configured[-1][1][-1] == "end", a.text
-# ios still rejects end
+# non-FortiGate platforms still refuse exec commands inside a config change
+p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\ndo reload"}, headers=H)
+assert p.status_code == 400 and "do reload" in p.text, p.text
 p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\nend"}, headers=H)
-assert p.status_code == 400, p.text
+assert p.status_code == 200, p.text      # leaving config mode is harmless
 print("FORTINET BLOCKS OK")
 # auth failure: 401 (not 502), no auto-retry inside the call, recoverable wording, audited
 from app.transport import AuthError

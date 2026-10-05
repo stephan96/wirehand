@@ -29,7 +29,6 @@ change:
     reason: the tool enters and leaves config mode and commits/saves itself, and exec commands do not belong in a config change - use mode='exec' for maintenance commands
     patterns:
       - '^conf[a-z]*(\s|$)'           # conf t, config, configure
-      - '^end(\s|$)'                  # leaves config mode: later lines would run in exec mode
       - '^com(m(it?)?)?(\s|$)'        # commit (not 'comment')
       - '^wr[a-z]*(\s|$)'             # wr, write
       - '^relo[a-z]*(\s|$)'           # reload

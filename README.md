@@ -487,9 +487,9 @@ rejected when the inventory loads, and every file needs its counterpart in
 `refuse_in_config` is matched against every line of a config-mode change. CLIs accept
 abbreviations, so a verb is written as its shortest distinctive prefix plus `[a-z]*` (`wr`
 is `write`), and `(\s|$)` keeps config words that only start the same way
-(`config-register`, `end-policy`, `sysname`) out of it. The point is less the verbs
-themselves than what follows them: after an `end` or `return`, every remaining line of the
-change runs in exec/user view - where `reload` reboots.
+(`config-register`, `end-policy`, `sysname`) out of it. What is refused runs something
+from inside a config change (`do`, `run`, `copy`, `execute`) or commits/saves in the middle
+of it; merely leaving a mode (`end`, `exit`, `quit`, `return`) is allowed.
 
 `extends: cisco_ios` lets a file start from another one and override only what differs
 (that is all `cisco_xe.yaml` does). `change.apply` and `change.finish` name behaviours that
@@ -511,7 +511,6 @@ change:
   refuse_in_config:
     reason: the tool enters and leaves system-view and commits/saves itself, ...
     patterns:
-      - '^ret(u(rn?)?)?(\s|$)'        # return: back to user view, later lines would run there
       - '^run(\s|$)'                  # 'run <cmd>' runs a user-view command from system-view
       - '^com(m(it?)?)?(\s|$)'        # commit
 containerlab:

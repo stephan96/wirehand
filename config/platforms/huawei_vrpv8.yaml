@@ -26,13 +26,11 @@ change:
   rollback_last:
     - rollback configuration last 1
   balance_end: false
-  # Matched against every line of a change made in system-view. 'quit' is NOT
-  # refused: it is how a block leaves an interface view and appears in nearly
-  # every Huawei snippet.
+  # Matched against every line of a change made in system-view. 'quit' and
+  # 'return' only leave a view, so they are allowed.
   refuse_in_config:
     reason: the tool enters and leaves system-view and commits/saves itself, and user-view commands do not belong in a config change - use mode='exec' for maintenance commands
     patterns:
-      - '^ret(u(rn?)?)?(\s|$)'        # return: back to user view, later lines would run there
       - '^run(\s|$)'                  # 'run <cmd>' runs a user-view command from system-view
       - '^com(m(it?)?)?(\s|$)'        # commit
       - '^sa(ve?)?(\s|$)'             # save
