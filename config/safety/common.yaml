@@ -1,0 +1,98 @@
+# wirehand read-path safety rules - the part shared by EVERY device type.
+#
+# These lists decide what run_read is allowed to execute. Everything they refuse
+# has to go through propose_change, which is approval-gated. Treat this directory
+# as security policy: whoever can WRITE it can grant arbitrary command execution
+# on the read path. It is mounted read-only into the container (docker-compose.yml).
+#
+# Layout of config/safety/:
+#
+#   common.yaml              this file - rules for every device type
+#   <device_type>.yaml       one file per supported Netmiko device_type (linux.yaml,
+#                            cisco_xr.yaml, huawei_vrpv8.yaml, fortinet.yaml, ...).
+#                            The file name IS the device_type from inventory.yaml.
+#   local/<name>.yaml        optional, git-ignored site additions; <name> is 'common'
+#                            or a device_type. They can only ADD entries.
+#
+# A device of type T is checked against: common.yaml + T.yaml + local/common.yaml
+# + local/T.yaml, section by section. Every supported device_type must have its
+# own file - a missing one stops the service, it is never silently defaulted.
+#
+# Evaluation order is fixed in app/safety.py and cannot be changed from here:
+#
+#   1. hard_refusals   argument-level refusals; win even over an allow-listed verb
+#   2. blocklist       known write/privileged verbs
+#   3. allowlist       known-good read verbs
+#   4. default         the device file's 'default:' - deny (allow-list only) or allow
+#
+# A pipeline is checked stage by stage, each stage like a command of its own
+# ('^' anchors at the start of the stage): 'cat x | crontab -' is refused on
+# Linux because 'crontab' is not on the allow-list, not waved through because
+# 'cat' is. hard_refusals additionally run against the whole line once, which
+# is what lets a pattern such as '\|\s*sh\b' see the pipe itself.
+#
+# Within a section the order of entries is irrelevant: the first match wins and
+# every entry produces the same verdict. Each entry is a Python regular
+# expression, matched with re.search against the command after whitespace
+# collapse, case-insensitively unless it sets `case_sensitive: true`.
+#
+# ALWAYS single-quote a pattern, so YAML does not eat the backslashes.
+# After editing, check the directory before it goes live:
+#
+#   python -m app.safety --lint            # or: docker exec wirehand python -m app.safety --lint
+#   python -m app.safety --explain cisco_xr 'show run | file x'   # which rule decides, and why
+#
+# A malformed file is never loaded: on startup the service refuses to come up,
+# and at runtime the previously loaded rules keep serving (see README).
+
+version: 1
+
+# --- 1. Hard refusals -------------------------------------------------------
+# Only what is dangerous on every platform belongs here: shell syntax that
+# chains, redirects or substitutes commands, write-capable pipe modifiers, and
+# programs that hand over a general-purpose interpreter or a connection to
+# another host. Vendor- and OS-specific refusals live in the device files.
+# `reason` is handed to the model verbatim, so say what to use instead.
+hard_refusals:
+  - pattern: '[>;&]|\|\||<\('
+    reason: shell redirection/chaining/background ('>', ';', '&', '||', '<(') not allowed on read path - use filter= to narrow output
+    note: >
+      Any '>' at all, not only ' > ': 'ls 2>/tmp/x' and 'cat x>/tmp/y' write a
+      file just as well. A single '&' backgrounds the first command and runs
+      the second one; '<(...)' runs a command like '$(...)'. A '>' inside a
+      vendor filter regex is refused too - the filter parameter does that job.
+
+  - pattern: '\|\s*(sh|bash|zsh|python\d?|perl|xargs|sudo|tee)\b'
+    reason: piping into an interpreter/tee is not allowed on read path
+
+  - pattern: '[`]|\$\('
+    reason: command substitution is not allowed on read path
+
+  - pattern: '\|\s*(file|utility|append|redirect|save|tee)\b'
+    reason: pipe modifier writes to a file or runs a shell utility - use propose_change
+    note: >
+      Vendor pipe modifiers that write or shell out: IOS-XR '| file' and
+      '| utility', IOS/EOS '| append|redirect|tee', Junos '| save'. Kept in one
+      place because the keywords are harmless as reads on every other platform.
+      '| include|exclude|begin|count' and friends stay allowed.
+
+  - pattern: '^(bash|zsh|ash|dash|ksh|csh|tcsh|busybox|python[\d.]*|perl|ruby|node|nodejs|lua[\d.]*|tclsh|expect|php|awk|gawk|mawk|nawk)\b'
+    reason: shell/interpreter invocation can run arbitrary code - use propose_change
+    note: >
+      Interpreters take their program as an argument, so no verb check can make
+      them safe. Not only a Linux concern: NX-OS and EOS have 'bash' and
+      'python', IOS has 'tclsh'. Bare 'sh' is deliberately absent: on
+      Cisco/Huawei it is the usual abbreviation of 'show'. On Linux it is
+      refused by the allow-list.
+
+  - pattern: '^(ssh|scp|sftp|rsync|socat|nc|ncat|netcat|telnet|curl|wget|ftp|tftp)\b'
+    reason: network/file-transfer client is not allowed on read path
+    note: >
+      From a router as much as from a server: 'ssh'/'telnet' would hop to
+      another host with this device's reachability.
+
+# Nothing shared beyond the hard refusals: write verbs and read verbs differ
+# per platform and are listed in the device files. Both keys must stay present.
+blocklist: []
+
+allowlist: []

@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
-from . import platforms
+from . import platforms, safety
 from .approval import Approver, ConfigError
 from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
@@ -59,6 +59,8 @@ async def lifespan(app: FastAPI):
         log.warning("WIREHAND_CONFIRM_MODE=off - the model can apply its own proposals without a human")
     else:
         log.info("changes require a one-time approval code (WIREHAND_CONFIRM_MODE=totp)")
+    rules = safety.rules()   # raises RuleError -> startup fails, which is the point
+    log.info("read-path safety rules: %s (%s)", rules.summary(), rules.path)
     log.info("loaded %d devices (inventory.yaml=%s, containerlab=%s)", len(inventory.all()), inventory.path, inventory.clab_dir or "off")
     yield
     pool.close_all()
@@ -66,7 +68,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.5.3",
+    version="0.5.4",
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
@@ -139,11 +141,12 @@ def _next_step(dev, code: str) -> str:
              "Examples: list_devices() | list_devices(check=true) - 'which devices are up right now?'"
          ), dependencies=[Depends(auth)])
 def list_devices(
-    refresh: bool = Query(False, description="Re-read inventory.yaml and rescan containerlab labs now"),
+    refresh: bool = Query(False, description="Re-read inventory.yaml and safety.yaml and rescan containerlab labs now"),
     check: bool = Query(False, description="Also check reachability (SSH port) of every device"),
 ) -> str:
     if refresh:
         inventory.reload()
+        safety.reload()
     devs = inventory.all()
     if not check:
         rows = [f"{d.name:<24} {d.device_type:<14} {d.access:<3} {d.host:<15} {d.description}" for d in devs]
@@ -247,10 +250,10 @@ def run_read(
     # Resolve every device BEFORE running anything: an unknown name in a list
     # must not leave the earlier devices already executed. What counts as a safe
     # read depends on the platform - a Linux shell needs the strict allow-list,
-    # a vendor exec view does not - so check each command per target family.
+    # a vendor exec view does not - so check each command per target device type.
     devs = [_device(n) for n in names]
     refused = [(d.name, c, v.reason) for d in devs for c in cmds
-               if not (v := check_read_command(c, d.family)).allowed]
+               if not (v := check_read_command(c, d.device_type)).allowed]
     if refused:
         msg = "; ".join(f"{d}: '{c}': {r}" for d, c, r in refused)
         raise HTTPException(403, f"refused on read path: {msg}")
