@@ -1,0 +1,38 @@
+# wirehand platform definition for device_type: cisco_xr (Cisco IOS-XR)
+# Format: see common.yaml.
+
+version: 1
+name: Cisco IOS-XR
+
+# get_facts: the overview bundle, the intended first step of an analysis.
+facts:
+  - show version
+  - show ipv4 interface brief
+  - show route summary
+  - show bgp summary
+  - show lldp neighbors
+  - show logging last 30
+
+# Saved before every change and before a native rollback.
+snapshot: show running-config
+
+session:
+  enable: false
+  prep: []
+
+change:
+  apply: config_set
+  finish: commit
+  rollback_last:
+    - rollback configuration last 1
+  balance_end: false
+  refuse_in_config:
+    reason: the tool handles mode changes and commit
+    patterns:
+      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+
+containerlab:
+  kinds:
+    cisco_xrd: {username: clab, password: clab@123}
+    cisco_xrv9k: {username: clab, password: clab@123}
+    cisco_xrv: {}

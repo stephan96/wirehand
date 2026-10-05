@@ -1,0 +1,37 @@
+# wirehand platform definition for device_type: juniper_junos (Juniper Junos)
+# Format: see common.yaml.
+
+version: 1
+name: Juniper Junos
+
+facts:
+  - show version
+  - show interfaces terse
+  - show route summary
+  - show lldp neighbors
+
+snapshot: show configuration
+
+session:
+  enable: false
+  prep: []
+
+change:
+  apply: config_set
+  finish: commit
+  rollback_last:
+    - configure
+    - rollback 1
+    - commit and-quit
+  balance_end: false
+  refuse_in_config:
+    reason: the tool handles mode changes and commit
+    patterns:
+      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+
+containerlab:
+  kinds:
+    juniper_vjunosrouter: {}
+    juniper_vjunosswitch: {}
+    juniper_vmx: {}
+    juniper_vsrx: {}

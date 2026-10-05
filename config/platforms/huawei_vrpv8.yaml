@@ -1,0 +1,36 @@
+# wirehand platform definition for device_type: huawei_vrpv8 (Huawei VRP8: NE40E, CE)
+# Format: see common.yaml.
+
+version: 1
+name: Huawei VRP8
+
+facts:
+  - display version
+  - display ip interface brief
+  - display ip routing-table statistics
+  - display bgp peer
+  - display lldp neighbor brief
+  - display logbuffer size 30
+
+snapshot: display current-configuration
+
+session:
+  enable: false
+  # See huawei.yaml: stops the "Continue? [Y/N]:" questions on maintenance commands.
+  prep:
+    - mmi-mode enable
+
+change:
+  apply: config_set
+  finish: commit
+  rollback_last:
+    - rollback configuration last 1
+  balance_end: false
+  refuse_in_config:
+    reason: the tool handles mode changes and commit
+    patterns:
+      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+
+containerlab:
+  kinds:
+    huawei_vrp: {username: admin, password: admin}

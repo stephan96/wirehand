@@ -1,0 +1,32 @@
+# wirehand platform definition for device_type: cisco_ios (Cisco IOS)
+# Format: see common.yaml. cisco_xe.yaml extends this file.
+
+version: 1
+name: Cisco IOS
+
+facts:
+  - show version
+  - show ip interface brief
+  - show ip route summary
+  - show cdp neighbors
+  - show logging | tail 30
+
+snapshot: show running-config
+
+session:
+  enable: true
+  prep: []
+
+change:
+  apply: config_set
+  finish: save
+  rollback_last: null
+  balance_end: false
+  refuse_in_config:
+    reason: the tool handles mode changes and commit
+    patterns:
+      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+
+containerlab:
+  kinds:
+    cisco_iol: {username: admin, password: admin}

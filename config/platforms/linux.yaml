@@ -1,0 +1,39 @@
+# wirehand platform definition for device_type: linux (Linux servers and containers)
+# Format: see common.yaml.
+
+version: 1
+name: Linux
+
+facts:
+  - hostname
+  - uptime
+  - uname -a
+  - cat /etc/os-release
+  - ip -brief address
+  - ip route
+  - ss -tulpn
+  - df -h
+  - free -m
+  - systemctl list-units --type=service --state=failed --no-pager
+  - journalctl -p warning -n 30 --no-pager
+
+# No configuration to snapshot on a shell: per-file backups are part of the change
+# itself (e.g. 'sudo cp /etc/x /etc/x.bak').
+snapshot: null
+
+session:
+  enable: false
+  prep: []
+
+change:
+  # Every line of a change runs as a shell command of its own.
+  apply: shell
+  finish: none
+  rollback_last: null
+  balance_end: false
+
+containerlab:
+  kinds:
+    linux: {username: clab, password: clab@123}
+    sonic-vs: {}
+    generic_vm: {}

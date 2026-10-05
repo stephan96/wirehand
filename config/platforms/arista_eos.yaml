@@ -1,0 +1,32 @@
+# wirehand platform definition for device_type: arista_eos (Arista EOS)
+# Format: see common.yaml.
+
+version: 1
+name: Arista EOS
+
+facts:
+  - show version
+  - show ip interface brief
+  - show ip route summary
+  - show lldp neighbors
+
+snapshot: show running-config
+
+session:
+  enable: true
+  prep: []
+
+change:
+  apply: config_set
+  finish: save
+  rollback_last: null
+  balance_end: false
+  refuse_in_config:
+    reason: the tool handles mode changes and commit
+    patterns:
+      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+
+containerlab:
+  kinds:
+    arista_ceos: {username: admin, password: admin}
+    arista_veos: {}

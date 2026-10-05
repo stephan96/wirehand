@@ -1,0 +1,12 @@
+# wirehand platform definition for device_type: cisco_xe (Cisco IOS-XE)
+# Format: see common.yaml. Everything not set here comes from cisco_ios.yaml.
+
+version: 1
+name: Cisco IOS-XE
+extends: cisco_ios
+
+containerlab:
+  kinds:
+    cisco_csr1000v: {}
+    cisco_c8000v: {}
+    cisco_cat9kv: {}

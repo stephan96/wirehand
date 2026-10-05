@@ -1,0 +1,35 @@
+# wirehand platform definition for device_type: huawei (Huawei VRP5)
+# Format: see common.yaml.
+
+version: 1
+name: Huawei VRP5
+
+facts:
+  - display version
+  - display ip interface brief
+  - display ip routing-table statistics
+  - display lldp neighbor brief
+
+snapshot: display current-configuration
+
+session:
+  enable: false
+  # Huawei VRP asks for confirmation on maintenance commands ("Continue? [Y/N]:");
+  # mmi-mode is the vendor's own switch for exactly this case - it tells the CLI a
+  # machine is typing, and the questions stop. Best effort: if the image does not
+  # know the command, nothing breaks.
+  prep:
+    - mmi-mode enable
+
+change:
+  apply: config_set
+  finish: save
+  rollback_last: null
+  balance_end: false
+  refuse_in_config:
+    reason: the tool handles mode changes and commit
+    patterns:
+      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+
+# No containerlab kind: clab's huawei_vrp is VRP8 (huawei_vrpv8.yaml). Map it here
+# per lab with 'containerlab.kinds' in inventory.yaml if you run VRP5 images.
