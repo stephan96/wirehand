@@ -315,10 +315,18 @@ def propose_change(body: ProposeIn) -> str:
         raise HTTPException(400, "config is empty")
     if body.mode not in ("config", "exec"):
         raise HTTPException(400, "mode must be 'config' or 'exec'")
+    dropped: list[str] = []
     if body.mode == "config":
         refused = plat.refused_lines(lines)      # change.refuse_in_config
         if refused:
             raise HTTPException(400, f"do not include {refused} - {plat.refuse_reason}")
+        # A closing 'end'/'return' is what models habitually add; on platforms that
+        # commit, leaving config mode with uncommitted changes makes the device ask
+        # a question the commit step then stumbles over. The tool leaves config
+        # mode itself, so the line is dropped - and the preview says so.
+        lines, dropped = plat.split_trailing(lines)
+        if not lines:
+            raise HTTPException(400, f"config is empty once {dropped} is dropped - the tool leaves config mode itself")
         if plat.balance_end:
             # FortiOS applies a section only at 'end' - balance missing ends automatically.
             opens = sum(1 for ln in lines if ln.strip().lower().startswith("config "))
@@ -346,6 +354,9 @@ def propose_change(body: ProposeIn) -> str:
         preview = "Commands to run:\n" + "\n".join(f"  $ {ln}" for ln in lines)
     else:
         preview = "Configuration lines to send:\n" + "\n".join(f"  + {ln}" for ln in lines)
+        if dropped:
+            preview += (f"\n(dropped from the end: {', '.join(repr(d) for d in dropped)} - "
+                        f"the tool leaves config mode itself)")
     pc = changes.create(dev.name, lines, snap_path, preview, mode=body.mode)
     audit("propose_change", dev.name, code=pc.code, lines=lines, reason=body.reason, mode=body.mode, snapshot=str(snap_path))
     return (

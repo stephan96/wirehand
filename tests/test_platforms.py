@@ -80,6 +80,20 @@ def test_config_change_guards(dt):
         assert p.refused_lines([line]) == [], (dt, line)
 
 
+@pytest.mark.parametrize("dt, lines, kept", [
+    ("cisco_xr", ["interface Lo1", " exit", "end"], ["interface Lo1"]),
+    ("cisco_xr", ["interface Lo1", "end", "interface Lo2"], ["interface Lo1", "end", "interface Lo2"]),
+    ("cisco_ios", ["interface Lo1", "end-policy"], ["interface Lo1", "end-policy"]),
+    ("huawei_vrpv8", ["interface LoopBack1", "quit", "return"], ["interface LoopBack1"]),
+    ("huawei", ["sysname r1", "return"], ["sysname r1"]),
+    ("juniper_junos", ["set system host-name r1", "top", "exit configuration-mode"], ["set system host-name r1"]),
+    ("fortinet", ["config system global", "set hostname f", "end"], ["config system global", "set hostname f", "end"]),
+])
+def test_trailing_mode_exits_are_dropped(dt, lines, kept):
+    got, dropped = platforms.get(dt).split_trailing(lines)
+    assert got == kept and got + dropped == lines
+
+
 def test_every_config_set_platform_has_guard_tests():
     assert set(GUARDS) == {dt for dt in platforms.known() if not platforms.get(dt).shell}
 
@@ -147,6 +161,8 @@ def test_minimal_tree(tmp_path):
     ({"cisco_xr": CFG.replace("'^end(\\s|$)'", "'^end(\\s'")}, "invalid regular expression"),
     ({"cisco_xr": CFG.replace("finish: commit", "finish: none")}, "no commits to roll back"),
     ({"linux": SHELL.replace("finish: none", "finish: save")}, "set change.finish: none"),
+    ({"linux": SHELL.replace("rollback_last: null}", "rollback_last: null, drop_trailing: ['^end$']}")},
+     "only apply to change.apply: config_set"),
     ({"cisco_xr": CFG.replace("{username: u, password: p}", "{username: u}")}, "both 'username' and 'password'"),
     ({"cisco_ios": SHELL + "containerlab: {kinds: {cisco_xrd: {}}}\n"}, "already mapped by"),
     ({"cisco_ios": "version: 1\nname: X\nextends: nope\n"}, "extends 'nope'"),

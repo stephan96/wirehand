@@ -22,6 +22,11 @@ change:
   finish: save
   rollback_last: null
   balance_end: false
+  # Closing lines models like to add. The tool leaves config mode itself, and on
+  # a committing platform leaving with uncommitted changes makes the device ask
+  # first - so a trailing end/exit is dropped (the preview says so).
+  drop_trailing:
+    - '^(end|exit)$'
   # Matched against every line of a config change. The CLI accepts any
   # unambiguous abbreviation, so a verb is its shortest distinctive prefix plus
   # [a-z]*; '(\s|$)' keeps config words that merely start the same way

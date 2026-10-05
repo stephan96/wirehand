@@ -41,7 +41,7 @@ _KEYS = {
     "device": {"version", "name", "extends", "facts", "snapshot", "session", "change",
                "comment_prefixes", "prompts", "containerlab"},
     "session": {"enable", "prep"},
-    "change": {"apply", "finish", "rollback_last", "balance_end", "refuse_in_config"},
+    "change": {"apply", "finish", "rollback_last", "balance_end", "refuse_in_config", "drop_trailing"},
     "refuse_in_config": {"reason", "patterns"},
     "containerlab": {"kinds"},
     "prompt": {"pattern", "proceed", "abort", "note"},
@@ -78,6 +78,7 @@ class Platform:
     balance_end: bool
     refuse: tuple[re.Pattern[str], ...]
     refuse_reason: str
+    drop_trailing: tuple[re.Pattern[str], ...]
     comment_prefixes: tuple[str, ...]
     prompts: tuple[Prompt, ...]         # own first, then common.yaml's
     kinds: dict[str, tuple[str, str] | None] = field(default_factory=dict)
@@ -95,6 +96,14 @@ class Platform:
     def refused_lines(self, lines: list[str]) -> list[str]:
         """Lines of a config-mode change that refuse_in_config forbids."""
         return [ln for ln in lines if any(rx.search(ln.strip()) for rx in self.refuse)]
+
+    def split_trailing(self, lines: list[str]) -> tuple[list[str], list[str]]:
+        """(kept, dropped): trailing lines matching change.drop_trailing come off
+        the end of a config-mode change - the tool leaves config mode itself."""
+        end = len(lines)
+        while end and any(rx.search(lines[end - 1].strip()) for rx in self.drop_trailing):
+            end -= 1
+        return lines[:end], lines[end:]
 
 
 @dataclass(frozen=True)
@@ -226,9 +235,9 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
     if apply == "shell":
         if finish != "none":
             raise PlatformError(f"{file}: change.apply 'shell' has no commit step - set change.finish: none")
-        if balance_end or "refuse_in_config" in change:
-            raise PlatformError(f"{file}: change.balance_end and change.refuse_in_config only apply "
-                                "to change.apply: config_set")
+        if balance_end or "refuse_in_config" in change or "drop_trailing" in change:
+            raise PlatformError(f"{file}: change.balance_end, change.refuse_in_config and "
+                                "change.drop_trailing only apply to change.apply: config_set")
     else:
         # The guard is what keeps 'end' + 'reload' from running in exec mode in the
         # middle of a config change - a config_set platform without one is a
@@ -246,6 +255,10 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
         refuse = tuple(_compile(p, f"{file}: change.refuse_in_config.patterns[{i}]")
                        for i, p in enumerate(pats))
         reason = reason.strip()
+    drop = change.get("drop_trailing") or []
+    if not isinstance(drop, list):
+        raise PlatformError(f"{file}: change.drop_trailing must be a list of patterns")
+    drop = tuple(_compile(p, f"{file}: change.drop_trailing[{i}]") for i, p in enumerate(drop))
     if rollback and finish == "none":
         raise PlatformError(f"{file}: change.rollback_last undoes a commit, but change.finish is "
                             "'none' - this platform has no commits to roll back")
@@ -259,7 +272,7 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
         device_type=dt, name=name.strip(), facts=facts,
         snapshot=snapshot.strip() if snapshot else None,
         enable=enable, prep=prep, apply=apply, finish=finish, rollback_last=rollback,
-        balance_end=balance_end, refuse=refuse, refuse_reason=reason,
+        balance_end=balance_end, refuse=refuse, refuse_reason=reason, drop_trailing=drop,
         comment_prefixes=prefixes, prompts=prompts, sources=sources,
     )
 

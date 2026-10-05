@@ -26,6 +26,11 @@ change:
   finish: save
   rollback_last: null
   balance_end: false
+  # Closing lines models like to add. The tool leaves config mode itself, and on
+  # a committing platform leaving with uncommitted changes makes the device ask
+  # first - so a trailing return/quit is dropped (the preview says so).
+  drop_trailing:
+    - '^(return|quit)$'
   # Matched against every line of a change made in system-view. 'quit' and
   # 'return' only leave a view, so they are allowed.
   refuse_in_config:

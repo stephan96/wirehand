@@ -479,6 +479,7 @@ rejected when the inventory loads, and every file needs its counterpart in
 | `change.finish` | after `config_set`: `commit`, `save`, or `none` (FortiOS blocks close themselves) |
 | `change.rollback_last` | native rollback of the last commit, or `null` (snapshot only) |
 | `change.balance_end` | append missing `end` lines to open `config` blocks (FortiOS) |
+| `change.drop_trailing` | trailing lines dropped from a config change (`end`, `return`, `exit`) - the tool leaves config mode itself, and the preview names what was dropped |
 | `change.refuse_in_config` | lines a config change must not contain (they leave config mode, commit or reboot), with the reason shown to the model |
 | `prompts` | device questions and the answers to them; shared ones in `common.yaml` |
 | `comment_prefixes` | lines of a proposed change that are dropped as comments (`#`, `!`) |

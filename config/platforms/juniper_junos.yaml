@@ -24,6 +24,11 @@ change:
     - rollback 1
     - commit and-quit
   balance_end: false
+  # Closing lines models like to add. The tool leaves config mode itself, and on
+  # a committing platform leaving with uncommitted changes makes the device ask
+  # first - so a trailing exit/quit/top is dropped (the preview says so).
+  drop_trailing:
+    - '^(exit(\s+configuration-mode)?|quit|top)$'
   # Matched against every line of a change made in configuration mode ('set ...'
   # statements). 'top'/'up'/'exit' only move within the hierarchy, so they are
   # allowed unless they carry one of the commands below.

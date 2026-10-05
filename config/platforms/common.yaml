@@ -42,6 +42,9 @@
 #     refuse_in_config:                      required with apply: config_set
 #       reason: <shown to the model>
 #       patterns: ['<regex>', ...]           a config line matching one is refused
+#     drop_trailing: ['<regex>', ...]        trailing lines matching one are dropped from
+#                                            a config change ('end' - the tool leaves
+#                                            config mode itself)
 #   comment_prefixes: ['#', ...]             optional, replaces the value below
 #   prompts: [...]                           optional, checked before the ones below
 #   containerlab:
