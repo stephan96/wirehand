@@ -42,6 +42,47 @@ def test_platform_prompts_come_before_the_common_ones():
     assert pending_prompt("Commit? [yes,no] (yes)", "no_such_type")[1] == "yes"   # falls back to common
 
 
+
+# --- refuse_in_config: what a config change must not contain ----------------
+CISCO_REFUSED = ["end", "conf t", "config t", "configure terminal", "commit", "comm", "wr", "write mem",
+                 "reload", "relo", "reboot", "do write", "do reload", "  END  "]
+CISCO_ALLOWED = ["interface Gi0/0", " description uplink", "config-register 0x2102", "wrr-queue bandwidth 1 2",
+                 "controller T1 0/0/0", "comment", "end-policy", "endif", "router bgp 65000",
+                 " no shutdown", "domain-name lab", "delay 10"]
+GUARDS = {
+    "cisco_ios": (CISCO_REFUSED, CISCO_ALLOWED),
+    "cisco_xe": (CISCO_REFUSED, CISCO_ALLOWED),
+    "cisco_nxos": (CISCO_REFUSED + ["copy run start", "delete bootflash:x"], CISCO_ALLOWED),
+    "arista_eos": (CISCO_REFUSED + ["copy run start", "delete flash:x"], CISCO_ALLOWED),
+    "cisco_xr": (CISCO_REFUSED + ["abort", "commit replace"], CISCO_ALLOWED + ["control-plane", "commit-x"]),
+    "huawei": (["return", "ret", "run display version", "save", "sa", "reboot", "commit"],
+               ["sysname r1", "interface GE1/0/0", " ip address 10.0.0.1 24", "quit", "undo shutdown", "retry 3"]),
+    "huawei_vrpv8": (["return", "run reset ospf process 1", "commit", "save"],
+                     ["sysname r1", "quit", "ospf 1", " area 0"]),
+    "juniper_junos": (["commit", "commit and-quit", "rollback 1", "load override x", "run request system reboot",
+                       "top run show version", "up 2 commit", "exit", "quit configuration-mode"],
+                      ["set interfaces ge-0/0/0 description x", "delete protocols ospf", "top", "up 2",
+                       "set system commit synchronize"]),
+    "fortinet": (["execute reboot", "exe factoryreset", "diagnose sys kill 11 1", "diag sys kill", "sudo x",
+                  "fnsysctl ls", "reboot"],
+                 ["config system global", "set hostname fgt", "end", "edit 1", "next", "show", "get system status"]),
+}
+
+
+@pytest.mark.parametrize("dt", sorted(GUARDS))
+def test_config_change_guards(dt):
+    p = platforms.get(dt)
+    refused, allowed = GUARDS[dt]
+    for line in refused:
+        assert p.refused_lines([line]) == [line], (dt, line)
+    for line in allowed:
+        assert p.refused_lines([line]) == [], (dt, line)
+
+
+def test_every_config_set_platform_has_guard_tests():
+    assert set(GUARDS) == {dt for dt in platforms.known() if not platforms.get(dt).shell}
+
+
 # --- loader: a minimal tree, then one defect at a time ----------------------
 COMMON = """
 version: 1

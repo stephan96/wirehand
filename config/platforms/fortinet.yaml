@@ -24,11 +24,16 @@ change:
   rollback_last: null
   # A block without its 'end' is never applied: missing ends are appended.
   balance_end: true
-  # 'config' and 'end' are how FortiOS changes are written, so they are allowed here.
+  # FortiOS has no config mode: every line runs at the top level, so these are
+  # what a change could otherwise execute. 'config' and 'end' are how FortiOS
+  # changes are written, so they are allowed here.
   refuse_in_config:
-    reason: not allowed in a config change
+    reason: not allowed in a config change - use mode='exec' for operational commands
     patterns:
-      - '^(execute|reload|reboot)(\s|$)'
+      - '^exe[a-z]*(\s|$)'            # execute (reboot, factoryreset, ...)
+      - '^dia[a-z]*(\s|$)'            # diagnose (sys kill, ...)
+      - '^(sudo|fnsysctl)(\s|$)'
+      - '^(reload|reboot)(\s|$)'
 
 containerlab:
   kinds:

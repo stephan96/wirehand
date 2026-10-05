@@ -484,6 +484,13 @@ rejected when the inventory loads, and every file needs its counterpart in
 | `comment_prefixes` | lines of a proposed change that are dropped as comments (`#`, `!`) |
 | `containerlab.kinds` | the containerlab kinds that map to this `device_type`, with their default credentials |
 
+`refuse_in_config` is matched against every line of a config-mode change. CLIs accept
+abbreviations, so a verb is written as its shortest distinctive prefix plus `[a-z]*` (`wr`
+is `write`), and `(\s|$)` keeps config words that only start the same way
+(`config-register`, `end-policy`, `sysname`) out of it. The point is less the verbs
+themselves than what follows them: after an `end` or `return`, every remaining line of the
+change runs in exec/user view - where `reload` reboots.
+
 `extends: cisco_ios` lets a file start from another one and override only what differs
 (that is all `cisco_xe.yaml` does). `change.apply` and `change.finish` name behaviours that
 are implemented in code - a new platform that fits one of them needs no Python; one that
@@ -502,8 +509,11 @@ change:
   finish: commit
   rollback_last: [rollback configuration last 1]
   refuse_in_config:
-    reason: the tool handles mode changes and commit
-    patterns: ['^(commit|end|configure|conf|write|reload|reboot)(\s|$)']
+    reason: the tool enters and leaves system-view and commits/saves itself, ...
+    patterns:
+      - '^ret(u(rn?)?)?(\s|$)'        # return: back to user view, later lines would run there
+      - '^run(\s|$)'                  # 'run <cmd>' runs a user-view command from system-view
+      - '^com(m(it?)?)?(\s|$)'        # commit
 containerlab:
   kinds:
     huawei_vrp: {username: admin, password: admin}

@@ -24,10 +24,16 @@ change:
     - rollback 1
     - commit and-quit
   balance_end: false
+  # Matched against every line of a change made in configuration mode ('set ...'
+  # statements). 'top'/'up' only move within the hierarchy, so they are allowed
+  # unless they carry one of the commands below.
   refuse_in_config:
-    reason: the tool handles mode changes and commit
+    reason: the tool enters configuration mode and commits itself - write 'set'/'delete' statements only; use rollback_change for rollbacks and mode='exec' for operational commands
     patterns:
-      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+      - '^((top|up(\s+\d+)?)\s+)?run(\s|$)'                 # run <op command> from config mode
+      - '^((top|up(\s+\d+)?)\s+)?com(m(it?)?)?(\s|$)'       # commit
+      - '^((top|up(\s+\d+)?)\s+)?(rollback|load)(\s|$)'     # replace the candidate configuration
+      - '^(exit|quit)(\s|$)'          # leaves configuration mode: later lines would run in op mode
 
 containerlab:
   kinds:

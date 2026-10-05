@@ -26,10 +26,17 @@ change:
   finish: save
   rollback_last: null
   balance_end: false
+  # Matched against every line of a change made in system-view. 'quit' is NOT
+  # refused: it is how a block leaves an interface view and appears in nearly
+  # every Huawei snippet.
   refuse_in_config:
-    reason: the tool handles mode changes and commit
+    reason: the tool enters and leaves system-view and commits/saves itself, and user-view commands do not belong in a config change - use mode='exec' for maintenance commands
     patterns:
-      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+      - '^ret(u(rn?)?)?(\s|$)'        # return: back to user view, later lines would run there
+      - '^run(\s|$)'                  # 'run <cmd>' runs a user-view command from system-view
+      - '^com(m(it?)?)?(\s|$)'        # commit
+      - '^sa(ve?)?(\s|$)'             # save
+      - '^reb[a-z]*(\s|$)'            # reboot
 
 # No containerlab kind: clab's huawei_vrp is VRP8 (huawei_vrpv8.yaml). Map it here
 # per lab with 'containerlab.kinds' in inventory.yaml if you run VRP5 images.

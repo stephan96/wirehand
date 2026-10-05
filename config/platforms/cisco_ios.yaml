@@ -22,10 +22,20 @@ change:
   finish: save
   rollback_last: null
   balance_end: false
+  # Matched against every line of a config change. The CLI accepts any
+  # unambiguous abbreviation, so a verb is its shortest distinctive prefix plus
+  # [a-z]*; '(\s|$)' keeps config words that merely start the same way
+  # (config-register, wrr-queue, end-policy) out of it.
   refuse_in_config:
-    reason: the tool handles mode changes and commit
+    reason: the tool enters and leaves config mode and commits/saves itself, and exec commands do not belong in a config change - use mode='exec' for maintenance commands
     patterns:
-      - '^(commit|end|configure|conf|write|reload|reboot)(\s|$)'
+      - '^conf[a-z]*(\s|$)'           # conf t, config, configure
+      - '^end(\s|$)'                  # leaves config mode: later lines would run in exec mode
+      - '^com(m(it?)?)?(\s|$)'        # commit (not 'comment')
+      - '^wr[a-z]*(\s|$)'             # wr, write
+      - '^relo[a-z]*(\s|$)'           # reload
+      - '^reb[a-z]*(\s|$)'            # reboot
+      - '^do(\s|$)'                   # 'do <cmd>' runs an exec command from config mode
 
 containerlab:
   kinds:
