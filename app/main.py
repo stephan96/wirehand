@@ -327,6 +327,14 @@ def propose_change(body: ProposeIn) -> str:
         lines, dropped = plat.split_trailing(lines)
         if not lines:
             raise HTTPException(400, f"config is empty once {dropped} is dropped - the tool leaves config mode itself")
+        # In the middle of a change the same line leaves config mode with the change
+        # uncommitted; the device then asks whether to commit and the session hangs.
+        misplaced = plat.misplaced_lines(lines)
+        if misplaced:
+            raise HTTPException(400, (
+                f"{misplaced} is only allowed as the last line - in the middle of a change it leaves "
+                f"config mode with the change uncommitted. Remove it (the tool leaves config mode "
+                f"itself), or split the change into separate propose_change calls"))
         if plat.balance_end:
             # FortiOS applies a section only at 'end' - balance missing ends automatically.
             opens = sum(1 for ln in lines if ln.strip().lower().startswith("config "))

@@ -30,7 +30,11 @@ change:
   # a committing platform leaving with uncommitted changes makes the device ask
   # first - so a trailing end/exit is dropped (the preview says so).
   drop_trailing:
-    - '^(end|exit)$'
+    - '^exit$'
+  # ... and 'end' anywhere else is refused: it leaves config mode with the change
+  # uncommitted, XR asks whether to commit, and the session hangs at the question.
+  last_line_only:
+    - '^end$'
   # Matched against every line of a config change. The CLI accepts any
   # unambiguous abbreviation, so a verb is its shortest distinctive prefix plus
   # [a-z]*; '(\s|$)' keeps config words that merely start the same way

@@ -41,7 +41,8 @@ _KEYS = {
     "device": {"version", "name", "extends", "facts", "snapshot", "session", "change",
                "comment_prefixes", "prompts", "containerlab"},
     "session": {"enable", "prep"},
-    "change": {"apply", "finish", "rollback_last", "balance_end", "refuse_in_config", "drop_trailing"},
+    "change": {"apply", "finish", "rollback_last", "balance_end", "refuse_in_config", "drop_trailing",
+               "last_line_only"},
     "refuse_in_config": {"reason", "patterns"},
     "containerlab": {"kinds"},
     "prompt": {"pattern", "proceed", "abort", "note"},
@@ -79,6 +80,7 @@ class Platform:
     refuse: tuple[re.Pattern[str], ...]
     refuse_reason: str
     drop_trailing: tuple[re.Pattern[str], ...]
+    last_line_only: tuple[re.Pattern[str], ...]
     comment_prefixes: tuple[str, ...]
     prompts: tuple[Prompt, ...]         # own first, then common.yaml's
     kinds: dict[str, tuple[str, str] | None] = field(default_factory=dict)
@@ -98,12 +100,19 @@ class Platform:
         return [ln for ln in lines if any(rx.search(ln.strip()) for rx in self.refuse)]
 
     def split_trailing(self, lines: list[str]) -> tuple[list[str], list[str]]:
-        """(kept, dropped): trailing lines matching change.drop_trailing come off
-        the end of a config-mode change - the tool leaves config mode itself."""
+        """(kept, dropped): trailing lines matching change.drop_trailing or
+        change.last_line_only come off the end of a config-mode change - the tool
+        leaves config mode itself."""
+        drop = self.drop_trailing + self.last_line_only
         end = len(lines)
-        while end and any(rx.search(lines[end - 1].strip()) for rx in self.drop_trailing):
+        while end and any(rx.search(lines[end - 1].strip()) for rx in drop):
             end -= 1
         return lines[:end], lines[end:]
+
+    def misplaced_lines(self, lines: list[str]) -> list[str]:
+        """Lines matching change.last_line_only that are NOT at the end (call it
+        on what split_trailing kept)."""
+        return [ln for ln in lines if any(rx.search(ln.strip()) for rx in self.last_line_only)]
 
 
 @dataclass(frozen=True)
@@ -166,6 +175,14 @@ def _compile(pattern, where: str, suffix: str = "") -> re.Pattern[str]:
         return re.compile(pattern + suffix, re.IGNORECASE)
     except re.error as exc:
         raise PlatformError(f"{where}: invalid regular expression {pattern!r}: {exc}") from None
+
+
+def _pattern_list(value, where: str) -> tuple[re.Pattern[str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise PlatformError(f"{where}: must be a list of patterns")
+    return tuple(_compile(p, f"{where}[{i}]") for i, p in enumerate(value))
 
 
 def _prompts(value, where: str) -> tuple[Prompt, ...]:
@@ -235,9 +252,9 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
     if apply == "shell":
         if finish != "none":
             raise PlatformError(f"{file}: change.apply 'shell' has no commit step - set change.finish: none")
-        if balance_end or "refuse_in_config" in change or "drop_trailing" in change:
-            raise PlatformError(f"{file}: change.balance_end, change.refuse_in_config and "
-                                "change.drop_trailing only apply to change.apply: config_set")
+        if balance_end or {"refuse_in_config", "drop_trailing", "last_line_only"} & set(change):
+            raise PlatformError(f"{file}: change.balance_end, change.refuse_in_config, change.drop_trailing "
+                                "and change.last_line_only only apply to change.apply: config_set")
     else:
         # The guard is what keeps 'end' + 'reload' from running in exec mode in the
         # middle of a config change - a config_set platform without one is a
@@ -255,10 +272,8 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
         refuse = tuple(_compile(p, f"{file}: change.refuse_in_config.patterns[{i}]")
                        for i, p in enumerate(pats))
         reason = reason.strip()
-    drop = change.get("drop_trailing") or []
-    if not isinstance(drop, list):
-        raise PlatformError(f"{file}: change.drop_trailing must be a list of patterns")
-    drop = tuple(_compile(p, f"{file}: change.drop_trailing[{i}]") for i, p in enumerate(drop))
+    drop, last = (_pattern_list(change.get(key), f"{file}: change.{key}")
+                  for key in ("drop_trailing", "last_line_only"))
     if rollback and finish == "none":
         raise PlatformError(f"{file}: change.rollback_last undoes a commit, but change.finish is "
                             "'none' - this platform has no commits to roll back")
@@ -272,7 +287,7 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
         device_type=dt, name=name.strip(), facts=facts,
         snapshot=snapshot.strip() if snapshot else None,
         enable=enable, prep=prep, apply=apply, finish=finish, rollback_last=rollback,
-        balance_end=balance_end, refuse=refuse, refuse_reason=reason, drop_trailing=drop,
+        balance_end=balance_end, refuse=refuse, refuse_reason=reason, drop_trailing=drop, last_line_only=last,
         comment_prefixes=prefixes, prompts=prompts, sources=sources,
     )
 

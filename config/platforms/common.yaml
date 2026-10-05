@@ -45,6 +45,9 @@
 #     drop_trailing: ['<regex>', ...]        trailing lines matching one are dropped from
 #                                            a config change ('end' - the tool leaves
 #                                            config mode itself)
+#     last_line_only: ['<regex>', ...]       dropped at the end like drop_trailing, but
+#                                            refused anywhere else ('end' in the middle
+#                                            leaves config mode uncommitted)
 #   comment_prefixes: ['#', ...]             optional, replaces the value below
 #   prompts: [...]                           optional, checked before the ones below
 #   containerlab:

@@ -94,6 +94,21 @@ def test_trailing_mode_exits_are_dropped(dt, lines, kept):
     assert got == kept and got + dropped == lines
 
 
+@pytest.mark.parametrize("dt, lines, misplaced", [
+    ("cisco_xr", ["interface Lo1", "end", "interface Lo2"], ["end"]),
+    ("cisco_xr", ["interface Lo1", " exit", "interface Lo2"], []),          # exit only moves up
+    ("cisco_ios", ["interface Lo1", "end-policy", "endif"], []),
+    ("huawei_vrpv8", ["interface LoopBack1", "return", "sysname r1"], ["return"]),
+    ("huawei_vrpv8", ["interface LoopBack1", "quit", "sysname r1"], []),
+    ("juniper_junos", ["set a", "exit", "set b"], []),
+    ("fortinet", ["config system global", "end", "config system dns", "end"], []),
+])
+def test_mode_exits_only_as_the_last_line(dt, lines, misplaced):
+    p = platforms.get(dt)
+    kept, _ = p.split_trailing(lines + ["end" if dt != "huawei_vrpv8" else "return"])
+    assert p.misplaced_lines(kept) == misplaced
+
+
 def test_every_config_set_platform_has_guard_tests():
     assert set(GUARDS) == {dt for dt in platforms.known() if not platforms.get(dt).shell}
 
