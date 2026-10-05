@@ -25,7 +25,6 @@ class Device:
     device_type: str
     username: str
     password: str | None = None
-    key_file: str | None = None
     secret: str | None = None
     port: int = 22
     access: str = "ro"  # ro | rw
@@ -76,9 +75,6 @@ class Device:
             _d = _os.environ.get("WIREHAND_DATA", "/app/data")
             kw["session_log"] = f"{_d}/session-{self.name}.log"
             kw["session_log_file_mode"] = "append"
-        if self.key_file:
-            kw["use_keys"] = True
-            kw["key_file"] = self.key_file
         if self.password:
             kw["password"] = self.password
         if self.secret:

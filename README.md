@@ -268,8 +268,7 @@ including the ones the example above leaves at their default.
 | `host` | *required* | IP or hostname; resolved inside the container |
 | `device_type` | *required* | Netmiko driver, see the list below |
 | `username` | *required* | the account the LLM effectively works as |
-| `password` | - | omit entirely when using `key_file` |
-| `key_file` | - | private key **inside the container** - see below |
+| `password` | - | SSH password |
 | `secret` | - | enable password; used on `cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos` |
 | `port` | `22` | SSH port |
 | `timeout` | `30` | seconds Netmiko waits for a single command |
@@ -281,8 +280,7 @@ including the ones the example above leaves at their default.
 `device_type` is the Netmiko driver: `linux`, `cisco_ios`, `cisco_xe`, `cisco_xr`,
 `cisco_nxos`, `huawei`, `huawei_vrpv8`, `fortinet`, `arista_eos`, `juniper_junos`.
 
-`env:VARNAME` works for `username`, `password` and `secret`. It does **not** work for
-`key_file`, which is a path rather than a credential.
+`env:VARNAME` works for `username`, `password` and `secret`.
 
 `secret` is only consulted on platforms whose `config/platforms/` file sets
 `session.enable: true` (`cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos`) - it triggers
@@ -295,33 +293,10 @@ key it choked on and the keys that do exist:
 
 ```
 device 'core-sw1': unknown key(s) passwrod. Known keys: access, confirm, description,
-device_type, host, key_file, password, port, secret, tags, timeout, username
+device_type, host, password, port, secret, tags, timeout, username
 ```
 
 A missing `host`, `device_type` or `username` fails the same way.
-
-### Key-based authentication
-
-`key_file` is a path *in the container*, and only two host paths are mounted: `./config`
-(read-only) and `WIREHAND_CLAB_DIR`. So the key belongs in `config/` and is referenced as
-`/app/config/<name>`:
-
-```yaml
-edge-rtr1:
-  host: 192.0.2.30
-  device_type: cisco_xr
-  username: netops
-  key_file: /app/config/id_ed25519   # no 'password:' needed
-  access: ro
-```
-
-The container runs as `appuser` with the UID the image was built with
-(`--build-arg APP_UID=$(id -u)`), so the key file has to be readable by that UID -
-`chmod 600` plus matching ownership on the host.
-
-An encrypted key works: there is no `passphrase:` key, but Paramiko falls back to
-`password` for key decryption, so put the passphrase in `password:` (`env:` and all).
-Then `password` is the passphrase, not an SSH password - the device never sees it.
 
 Missing `env:` variables fail the whole inventory load at startup - deliberately
 (fail-fast beats a device with half-empty credentials). Remove dead references.

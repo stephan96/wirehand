@@ -1,7 +1,7 @@
 # ----------------------------------------------------------------------------
 # Manual devices. The LLM only sees: name, platform, access, description, tags.
 # Credentials: env:VARNAME -> resolved from the container environment (.env);
-#              works for username, password and secret (not for key_file).
+#              works for username, password and secret.
 # access: ro (default) | rw.
 # confirm: totp | off - who may approve a change on this device. Default comes from
 #          WIREHAND_CONFIRM_MODE; 'off' lets the model confirm its own proposal, so
@@ -35,16 +35,6 @@ devices:
   #   confirm: totp
   #   description: Core switch building A
   #   tags: [prod, campus]
-
-  # Key instead of password. The key has to be readable *inside* the container, and
-  # only ./config and WIREHAND_CLAB_DIR are mounted - so keep it in config/ and make
-  # it readable by the APP_UID the image was built with. Omit password entirely.
-  # edge-rtr1:
-  #   host: 192.0.2.30
-  #   device_type: cisco_xr
-  #   username: netops
-  #   key_file: /app/config/id_ed25519
-  #   access: ro
 
 # ----------------------------------------------------------------------------
 # Containerlab discovery (folder set via WIREHAND_CLAB_DIR). Every deployed lab

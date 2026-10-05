@@ -77,7 +77,7 @@ class _Session:
 
     def matches(self, device: Device) -> bool:
         """True if `device` would connect exactly like this session does.
-        Covers host, port, username, password, key and secret."""
+        Covers host, port, username, password and secret."""
         return self.device.netmiko_kwargs() == device.netmiko_kwargs()
 
 
