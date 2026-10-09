@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """Human approval for confirm_change.
 
 The problem this solves: the confirmation code from propose_change travels back

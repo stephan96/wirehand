@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """Safety primitives: write-blocklist, output filtering, truncation.
 
 The rule lists themselves live in config/safety/ - common.yaml plus one file

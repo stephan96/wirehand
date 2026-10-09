@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """SSH transport: one persistent Netmiko session per device, serialized with a
 lock, reaped after idle timeout. Keeps multi-step analysis from paying a full
 handshake on every tool call."""

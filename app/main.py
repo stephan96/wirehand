@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """wirehand: SSH-backed device analysis & change tool for LLM front-ends.
 
 "A hand on the wires" - the LLM works the devices through wirehand, wirehand keeps the glove on.
@@ -70,7 +72,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.5.5",
+    version="0.5.6",
+    license_info={"name": "Apache-2.0", "identifier": "Apache-2.0"},
     description=(
         "Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "

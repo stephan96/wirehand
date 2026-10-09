@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """Containerlab discovery.
 
 Scans WIREHAND_CLAB_DIR for deployed labs. containerlab writes a

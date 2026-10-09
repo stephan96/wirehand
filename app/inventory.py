@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """Inventory = manual devices (config/inventory.yaml) + auto-discovered
 containerlab nodes (WIREHAND_CLAB_DIR). Manual entries override discovered ones
 with the same name. Credentials may be given as `env:VARNAME`. The model only

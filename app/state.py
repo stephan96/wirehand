@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """Audit log and pending-change store.
 
 Audit: append-only JSONL at $WIREHAND_DATA/audit.jsonl. Never contains credentials.

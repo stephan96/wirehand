@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.title="wirehand" \
+      org.opencontainers.image.source="https://github.com/stephan96/wirehand" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 # Match the host user that owns the bind-mounted config (default uid/gid 1000).
 # Build with:  docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
 ARG APP_UID=1000
@@ -15,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # COPY --chown: otherwise host file modes (e.g. 600) carry over -> PermissionError as non-root
 COPY --chown=appuser:appuser app ./app
+COPY --chown=appuser:appuser LICENSE NOTICE ./
 
 RUN mkdir -p /app/data /app/config && chown -R appuser:appuser /app
 USER appuser
