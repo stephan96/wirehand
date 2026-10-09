@@ -945,6 +945,9 @@ and license notices, include the [NOTICE](NOTICE) file, and state which files yo
 changed. The license also grants a patent license from contributors and comes without
 warranty - see [LICENSE](LICENSE) for the exact terms.
 
+The license was added in version 0.5.6. All earlier versions are also available under
+Apache-2.0.
+
 Every Python source file carries an SPDX header (`SPDX-License-Identifier: Apache-2.0`),
 the Docker image has the label `org.opencontainers.image.licenses="Apache-2.0"` and
 ships `LICENSE` and `NOTICE` in `/app`, and `/openapi.json` reports the license under
