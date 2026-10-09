@@ -836,6 +836,10 @@ per-step limit **below** its deadline. Otherwise the step never ends on its own 
 (with a clean error), and the deadline always cuts it off with a 504. wirehand logs a
 warning at startup when that is the case.
 
+All six timeout settings above the inventory row can be set in `.env` (see
+`.env.example`); `docker-compose.yml` falls back to the defaults shown. After a change,
+run `docker compose up -d` - a plain `restart` does not reread `.env`.
+
 **How a hung call ends.** The device work runs in a worker thread. At the deadline the
 endpoint stops waiting and force-closes the connection that call is using, without
 waiting for the device's lock, which the hung call still holds. The hung call's next read
