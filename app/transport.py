@@ -24,6 +24,14 @@ class AuthError(RuntimeError):
     credentials have been corrected, the device is usable again and must be
     retried normally."""
 
+
+class OutcomeUnknown(RuntimeError):
+    """A change command failed after it was sent. Whether the device applied it
+    is unknown - the caller must neither report success nor retry blindly."""
+
+    def __init__(self, device: str, what: str, exc: BaseException):
+        super().__init__(f"{what} on {device} failed after it was sent: {type(exc).__name__}: {exc}")
+
 from . import platforms
 from .inventory import Device, RESCAN_SECONDS
 
@@ -117,7 +125,7 @@ class Pool:
         threading.Thread(target=_worker, daemon=True, name="wirehand-close").start()
 
     def run(self, device: Device, commands: list[str], timeout: int = CMD_TIMEOUT,
-            prompts: str = "no") -> list[tuple[str, str]]:
+            prompts: str = "no", idempotent: bool = True) -> list[tuple[str, str]]:
         """Run exec-mode commands sequentially. Returns [(cmd, output)].
 
         `prompts` says what to do when a device answers with a question instead
@@ -126,6 +134,10 @@ class Pool:
                   session must not be left hanging at the question)
           "yes" - go ahead; only confirm_change uses this, where a human has
                   already approved the operation.
+
+        `idempotent=False` is for commands that change the device: a failed
+        command is NOT retried (it may have run already) and raises
+        OutcomeUnknown instead of turning into an error line in the output.
         """
         s = self._get(device)
         with s.lock:
@@ -137,6 +149,11 @@ class Pool:
                 except AuthError:
                     raise          # wrong credentials: an immediate retry cannot fix that
                 except Exception as first_exc:
+                    if not idempotent:
+                        # The command may have run. Running it again could apply it
+                        # twice; the session is in an unknown state either way.
+                        s.close()
+                        raise OutcomeUnknown(device.name, f"'{cmd}'", first_exc) from first_exc
                     # Pooled sessions can be half-dead (device-side idle timeout kills the
                     # TCP session, is_alive() does not notice). Reconnect and retry ONCE -
                     # read commands are idempotent, so this is safe.
@@ -213,6 +230,11 @@ class Pool:
                             out += "\n" + conn.save_config()
                 # A config session can end on a question too ('Save? [Y/N]').
                 out = self._settle(conn, device, out, CMD_TIMEOUT, "yes")
+            except AuthError:
+                raise
+            except Exception as exc:
+                s.close()
+                raise OutcomeUnknown(device.name, "the configuration change", exc) from exc
             finally:
                 s.last_used = time.time()
             return out

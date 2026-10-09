@@ -35,7 +35,7 @@ from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
 from .state import ChangeStore, audit, read_audit
 from .platforms import pending_prompt
-from .transport import AuthError, Pool, check_devices
+from .transport import AuthError, OutcomeUnknown, Pool, check_devices
 
 logging.basicConfig(level=os.environ.get("WIREHAND_LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("wirehand")
@@ -424,12 +424,23 @@ def confirm_change(
         if pc.mode in ("exec", "rollback"):
             # prompts="yes": a human approved this operation, so a device that asks
             # "Continue? [Y/N]" gets its answer instead of stalling the session.
-            out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120, prompts="yes"))
+            # idempotent=False: never re-send a change command after an error.
+            out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120, prompts="yes",
+                                                              idempotent=False))
         else:
             out = pool.configure(dev, pc.lines, commit=dev.platform.commits)
     except AuthError as exc:
         audit("auth_failed", dev.name, code=code)
         raise HTTPException(401, str(exc))
+    except OutcomeUnknown as exc:
+        # Something went wrong after the change reached the device: it may or may
+        # not have been applied. Saying "APPLIED" or "failed" would both be guesses.
+        audit("confirm_unknown", dev.name, code=code, mode=pc.mode, error=str(exc))
+        raise HTTPException(502, (
+            f"NOT CONFIRMED - OUTCOME UNKNOWN on {dev.name}: {exc}. The change may or may not have "
+            f"been applied. Do NOT retry confirm_change; the code {code} is used up. Verify the "
+            f"current state with run_read and report it to the user. The configuration from before "
+            f"this change was saved as {pc.snapshot_path}."))
     except Exception as exc:
         audit("confirm_change_error", dev.name, code=code, error=str(exc))
         raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. Snapshot {pc.snapshot_path} is available for rollback.")

@@ -27,9 +27,9 @@ RUNNING = "interface Loopback0\n ipv4 address 1.1.1.1/32\ninterface GigabitEther
 
 class FakePool:
     def __init__(self): self.configured = []
-    def run(self, dev, cmds, timeout=60, prompts="no"):
+    def run(self, dev, cmds, timeout=60, prompts="no", **kw):
         return [(c, RUNNING if "running" in c else f"out of {c} on {dev.name}") for c in cmds]
-    def configure(self, dev, lines, commit):
+    def configure(self, dev, lines, commit, **kw):
         self.configured.append((dev.name, lines, commit)); return "Commit complete"
     def close_all(self): pass
 
@@ -114,7 +114,7 @@ print("FORTINET BLOCKS OK")
 from app.transport import AuthError
 class AuthFailPool(FakePool):
     def __init__(self): FakePool.__init__(self); self.attempts = 0
-    def run(self, dev, cmds, timeout=60, prompts="no"):
+    def run(self, dev, cmds, timeout=60, prompts="no", **kw):
         if dev.name == "s1":
             self.attempts += 1
             raise AuthError("AUTHENTICATION FAILED for 's1' (linux, user 'u'). "
@@ -217,7 +217,7 @@ STUCK = ("Warning: This operation will revert configuration changes to the previ
 class StuckPool(FakePool):
     """A pool whose devices ask and never get an answer (unknown prompt)."""
     def __init__(self): FakePool.__init__(self); self.reset_called = []
-    def run(self, dev, cmds, timeout=60, prompts="no"):
+    def run(self, dev, cmds, timeout=60, prompts="no", **kw):
         return [(c, RUNNING if "running" in c else STUCK) for c in cmds]
     def reset(self, dev): self.reset_called.append(dev.name)
 
