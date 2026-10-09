@@ -211,3 +211,179 @@ def test_busy_confirm_keeps_the_change_staged(held):
     r = client.post("/confirm_change", params={"code": code}, headers=H)   # retry later works
     assert r.status_code == 200 and "ROLLED BACK" in r.text, r.text
     s.lock.acquire()
+
+
+# ------------------------------------------------------------ deadlines ---
+
+from types import SimpleNamespace  # noqa: E402
+
+from app.transport import Budget, DeadlineExceeded  # noqa: E402
+
+DEADLINE = 1.0     # stands in for the 60s default, so the suite stays fast
+
+
+class HungConn(FakeConn):
+    """Hangs on any command containing `hang_on` and ignores read_timeout, like
+    a device that stopped answering in the middle of a step that has no timeout
+    of its own (save_config). Only abort() taking the channel away ends it."""
+    def __init__(self, hang_on):
+        super().__init__()
+        self.hang_on = hang_on
+        self.channel = SimpleNamespace(remote_conn=object())
+        self.remote_conn_pre = SimpleNamespace(close=lambda: None)
+
+    def _hang(self):
+        end = time.monotonic() + 30
+        while time.monotonic() < end:
+            if self.channel.remote_conn is None:
+                raise OSError("Attempt to read, but there is no active channel.")
+            time.sleep(0.01)
+
+    def send_command(self, cmd, **kw):
+        self.sent.append(cmd)
+        if self.hang_on in cmd:
+            self._hang()
+        return f"ok {cmd}"
+
+    def send_config_set(self, lines, **kw):
+        self.sent.extend(lines)
+        return ""
+
+    def commit(self, read_timeout=120.0):
+        self.sent.append("commit")
+        if self.hang_on == "commit":
+            self._hang()
+        return "committed"
+
+    def exit_config_mode(self):
+        pass
+
+
+@pytest.fixture
+def hung(pool, monkeypatch):
+    monkeypatch.setattr(transport, "MIN_STEP", 0.05)
+    for name in ("DEADLINE_READ", "DEADLINE_PROPOSE", "DEADLINE_CONFIRM"):
+        monkeypatch.setattr(main, name, DEADLINE)
+    main.pool = pool
+
+    def hang_on(word):
+        pool._get(_dev()).conn = conn = HungConn(word)
+        return conn
+    pool.hang_on = hang_on
+    return pool
+
+
+def _lock_freed(pool, within=2.0):
+    """The hung worker must end and release the device's lock after the abort."""
+    s = pool._get(_dev())
+    if not s.lock.acquire(timeout=within):
+        return False
+    s.lock.release()
+    return True
+
+
+@pytest.mark.parametrize("hang_on, staging", [
+    ("rollback", ("/rollback_change", {"params": {"device": "r1"}})),
+    ("commit", ("/propose_change", {"json": {"device": "r1", "config": "interface Loopback1"}})),
+])
+def test_hung_confirm_is_504_outcome_unknown(hung, hang_on, staging):
+    hung.hang_on("nothing yet")
+    path, kw = staging
+    code = _staged(path, **kw)
+    hung.hang_on(hang_on)
+    t0 = time.monotonic()
+    r = client.post("/confirm_change", params={"code": code}, headers=H)
+    took = time.monotonic() - t0
+    assert r.status_code == 504, (r.status_code, r.text)
+    assert DEADLINE * 0.9 < took < DEADLINE + 1.5, took
+    assert "OUTCOME UNKNOWN on r1" in r.text and "Do NOT retry" in r.text and "run_read" in r.text
+    assert "used up" in r.text, "the text must say the staged change is consumed"
+    for word in ("APPLIED", "EXECUTED", "ROLLED BACK"):
+        assert word not in r.text, r.text
+    assert _lock_freed(hung)
+    log = _audit_events()
+    assert "confirm_timeout" in log and code in log
+    assert client.post("/confirm_change", params={"code": code}, headers=H).status_code == 404
+
+
+def test_hung_read_is_504_nothing_changed(hung):
+    hung.hang_on("show")
+    for path, params in [("/get_facts", {"device": "r1"}),
+                         ("/run_read", {"device": "r1", "commands": "show clock"})]:
+        t0 = time.monotonic()
+        r = client.get(path, params=params, headers=H)
+        assert r.status_code == 504 and "Nothing was changed" in r.text, (path, r.status_code, r.text)
+        assert time.monotonic() - t0 < DEADLINE + 1.5
+        assert _lock_freed(hung)
+        hung.hang_on("show")        # the abort took the channel away; hang again
+    assert "read_timeout" in _audit_events()
+
+
+def test_hung_snapshot_stages_nothing(hung):
+    hung.hang_on("running")
+    before = len(main.changes.list())
+    for path, kw in [("/propose_change", {"json": {"device": "r1", "config": "interface Loopback1"}}),
+                     ("/rollback_change", {"params": {"device": "r1"}})]:
+        r = client.post(path, headers=H, **kw)
+        assert r.status_code == 504 and "Nothing was staged" in r.text and "code:" not in r.text, r.text
+        assert _lock_freed(hung)
+        hung.hang_on("running")
+    assert len(main.changes.list()) == before
+    assert "propose_timeout" in _audit_events()
+
+
+def test_a_session_freed_by_abort_is_reused_after_reconnect(hung):
+    hung.hang_on("show")
+    assert client.get("/get_facts", params={"device": "r1"}, headers=H).status_code == 504
+    assert _lock_freed(hung)
+    r = client.get("/get_facts", params={"device": "r1"}, headers=H)   # reconnects (fresh FakeConn)
+    assert r.status_code == 200 and "ok show" in r.text, r.text
+
+
+class TimeoutRecorder(FakeConn):
+    def __init__(self):
+        super().__init__()
+        self.timeouts = []
+
+    def send_command(self, cmd, read_timeout=None, **kw):
+        self.timeouts.append(read_timeout)
+        return super().send_command(cmd)
+
+
+def test_steps_get_only_the_time_left(pool):
+    pool.first = conn = TimeoutRecorder()
+    pool._get(_dev()).conn = conn
+    pool.run(_dev(), ["show clock"], timeout=45, budget=Budget(5))
+    assert conn.timeouts[0] <= 5
+    pool.run(_dev(), ["show clock"], timeout=3, budget=Budget(60))
+    assert conn.timeouts[1] == 3
+
+
+def test_no_step_starts_after_the_deadline(pool):
+    b = Budget(10)
+    b.until = time.monotonic() - 1
+    with pytest.raises(DeadlineExceeded):
+        pool.run(_dev(), ["show clock"], budget=b)
+    assert pool.first.sent == []
+
+
+def test_commit_gets_an_explicit_read_timeout():
+    seen = {}
+
+    class XR:
+        def commit(self, confirm=False, read_timeout=120.0):
+            seen["xr"] = read_timeout
+            return ""
+
+    class Plain:            # e.g. a driver whose commit() takes no timeout at all
+        def commit(self):
+            seen["plain"] = True
+            return ""
+    Pool._commit(XR(), 12.5)
+    Pool._commit(Plain(), 12.5)
+    assert seen == {"xr": 12.5, "plain": True}
+
+
+def test_default_step_limits_are_below_the_deadlines():
+    for step, value, deadline, dname in main._step_limits():
+        assert value < deadline, (step, value, dname, deadline)

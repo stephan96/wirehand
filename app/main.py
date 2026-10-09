@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -35,13 +37,20 @@ from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
 from .state import ChangeStore, audit, read_audit
 from .platforms import pending_prompt
-from .transport import AuthError, DeviceBusy, OutcomeUnknown, Pool, check_devices
+from . import transport
+from .transport import (AuthError, Budget, DeadlineExceeded, DeviceBusy, OutcomeUnknown, Pool,
+                        check_devices)
 
 logging.basicConfig(level=os.environ.get("WIREHAND_LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("wirehand")
 
 API_KEY = os.environ.get("WIREHAND_API_KEY", "")
 MAX_OUT = int(os.environ.get("WIREHAND_MAX_OUTPUT_CHARS", DEFAULT_MAX_OUTPUT_CHARS))
+# Overall time limit per tool call, in seconds. The front-end's own tool timeout
+# must be longer, or it gives up first and never sees the 504.
+DEADLINE_READ = float(os.environ.get("WIREHAND_DEADLINE_READ", "60"))        # run_read, get_facts
+DEADLINE_PROPOSE = float(os.environ.get("WIREHAND_DEADLINE_PROPOSE", "60"))  # propose_change, rollback_change
+DEADLINE_CONFIRM = float(os.environ.get("WIREHAND_DEADLINE_CONFIRM", "60"))  # confirm_change
 
 inventory = Inventory()
 pool = Pool()
@@ -65,6 +74,10 @@ async def lifespan(app: FastAPI):
     log.info("platforms: %s (%s)", plats.summary(), plats.path)
     rules = safety.rules()   # raises RuleError -> startup fails, which is the point
     log.info("read-path safety rules: %s (%s)", rules.summary(), rules.path)
+    for step, value, deadline, dname in _step_limits():
+        if value >= deadline:
+            log.warning("%s=%gs is not below %s=%gs: that step never ends on its own timeout, the "
+                        "deadline cuts it off (504) instead", step, value, dname, deadline)
     log.info("loaded %d devices (inventory.yaml=%s, containerlab=%s)", len(inventory.all()), inventory.path, inventory.clab_dir or "off")
     yield
     pool.close_all()
@@ -113,6 +126,66 @@ def _fmt(device: str, results: list[tuple[str, str]], flt: str = "", context: in
         body = filter_lines(out, flt, context) if flt else out
         blocks.append(f"=== {device} : {cmd} ===\n{body.rstrip()}\n")
     return truncate("\n".join(blocks), MAX_OUT)
+
+
+def _step_limits():
+    """(step name, step seconds, deadline seconds, deadline name): every step
+    limit should be below the deadline it runs under."""
+    t = transport
+    return [
+        ("WIREHAND_CMD_TIMEOUT", t.CMD_TIMEOUT, DEADLINE_READ, "WIREHAND_DEADLINE_READ"),
+        ("WIREHAND_CMD_TIMEOUT", t.CMD_TIMEOUT, DEADLINE_PROPOSE, "WIREHAND_DEADLINE_PROPOSE"),
+        ("WIREHAND_CHANGE_CMD_TIMEOUT", t.CHANGE_CMD_TIMEOUT, DEADLINE_CONFIRM, "WIREHAND_DEADLINE_CONFIRM"),
+    ] + [("WIREHAND_LOCK_WAIT", t.LOCK_WAIT, d, n) for d, n in (
+        (DEADLINE_READ, "WIREHAND_DEADLINE_READ"), (DEADLINE_PROPOSE, "WIREHAND_DEADLINE_PROPOSE"),
+        (DEADLINE_CONFIRM, "WIREHAND_DEADLINE_CONFIRM"))]
+
+
+class ToolTimeout(Exception):
+    """The device work of a tool call did not finish within its deadline."""
+    def __init__(self, budget: Budget):
+        super().__init__(f"deadline of {budget.seconds:g}s reached")
+        self.seconds, self.elapsed, self.device = budget.seconds, budget.elapsed(), budget.device
+
+
+def _within(seconds: float, work):
+    """Run work(budget) in a worker thread and wait at most `seconds` for it.
+
+    On timeout the connection the worker is using is force-closed (Pool.abort),
+    so the worker fails, frees the device's lock and ends; the caller gets
+    ToolTimeout. Exceptions from the worker are re-raised here unchanged."""
+    budget = Budget(seconds)
+    fut: Future = Future()
+
+    def runner():
+        try:
+            fut.set_result(work(budget))
+        except BaseException as exc:
+            fut.set_exception(exc)
+    threading.Thread(target=runner, daemon=True, name="wirehand-call").start()
+    try:
+        return fut.result(timeout=seconds)
+    except (FutureTimeout, DeadlineExceeded):
+        pool.abort(budget)
+        raise ToolTimeout(budget) from None
+
+
+def _read_timeout(t: ToolTimeout, dev, tool: str, **fields) -> HTTPException:
+    name = t.device or dev.name
+    audit("read_timeout", name, tool=tool, seconds=round(t.elapsed, 1), **fields)
+    return HTTPException(504, (
+        f"TIMED OUT on {name} after {t.elapsed:.0f}s (deadline {t.seconds:g}s). Nothing was "
+        f"changed - this tool only reads. The connection was closed; the next call reconnects. "
+        f"Check the device with list_devices(check=true), or use a narrower command or a filter, "
+        f"before retrying."))
+
+
+def _propose_timeout(t: ToolTimeout, dev, tool: str) -> HTTPException:
+    audit("propose_timeout", dev.name, tool=tool, seconds=round(t.elapsed, 1))
+    return HTTPException(504, (
+        f"TIMED OUT on {dev.name} after {t.elapsed:.0f}s (deadline {t.seconds:g}s) while taking the "
+        f"configuration snapshot. Nothing was staged and nothing was applied - there is no "
+        f"confirmation code. Check the device with list_devices(check=true), then call {tool} again."))
 
 
 def _busy(dev, exc: DeviceBusy, **fields) -> HTTPException:
@@ -217,7 +290,9 @@ def get_facts(device: str = Query(..., description="Device name from list_device
     dev = _device(device)
     cmds = list(dev.platform.facts)
     try:
-        res = pool.run(dev, cmds)
+        res = _within(DEADLINE_READ, lambda b: pool.run(dev, cmds, budget=b))
+    except ToolTimeout as t:
+        raise _read_timeout(t, dev, "get_facts")
     except AuthError as exc:
         audit("auth_failed", dev.name)
         raise HTTPException(401, str(exc))
@@ -269,27 +344,37 @@ def run_read(
     if refused:
         msg = "; ".join(f"{d}: '{c}': {r}" for d, c, r in refused)
         raise HTTPException(403, f"refused on read path: {msg}")
-    out = []
-    for dev in devs:
-        try:
-            res = pool.run(dev, cmds)
-        except AuthError as exc:
-            audit("auth_failed", dev.name, commands=cmds)
-            out.append(f"=== {dev.name} ===\n[{exc}]\n")
-            continue
-        except DeviceBusy as exc:
-            if len(devs) == 1:
-                raise _busy(dev, exc, tool="run_read")
-            audit("device_busy", dev.name, tool="run_read")
-            out.append(f"=== {dev.name} ===\n[{exc}]\n")
-            continue
-        except RuntimeError as exc:
-            out.append(f"=== {dev.name} ===\n[connection error - device unreachable or not "
-                       f"responding: {exc}. Verify with list_devices(check=true) before retrying.]\n")
-            audit("run_read_error", dev.name, commands=cmds, error=str(exc))
-            continue
-        audit("run_read", dev.name, commands=cmds, filter=filter)
-        out.append(_fmt(dev.name, res, filter, context))
+
+    def work(budget):
+        out = []
+        for dev in devs:
+            try:
+                res = pool.run(dev, cmds, budget=budget)
+            except DeadlineExceeded:
+                raise
+            except AuthError as exc:
+                audit("auth_failed", dev.name, commands=cmds)
+                out.append(f"=== {dev.name} ===\n[{exc}]\n")
+                continue
+            except DeviceBusy as exc:
+                if len(devs) == 1:
+                    raise _busy(dev, exc, tool="run_read")
+                audit("device_busy", dev.name, tool="run_read")
+                out.append(f"=== {dev.name} ===\n[{exc}]\n")
+                continue
+            except RuntimeError as exc:
+                out.append(f"=== {dev.name} ===\n[connection error - device unreachable or not "
+                           f"responding: {exc}. Verify with list_devices(check=true) before retrying.]\n")
+                audit("run_read_error", dev.name, commands=cmds, error=str(exc))
+                continue
+            audit("run_read", dev.name, commands=cmds, filter=filter)
+            out.append(_fmt(dev.name, res, filter, context))
+        return out
+
+    try:
+        out = _within(DEADLINE_READ, work)
+    except ToolTimeout as t:
+        raise _read_timeout(t, devs[0], "run_read", commands=cmds)
     return truncate("\n".join(out), MAX_OUT)
 
 
@@ -360,7 +445,10 @@ def propose_change(body: ProposeIn) -> str:
 
     snap_cmd = plat.snapshot
     try:
-        snapshot = pool.run(dev, [snap_cmd])[0][1] if snap_cmd else "(no config snapshot on this platform; per-file backups are your responsibility - include them in the change, e.g. 'sudo cp /etc/x /etc/x.bak')"
+        snapshot = (_within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1] if snap_cmd
+                    else "(no config snapshot on this platform; per-file backups are your responsibility - include them in the change, e.g. 'sudo cp /etc/x /etc/x.bak')")
+    except ToolTimeout as t:
+        raise _propose_timeout(t, dev, "propose_change")
     except AuthError as exc:
         audit("auth_failed", dev.name)
         raise HTTPException(401, str(exc))
@@ -435,15 +523,27 @@ def confirm_change(
         pc = changes.pop(code)   # consume only once the approval holds
     except KeyError as exc:
         raise HTTPException(404, str(exc))
-    try:
+    def work(budget):
         if pc.mode in ("exec", "rollback"):
             # prompts="yes": a human approved this operation, so a device that asks
             # "Continue? [Y/N]" gets its answer instead of stalling the session.
             # idempotent=False: never re-send a change command after an error.
-            out = "\n".join(f"> {c}\n{o}" for c, o in pool.run(dev, pc.lines, timeout=120, prompts="yes",
-                                                              idempotent=False))
-        else:
-            out = pool.configure(dev, pc.lines, commit=dev.platform.commits)
+            res = pool.run(dev, pc.lines, timeout=transport.CHANGE_CMD_TIMEOUT, prompts="yes",
+                           idempotent=False, budget=budget)
+            return "\n".join(f"> {c}\n{o}" for c, o in res)
+        return pool.configure(dev, pc.lines, commit=dev.platform.commits, budget=budget)
+
+    try:
+        out = _within(DEADLINE_CONFIRM, work)
+    except ToolTimeout as t:
+        # No automatic rollback: wirehand cannot tell what the device did, and
+        # undoing a change that never landed is a change of its own.
+        audit("confirm_timeout", dev.name, code=code, mode=pc.mode, seconds=round(t.elapsed, 1))
+        raise HTTPException(504, (
+            f"OUTCOME UNKNOWN on {dev.name} after {t.elapsed:.0f}s (deadline {t.seconds:g}s). The "
+            f"change may or may not have been applied. Do NOT retry: the code {code} is used up and "
+            f"the staged change is gone. Verify the current state with run_read and report it to the "
+            f"user. The configuration from before this change was saved as {pc.snapshot_path}."))
     except AuthError as exc:
         audit("auth_failed", dev.name, code=code)
         raise HTTPException(401, str(exc))
@@ -524,7 +624,10 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
     # instead of applying on a single call.
     snap_cmd = dev.platform.snapshot
     try:
-        snapshot = pool.run(dev, [snap_cmd])[0][1] if snap_cmd else "(no config snapshot for this platform)"
+        snapshot = (_within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1] if snap_cmd
+                    else "(no config snapshot for this platform)")
+    except ToolTimeout as t:
+        raise _propose_timeout(t, dev, "rollback_change")
     except AuthError as exc:
         audit("auth_failed", dev.name)
         raise HTTPException(401, str(exc))
