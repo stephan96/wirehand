@@ -152,6 +152,14 @@ class _Session:
         if getattr(conn, "channel", None) is not None:
             conn.channel.remote_conn = None
 
+    def drop(self):
+        """close() for a session in an unknown state (a command failed or timed
+        out). A graceful disconnect first checks for config mode, which waits for
+        a prompt the busy device never sends (~10s seen on Linux after a step
+        timeout) - so take the channel away first, then close."""
+        self.abort()
+        self.close()
+
     def close(self):
         if self.conn is not None:
             try:
@@ -262,25 +270,25 @@ class Pool:
                     raise          # wrong credentials: an immediate retry cannot fix that
                 except Exception as first_exc:
                     if isinstance(first_exc, DeadlineExceeded):
-                        s.close()      # it may be sitting at a device question
+                        s.drop()      # it may be sitting at a device question
                         raise
                     if not idempotent:
                         # The command may have run. Running it again could apply it
                         # twice; the session is in an unknown state either way.
-                        s.close()
+                        s.drop()
                         raise OutcomeUnknown(device.name, f"'{cmd}'", first_exc) from first_exc
                     # Pooled sessions can be half-dead (device-side idle timeout kills the
                     # TCP session, is_alive() does not notice). Reconnect and retry ONCE -
                     # read commands are idempotent, so this is safe.
+                    s.drop()
+                    step = _step(budget, timeout)      # no retry once the deadline is (nearly) up
                     log.warning("%s: '%s' failed (%s), reconnecting and retrying once",
                                 device.name, cmd, type(first_exc).__name__)
-                    s.close()
-                    step = _step(budget, timeout)
                     conn = self._open_or_raise(s)
                     try:
                         out = self._send(conn, device, cmd, step, prompts, budget)
                     except Exception as exc:
-                        s.close()
+                        s.drop()
                         conn = None
                         if isinstance(exc, DeadlineExceeded):
                             raise
@@ -362,7 +370,7 @@ class Pool:
             except Exception as exc:
                 # Part of the change may be on the device, maybe uncommitted in
                 # config mode: never reuse this session.
-                s.close()
+                s.drop()
                 if isinstance(exc, DeadlineExceeded):
                     raise
                 raise OutcomeUnknown(device.name, "the configuration change", exc) from exc

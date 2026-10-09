@@ -174,7 +174,7 @@ def _read_timeout(t: ToolTimeout, dev, tool: str, **fields) -> HTTPException:
     name = t.device or dev.name
     audit("read_timeout", name, tool=tool, seconds=round(t.elapsed, 1), **fields)
     return HTTPException(504, (
-        f"TIMED OUT on {name} after {t.elapsed:.0f}s (deadline {t.seconds:g}s). Nothing was "
+        f"TIMED OUT on {name} after {t.elapsed:.1f}s (deadline {t.seconds:g}s). Nothing was "
         f"changed - this tool only reads. The connection was closed; the next call reconnects. "
         f"Check the device with list_devices(check=true), or use a narrower command or a filter, "
         f"before retrying."))
@@ -183,7 +183,7 @@ def _read_timeout(t: ToolTimeout, dev, tool: str, **fields) -> HTTPException:
 def _propose_timeout(t: ToolTimeout, dev, tool: str) -> HTTPException:
     audit("propose_timeout", dev.name, tool=tool, seconds=round(t.elapsed, 1))
     return HTTPException(504, (
-        f"TIMED OUT on {dev.name} after {t.elapsed:.0f}s (deadline {t.seconds:g}s) while taking the "
+        f"TIMED OUT on {dev.name} after {t.elapsed:.1f}s (deadline {t.seconds:g}s) while taking the "
         f"configuration snapshot. Nothing was staged and nothing was applied - there is no "
         f"confirmation code. Check the device with list_devices(check=true), then call {tool} again."))
 
@@ -540,7 +540,7 @@ def confirm_change(
         # undoing a change that never landed is a change of its own.
         audit("confirm_timeout", dev.name, code=code, mode=pc.mode, seconds=round(t.elapsed, 1))
         raise HTTPException(504, (
-            f"OUTCOME UNKNOWN on {dev.name} after {t.elapsed:.0f}s (deadline {t.seconds:g}s). The "
+            f"OUTCOME UNKNOWN on {dev.name} after {t.elapsed:.1f}s (deadline {t.seconds:g}s). The "
             f"change may or may not have been applied. Do NOT retry: the code {code} is used up and "
             f"the staged change is gone. Verify the current state with run_read and report it to the "
             f"user. The configuration from before this change was saved as {pc.snapshot_path}."))
