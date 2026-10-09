@@ -12,12 +12,12 @@
 - [Installation](#installation)
 - [Updating to a new version](#updating-to-a-new-version)
 - [Configuration](#configuration)
-- [Approving changes](#approving-changes)
 - [Connecting the front-ends](#connecting-the-front-ends)
 - [Where devices come from](#where-devices-come-from)
 - [containerlab kind mapping](#containerlab-kind-mapping)
 - [Reachability check and overlapping lab subnets](#reachability-check-and-overlapping-lab-subnets)
 - [Platform behavior for changes](#platform-behavior-for-changes)
+- [Approving changes](#approving-changes)
 - [Timeouts and unknown outcomes](#timeouts-and-unknown-outcomes)
 - [Audit log & snapshots](#audit-log--snapshots)
 - [Troubleshooting](#troubleshooting)
@@ -552,81 +552,6 @@ docker exec wirehand python -m app.platforms --lint   # or: python -m app.platfo
 Quote prompt answers and reasons that look like booleans (`'Y'`, `'yes'`, `'no'`) - YAML
 reads a bare `yes`/`no` as true/false, and the loader refuses that rather than guess.
 
-## Approving changes
-
-Wirehand refuses to let the model approve its own proposal, because that is the one thing
-it will eventually try. A real transcript (qwen3.6:35b-a3b):
-
-```
-propose_change(...) -> STAGED, NOT APPLIED. Confirmation code: 65C02D
-                       Ask the user to approve. Then call confirm_change(code='65C02D').
-Thought: Executing confirm_change...
-confirm_change(code='65C02D')
-```
-
-Nothing in a system prompt fixes this. The model is *told* to wait, and the code it needs
-is in its own context - instructions it can ignore, plus a secret it already has. So the
-approval is a **time-based one-time code (TOTP)** that only a human can read:
-
-| `WIREHAND_CONFIRM_MODE` | `confirm_change` needs | Use for |
-|---|---|---|
-| `totp` (default) | `code` **and** a fresh 6-digit code from your authenticator app | anything you care about |
-| `off` | `code` only - the model may apply its own proposal | disposable labs, unattended runs |
-
-`confirm: totp` / `confirm: off` per device in [`config/inventory.yaml`](#configinventoryyaml)
-overrides the global mode, so lab nodes can stay frictionless while real devices need a
-human. Containerlab nodes are discovered rather than listed, so theirs is set once for
-the whole fleet as `containerlab.default_confirm` - or per kind as
-`containerlab.kinds.<kind>.confirm`, which wins over it. Resolution order for any device:
-
-```
-device `confirm:`  >  kinds.<kind>.confirm  >  containerlab.default_confirm  >  WIREHAND_CONFIRM_MODE
-```
-
-Write `off` unquoted if you like: YAML turns it into a boolean and Wirehand accepts that
-spelling. Anything other than `totp`/`off` fails the inventory load at startup. Until
-0.5.2 that boolean was read as "unset" on the containerlab path, so a per-kind
-`confirm: off` was silently ignored and the node kept asking for a code.
-
-### Setting it up
-
-```bash
-docker exec wirehand python -m app.approval --new     # prints secret + otpauth:// URI
-$EDITOR .env                                          # WIREHAND_TOTP_SECRET=<the secret>
-docker compose up -d
-```
-
-Add the secret to an authenticator app (Aegis, FreeOTP, Google Authenticator, ...) by
-typing it or by scanning the URI - `qrencode -t ANSIUTF8 '<uri>'` turns it into a QR code
-in the terminal. The secret lives only in `.env` and the app; **no API endpoint ever
-returns it**, precisely so a front-end (and with it the model) cannot fetch it.
-
-### What a change looks like in the chat
-
-```
-you:   add a loopback on vrp1
-model: <calls propose_change, shows the preview and the code, then stops and asks>
-you:   734891                       <- read from the authenticator app
-model: <calls confirm_change(code='65C02D', approval='734891')>  -> APPLIED
-```
-
-A wrong or invented approval is refused with HTTP 403, logged as `confirm_denied`, and
-leaves the change staged so you can simply send the right number. Five failures within
-two minutes lock approvals for a while (`WIREHAND_APPROVAL_MAX_FAILURES`,
-`WIREHAND_APPROVAL_LOCKOUT`) - six digits are guessable if you may keep trying. Each code
-is consumed on use, so a model cannot reuse the number you read out a minute ago for a
-second change.
-
-You are not racing the 30-second clock: a code is still accepted for
-`WIREHAND_APPROVAL_MAX_AGE` seconds (default 120) after your app stopped showing it, because
-a local model can easily think for a minute before it calls `confirm_change`. Raise it if
-your model is slower than that; single use and the lockout keep a longer window cheap.
-Codes from the *next* step are accepted too (`WIREHAND_APPROVAL_SKEW_STEPS`, default 1), for
-a phone clock that runs slightly ahead.
-
-If the mode is `totp` and no usable secret is configured, `confirm_change` fails **closed**
-(HTTP 503) with setup instructions. Changes stop; nothing gets applied by accident.
-
 ## Connecting the front-ends
 
 ### Open WebUI
@@ -827,6 +752,81 @@ it never claims work that did not happen.
 IOS-XR needs neither: `rollback configuration last 1` runs there without asking. To teach
 wirehand a new question, add the pattern and its two answers to `prompts` - in
 `common.yaml`, or in one platform's file if only that platform asks it - and restart.
+
+## Approving changes
+
+Wirehand refuses to let the model approve its own proposal, because that is the one thing
+it will eventually try. A real transcript (qwen3.6:35b-a3b):
+
+```
+propose_change(...) -> STAGED, NOT APPLIED. Confirmation code: 65C02D
+                       Ask the user to approve. Then call confirm_change(code='65C02D').
+Thought: Executing confirm_change...
+confirm_change(code='65C02D')
+```
+
+Nothing in a system prompt fixes this. The model is *told* to wait, and the code it needs
+is in its own context - instructions it can ignore, plus a secret it already has. So the
+approval is a **time-based one-time code (TOTP)** that only a human can read:
+
+| `WIREHAND_CONFIRM_MODE` | `confirm_change` needs | Use for |
+|---|---|---|
+| `totp` (default) | `code` **and** a fresh 6-digit code from your authenticator app | anything you care about |
+| `off` | `code` only - the model may apply its own proposal | disposable labs, unattended runs |
+
+`confirm: totp` / `confirm: off` per device in [`config/inventory.yaml`](#configinventoryyaml)
+overrides the global mode, so lab nodes can stay frictionless while real devices need a
+human. Containerlab nodes are discovered rather than listed, so theirs is set once for
+the whole fleet as `containerlab.default_confirm` - or per kind as
+`containerlab.kinds.<kind>.confirm`, which wins over it. Resolution order for any device:
+
+```
+device `confirm:`  >  kinds.<kind>.confirm  >  containerlab.default_confirm  >  WIREHAND_CONFIRM_MODE
+```
+
+Write `off` unquoted if you like: YAML turns it into a boolean and Wirehand accepts that
+spelling. Anything other than `totp`/`off` fails the inventory load at startup. Until
+0.5.2 that boolean was read as "unset" on the containerlab path, so a per-kind
+`confirm: off` was silently ignored and the node kept asking for a code.
+
+### Setting it up
+
+```bash
+docker exec wirehand python -m app.approval --new     # prints secret + otpauth:// URI
+$EDITOR .env                                          # WIREHAND_TOTP_SECRET=<the secret>
+docker compose up -d
+```
+
+Add the secret to an authenticator app (Aegis, FreeOTP, Google Authenticator, ...) by
+typing it or by scanning the URI - `qrencode -t ANSIUTF8 '<uri>'` turns it into a QR code
+in the terminal. The secret lives only in `.env` and the app; **no API endpoint ever
+returns it**, precisely so a front-end (and with it the model) cannot fetch it.
+
+### What a change looks like in the chat
+
+```
+you:   add a loopback on vrp1
+model: <calls propose_change, shows the preview and the code, then stops and asks>
+you:   734891                       <- read from the authenticator app
+model: <calls confirm_change(code='65C02D', approval='734891')>  -> APPLIED
+```
+
+A wrong or invented approval is refused with HTTP 403, logged as `confirm_denied`, and
+leaves the change staged so you can simply send the right number. Five failures within
+two minutes lock approvals for a while (`WIREHAND_APPROVAL_MAX_FAILURES`,
+`WIREHAND_APPROVAL_LOCKOUT`) - six digits are guessable if you may keep trying. Each code
+is consumed on use, so a model cannot reuse the number you read out a minute ago for a
+second change.
+
+You are not racing the 30-second clock: a code is still accepted for
+`WIREHAND_APPROVAL_MAX_AGE` seconds (default 120) after your app stopped showing it, because
+a local model can easily think for a minute before it calls `confirm_change`. Raise it if
+your model is slower than that; single use and the lockout keep a longer window cheap.
+Codes from the *next* step are accepted too (`WIREHAND_APPROVAL_SKEW_STEPS`, default 1), for
+a phone clock that runs slightly ahead.
+
+If the mode is `totp` and no usable secret is configured, `confirm_change` fails **closed**
+(HTTP 503) with setup instructions. Changes stop; nothing gets applied by accident.
 
 ## Timeouts and unknown outcomes
 
