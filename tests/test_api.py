@@ -71,6 +71,8 @@ assert c.get("/run_read", params={"device": "r1,nope", "commands": "show version
 log = c.get("/get_audit_log", headers=H).text
 assert "propose_change" in log and "confirm_change" in log
 ops = [op["operationId"] for p_ in c.get("/openapi.json").json()["paths"].values() for op in p_.values()]
+info = c.get("/openapi.json").json()["info"]
+assert info["description"].startswith(f"wirehand {info['version']} - Tools to inspect"), info["description"]
 print("tools:", ops)
 print("OK")
 pre = c.options("/openapi.json", headers={"Origin": "http://llm-srv1:3000", "Access-Control-Request-Method": "GET"})
