@@ -555,8 +555,7 @@ def confirm_change(
                  if approver.requires_approval(dev.confirm) else "Call confirm_change again.")
         audit("device_busy", dev.name, tool="confirm_change", code=code)
         raise HTTPException(409, (
-            f"{exc} NOT APPLIED. The change is still staged as {pc.code} until it expires. Wait a "
-            f"minute, then retry. {again}"))
+            f"{exc} NOT APPLIED. The change is still staged as {pc.code} until it expires. {again}"))
     except OutcomeUnknown as exc:
         # Something went wrong after the change reached the device: it may or may
         # not have been applied. Saying "APPLIED" or "failed" would both be guesses.

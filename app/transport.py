@@ -34,6 +34,7 @@ class OutcomeUnknown(RuntimeError):
     def __init__(self, device: str, what: str, exc: BaseException):
         super().__init__(f"{what} on {device} failed after it was sent: {type(exc).__name__}: {exc}")
 
+
 class DeviceBusy(RuntimeError):
     """Another call held the device's session for longer than WIREHAND_LOCK_WAIT.
     Nothing was sent to the device."""
@@ -253,6 +254,8 @@ class Pool:
             results = []
             for cmd in commands:
                 step = _step(budget, timeout)
+                if conn is None:       # dropped after the previous command failed twice
+                    conn = self._open_or_raise(s)
                 try:
                     out = self._send(conn, device, cmd, step, prompts, budget)
                 except AuthError:
@@ -277,10 +280,12 @@ class Pool:
                     try:
                         out = self._send(conn, device, cmd, step, prompts, budget)
                     except Exception as exc:
+                        s.close()
+                        conn = None
+                        if isinstance(exc, DeadlineExceeded):
+                            raise
                         out = (f"[error running command (after reconnect+retry): "
                                f"{type(exc).__name__}: {exc}]")
-                        s.close()
-                        conn = self._open_or_raise(s)
                 results.append((cmd, out or ""))
             s.last_used = time.time()
             return results
