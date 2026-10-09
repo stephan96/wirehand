@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """Devices that ask before they act.
 
 Netmiko's send_command returns as soon as the output looks like a prompt, and

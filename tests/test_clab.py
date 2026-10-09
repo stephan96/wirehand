@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 import json, os, tempfile
 from pathlib import Path
 from app import clab

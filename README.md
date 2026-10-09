@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.5.5
+**Version:** 0.5.6 · **License:** [Apache-2.0](LICENSE)
 
 
 ## Summary
@@ -934,3 +934,21 @@ a chat, one process is fast enough.
 Every rule trades a little elegance for reliability: keep the model's choices few, its
 inputs simple, its outputs readable and bounded - and never rely on the model for
 anything that must not go wrong.
+
+## License
+
+Copyright 2026 Stephan Baenisch
+
+wirehand is licensed under the [Apache License, Version 2.0](LICENSE). You may use,
+modify and redistribute it, including commercially, as long as you keep the copyright
+and license notices, include the [NOTICE](NOTICE) file, and state which files you
+changed. The license also grants a patent license from contributors and comes without
+warranty - see [LICENSE](LICENSE) for the exact terms.
+
+Every Python source file carries an SPDX header (`SPDX-License-Identifier: Apache-2.0`),
+the Docker image has the label `org.opencontainers.image.licenses="Apache-2.0"` and
+ships `LICENSE` and `NOTICE` in `/app`, and `/openapi.json` reports the license under
+`info.license`.
+
+Unless stated otherwise, any contribution submitted for inclusion in wirehand is
+licensed under the same terms, without additional conditions (Apache-2.0, section 5).

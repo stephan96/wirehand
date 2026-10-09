@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """End-to-end API test with a fake SSH pool (no real devices)."""
 import os, sys, tempfile
 os.environ["WIREHAND_API_KEY"] = "k"

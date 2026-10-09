@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stephan Baenisch
+# SPDX-License-Identifier: Apache-2.0
 """Per-platform behaviour: what wirehand runs on each device_type and how it
 applies changes there.
 
