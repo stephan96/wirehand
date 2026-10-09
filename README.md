@@ -4,6 +4,26 @@
 
 **Version:** 0.6.0 · **License:** [Apache-2.0](LICENSE)
 
+## Contents
+
+- [Summary](#summary)
+- [How it works](#how-it-works)
+- [Key properties](#key-properties)
+- [Installation](#installation)
+- [Updating to a new version](#updating-to-a-new-version)
+- [Configuration](#configuration)
+- [Approving changes](#approving-changes)
+- [Connecting the front-ends](#connecting-the-front-ends)
+- [Where devices come from](#where-devices-come-from)
+- [containerlab kind mapping](#containerlab-kind-mapping)
+- [Reachability check and overlapping lab subnets](#reachability-check-and-overlapping-lab-subnets)
+- [Platform behavior for changes](#platform-behavior-for-changes)
+- [Timeouts and unknown outcomes](#timeouts-and-unknown-outcomes)
+- [Audit log & snapshots](#audit-log--snapshots)
+- [Troubleshooting](#troubleshooting)
+- [Tests](#tests)
+- [Design rules (why it looks the way it does)](#design-rules-why-it-looks-the-way-it-does)
+- [License](#license)
 
 ## Summary
 
