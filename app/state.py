@@ -106,6 +106,12 @@ class ChangeStore:
             raise KeyError(f"no pending change with code '{code}' (expired after {CHANGE_TTL}s, or already applied)")
         return pc
 
+    def restore(self, pc: PendingChange) -> None:
+        """Put a popped change back, unchanged (same code, same expiry) - for a
+        confirm_change that ended before anything was sent to the device."""
+        with self._lock:
+            self._pending.setdefault(pc.code, pc)
+
     def _purge(self):
         for k in [k for k, v in self._pending.items() if v.expired]:
             del self._pending[k]

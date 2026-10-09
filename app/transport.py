@@ -5,6 +5,7 @@ lock, reaped after idle timeout. Keeps multi-step analysis from paying a full
 handshake on every tool call."""
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
@@ -12,6 +13,7 @@ import time
 
 import socket
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
@@ -24,15 +26,71 @@ class AuthError(RuntimeError):
     credentials have been corrected, the device is usable again and must be
     retried normally."""
 
+
+class OutcomeUnknown(RuntimeError):
+    """A change command failed after it was sent. Whether the device applied it
+    is unknown - the caller must neither report success nor retry blindly."""
+
+    def __init__(self, device: str, what: str, exc: BaseException):
+        super().__init__(f"{what} on {device} failed after it was sent: {type(exc).__name__}: {exc}")
+
+
+class DeviceBusy(RuntimeError):
+    """Another call held the device's session for longer than WIREHAND_LOCK_WAIT.
+    Nothing was sent to the device."""
+
+
+class DeadlineExceeded(RuntimeError):
+    """The tool call's deadline ran out before the next step could start."""
+
 from . import platforms
 from .inventory import Device, RESCAN_SECONDS
 
 log = logging.getLogger("wirehand.transport")
 IDLE_SECONDS = int(os.environ.get("WIREHAND_IDLE_SECONDS", "300"))
-CMD_TIMEOUT = int(os.environ.get("WIREHAND_CMD_TIMEOUT", "60"))
+# Per-step limits. Each is also capped at the time left in the tool call's
+# deadline (Budget), and should stay below that deadline - see main.lifespan.
+CMD_TIMEOUT = int(os.environ.get("WIREHAND_CMD_TIMEOUT", "45"))          # one read command
+CHANGE_CMD_TIMEOUT = int(os.environ.get("WIREHAND_CHANGE_CMD_TIMEOUT", "45"))  # one change step
+# Seconds a call waits for another call on the same device to finish.
+LOCK_WAIT = float(os.environ.get("WIREHAND_LOCK_WAIT", "20"))
+# A step is not started with less time than this left in the deadline.
+MIN_STEP = 1.0
 # How often we answer a follow-up question for a single command before giving up.
 MAX_PROMPT_ANSWERS = 3
 pending_prompt = platforms.pending_prompt   # re-exported: callers ask transport
+
+
+class Budget:
+    """The time one tool call has left, and the handle to stop it: while the call
+    holds a session, the session's owner is this budget, so Pool.abort() closes
+    that call's connection and no other."""
+
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self.started = time.monotonic()
+        self.until = self.started + seconds
+        self.session: _Session | None = None    # the session the call holds right now
+
+    def left(self) -> float:
+        return self.until - time.monotonic()
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started
+
+    @property
+    def device(self) -> str:
+        return self.session.device.name if self.session else ""
+
+
+def _step(budget: Budget | None, seconds: float) -> float:
+    """Timeout for the next step: its own limit, but never past the deadline."""
+    if budget is None:
+        return seconds
+    left = budget.left()
+    if left < MIN_STEP:
+        raise DeadlineExceeded(f"deadline of {budget.seconds:g}s reached")
+    return min(seconds, left)
 
 
 class _Session:
@@ -40,10 +98,11 @@ class _Session:
         self.device = device
         self.lock = threading.Lock()
         self.conn = None
+        self.owner: Budget | None = None    # set while a call holds the lock
         self.last_used = 0.0
 
     def open(self):
-        if self.conn is not None and self.conn.is_alive():
+        if self.conn is not None and self._alive():
             return self.conn
         log.info("connecting to %s (%s)", self.device.name, self.device.device_type)
         self.conn = ConnectHandler(**self.device.netmiko_kwargs())
@@ -68,6 +127,38 @@ class _Session:
                 log.warning("%s: session prep '%s' failed (%s) - continuing",
                             self.device.name, cmd, type(exc).__name__)
         return self.conn
+
+    def _alive(self) -> bool:
+        try:
+            return self.conn.is_alive()
+        except Exception:       # e.g. a channel abort() took away
+            return False
+
+    def abort(self):
+        """Kill the connection under a call that is still running on it. Does NOT
+        take the lock - the hung call holds it. Closing the socket alone is not
+        enough: Netmiko polls a closed paramiko channel until its read_timeout
+        (recv_ready() just stays False), so the channel is taken away as well and
+        the call's next read or write raises. It then releases the lock, and the
+        next call reconnects."""
+        conn = self.conn
+        if conn is None:
+            return
+        try:
+            if getattr(conn, "remote_conn_pre", None) is not None:
+                conn.remote_conn_pre.close()
+        except Exception:
+            pass
+        if getattr(conn, "channel", None) is not None:
+            conn.channel.remote_conn = None
+
+    def drop(self):
+        """close() for a session in an unknown state (a command failed or timed
+        out). A graceful disconnect first checks for config mode, which waits for
+        a prompt the busy device never sends (~10s seen on Linux after a step
+        timeout) - so take the channel away first, then close."""
+        self.abort()
+        self.close()
 
     def close(self):
         if self.conn is not None:
@@ -116,8 +207,38 @@ class Pool:
                 s.close()
         threading.Thread(target=_worker, daemon=True, name="wirehand-close").start()
 
+    @staticmethod
+    @contextmanager
+    def _locked(s: _Session, budget: Budget | None):
+        """Hold the session's lock, waiting at most LOCK_WAIT for it. A call that
+        hangs on a device must not make every later call hang behind it."""
+        wait = _step(budget, LOCK_WAIT)
+        if not s.lock.acquire(timeout=wait):
+            raise DeviceBusy(
+                f"DEVICE BUSY: {s.device.name} is still working on another call (waited "
+                f"{wait:.0f}s). Nothing was sent to the device by this call. It can be retried "
+                f"in a minute.")
+        s.owner = budget
+        if budget is not None:
+            budget.session = s
+        try:
+            yield
+        finally:
+            s.owner = None
+            s.lock.release()
+
+    @staticmethod
+    def abort(budget: Budget) -> None:
+        """Force-close the connection the call with this budget is still using."""
+        s = budget.session
+        if s is not None and s.owner is budget:
+            log.warning("%s: call ran past its %gs deadline - closing the connection",
+                        s.device.name, budget.seconds)
+            s.abort()
+
     def run(self, device: Device, commands: list[str], timeout: int = CMD_TIMEOUT,
-            prompts: str = "no") -> list[tuple[str, str]]:
+            prompts: str = "no", idempotent: bool = True,
+            budget: Budget | None = None) -> list[tuple[str, str]]:
         """Run exec-mode commands sequentially. Returns [(cmd, output)].
 
         `prompts` says what to do when a device answers with a question instead
@@ -126,40 +247,64 @@ class Pool:
                   session must not be left hanging at the question)
           "yes" - go ahead; only confirm_change uses this, where a human has
                   already approved the operation.
+
+        `idempotent=False` is for commands that change the device: a failed
+        command is NOT retried (it may have run already) and raises
+        OutcomeUnknown instead of turning into an error line in the output.
+
+        `budget` caps the lock wait and every step at the time left in the tool
+        call's deadline; with none left, DeadlineExceeded is raised before the
+        next command is sent.
         """
         s = self._get(device)
-        with s.lock:
+        with self._locked(s, budget):
             conn = self._open_or_raise(s)
             results = []
             for cmd in commands:
+                step = _step(budget, timeout)
+                if conn is None:       # dropped after the previous command failed twice
+                    conn = self._open_or_raise(s)
                 try:
-                    out = self._send(conn, device, cmd, timeout, prompts)
+                    out = self._send(conn, device, cmd, step, prompts, budget)
                 except AuthError:
                     raise          # wrong credentials: an immediate retry cannot fix that
                 except Exception as first_exc:
+                    if isinstance(first_exc, DeadlineExceeded):
+                        s.drop()      # it may be sitting at a device question
+                        raise
+                    if not idempotent:
+                        # The command may have run. Running it again could apply it
+                        # twice; the session is in an unknown state either way.
+                        s.drop()
+                        raise OutcomeUnknown(device.name, f"'{cmd}'", first_exc) from first_exc
                     # Pooled sessions can be half-dead (device-side idle timeout kills the
                     # TCP session, is_alive() does not notice). Reconnect and retry ONCE -
                     # read commands are idempotent, so this is safe.
+                    s.drop()
+                    step = _step(budget, timeout)      # no retry once the deadline is (nearly) up
                     log.warning("%s: '%s' failed (%s), reconnecting and retrying once",
                                 device.name, cmd, type(first_exc).__name__)
-                    s.close()
                     conn = self._open_or_raise(s)
                     try:
-                        out = self._send(conn, device, cmd, timeout, prompts)
+                        out = self._send(conn, device, cmd, step, prompts, budget)
                     except Exception as exc:
+                        s.drop()
+                        conn = None
+                        if isinstance(exc, DeadlineExceeded):
+                            raise
                         out = (f"[error running command (after reconnect+retry): "
                                f"{type(exc).__name__}: {exc}]")
-                        s.close()
-                        conn = self._open_or_raise(s)
                 results.append((cmd, out or ""))
             s.last_used = time.time()
             return results
 
-    def _send(self, conn, device: Device, cmd: str, timeout: int, prompts: str) -> str:
+    def _send(self, conn, device: Device, cmd: str, timeout: float, prompts: str,
+              budget: Budget | None = None) -> str:
         out = conn.send_command(cmd, read_timeout=timeout, strip_command=True) or ""
-        return self._settle(conn, device, out, timeout, prompts)
+        return self._settle(conn, device, out, timeout, prompts, budget)
 
-    def _settle(self, conn, device: Device, out: str, timeout: int, prompts: str) -> str:
+    def _settle(self, conn, device: Device, out: str, timeout: float, prompts: str,
+                budget: Budget | None = None) -> str:
         """Answer a question the device asked instead of running the command."""
         if prompts not in ("yes", "no"):
             return out
@@ -171,7 +316,7 @@ class Pool:
             answer = yes if prompts == "yes" else no
             log.info("%s: device asked %r -> answering %r", device.name, question, answer)
             more = conn.send_command_timing(answer, strip_prompt=False, strip_command=False,
-                                            read_timeout=timeout) or ""
+                                            read_timeout=_step(budget, timeout)) or ""
             out = f"{out}\n{more}"
         log.warning("%s: still at a prompt after %d answers", device.name, MAX_PROMPT_ANSWERS)
         return out
@@ -183,7 +328,8 @@ class Pool:
         if s is not None:
             self._close_async(s)
 
-    def configure(self, device: Device, lines: list[str], commit: bool) -> str:
+    def configure(self, device: Device, lines: list[str], commit: bool,
+                  budget: Budget | None = None) -> str:
         """Apply configuration lines, as the platform's change.apply/finish say:
         - apply shell:  every line is a command of its own, in exec mode
         - apply config_set, then finish
@@ -191,31 +337,54 @@ class Pool:
             save:   leave config mode, then save_config  (IOS, NX-OS, EOS, VRP5)
             none:   nothing - the lines close their own blocks (FortiOS 'end')
         `commit=False` skips the commit/save step.
+
+        Every step gets CHANGE_CMD_TIMEOUT, capped at what is left of `budget`.
+        save_config() takes no timeout in any Netmiko driver; only the deadline
+        bounds it.
         """
         s = self._get(device)
-        with s.lock:
+        t = CHANGE_CMD_TIMEOUT
+        with self._locked(s, budget):
             conn = self._open_or_raise(s)
             plat = device.platform
             try:
                 if plat.shell:
                     chunks = []
                     for ln in lines:
-                        chunks.append(f"$ {ln}\n" + (conn.send_command(ln, read_timeout=CMD_TIMEOUT) or ""))
+                        chunks.append(f"$ {ln}\n" + (conn.send_command(ln, read_timeout=_step(budget, t)) or ""))
                     out = "\n".join(chunks)
                 else:
-                    out = conn.send_config_set(lines, read_timeout=CMD_TIMEOUT, exit_config_mode=False)
+                    out = conn.send_config_set(lines, read_timeout=_step(budget, t), exit_config_mode=False)
                     if plat.finish == "commit":
-                        out += "\n" + (conn.commit() if commit else "")
+                        out += "\n" + (self._commit(conn, _step(budget, t)) if commit else "")
                         conn.exit_config_mode()
                     elif plat.finish == "save":
                         conn.exit_config_mode()
                         if commit:
+                            _step(budget, t)
                             out += "\n" + conn.save_config()
                 # A config session can end on a question too ('Save? [Y/N]').
-                out = self._settle(conn, device, out, CMD_TIMEOUT, "yes")
+                out = self._settle(conn, device, out, t, "yes", budget)
+            except AuthError:
+                raise
+            except Exception as exc:
+                # Part of the change may be on the device, maybe uncommitted in
+                # config mode: never reuse this session.
+                s.drop()
+                if isinstance(exc, DeadlineExceeded):
+                    raise
+                raise OutcomeUnknown(device.name, "the configuration change", exc) from exc
             finally:
                 s.last_used = time.time()
             return out
+
+    @staticmethod
+    def _commit(conn, timeout: float) -> str:
+        """commit() with an explicit read_timeout where the driver takes one
+        (IOS-XR, VRPv8, Junos: default 120s, longer than any deadline)."""
+        if "read_timeout" in inspect.signature(conn.commit).parameters:
+            return conn.commit(read_timeout=timeout)
+        return conn.commit()
 
     def _open_or_raise(self, s: _Session):
         try:
