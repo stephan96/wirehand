@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.5.6 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.0 · **License:** [Apache-2.0](LICENSE)
 
 
 ## Summary
@@ -102,6 +102,9 @@ output together with the hint to use `filter`.
   operator's authenticator app: valid ~30 seconds, consumed on first use, never visible to
   the model until a human types it into the chat. No system prompt can replace this - see
   "Approving changes".
+- **Every tool call ends.** Each tool has an overall deadline (60 s by default). A
+  `confirm_change` that runs out of time answers `OUTCOME UNKNOWN` instead of guessing,
+  and a change command is never sent twice (see "Timeouts and unknown outcomes").
 - **Everything is logged.** Every tool call lands in an append-only audit log; every
   proposed change first saves a configuration snapshot (see "Audit log & snapshots").
 
@@ -203,6 +206,18 @@ only the apply step is gated.
 
 `curl -s http://localhost:8110/health` shows `confirm_mode` and `approval_ready`.
 
+**Upgrading to 0.6.0:** every tool call now has an overall deadline of 60 s (see
+"Timeouts and unknown outcomes"). What changes for existing setups:
+
+- The front-end's tool timeout must be **longer than 60 s**, or it gives up before
+  wirehand answers.
+- `WIREHAND_CMD_TIMEOUT` defaults to 45 (was 60). If you set it to 60 or more, startup logs
+  a warning, because the deadline then always cuts that step off first.
+- New answers: HTTP 504 when a deadline runs out, HTTP 409 when a device is still busy
+  with another call (nothing sent), and HTTP 502 `NOT CONFIRMED - OUTCOME UNKNOWN` when a
+  change step fails after it was sent. Before, a failed exec/rollback command was retried
+  once and could still be reported as `EXECUTED` / `ROLLED BACK`.
+
 
 **Open WebUI caches the tool description: after an update, toggle the tool-server entry
 off/on (or re-add it) so the model sees the new tool descriptions.**
@@ -271,7 +286,7 @@ including the ones the example above leaves at their default.
 | `password` | - | SSH password |
 | `secret` | - | enable password; used on `cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos` |
 | `port` | `22` | SSH port |
-| `timeout` | `30` | seconds Netmiko waits for a single command |
+| `timeout` | `30` | passed to Netmiko as `timeout`; over SSH it has practically no effect (see below) |
 | `access` | `ro` | `ro` \| `rw` - whether the device may be changed at all |
 | `confirm` | `WIREHAND_CONFIRM_MODE` | `totp` \| `off` - who may approve a change |
 | `description` | `""` | free text, shown to the model |
@@ -281,6 +296,13 @@ including the ones the example above leaves at their default.
 `cisco_nxos`, `huawei`, `huawei_vrpv8`, `fortinet`, `arista_eos`, `juniper_junos`.
 
 `env:VARNAME` works for `username`, `password` and `secret`.
+
+`timeout` does **not** limit how long a command may take. wirehand gives every command an
+explicit Netmiko `read_timeout` (`WIREHAND_CMD_TIMEOUT` / `WIREHAND_CHANGE_CMD_TIMEOUT`),
+which takes precedence, and the SSH connect has its own fixed limits (15 s TCP connect,
+30 s banner). Netmiko 4 uses `timeout` only for telnet and its old delay-factor mode,
+neither of which wirehand uses. The key is accepted so existing inventories still load.
+There are no per-device deadlines; see "Timeouts and unknown outcomes".
 
 `secret` is only consulted on platforms whose `config/platforms/` file sets
 `session.enable: true` (`cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos`) - it triggers
@@ -611,6 +633,13 @@ system prompt:
 > with mode='exec', never run_read. If unsure about platform CLI syntax, verify it via
 > web search before proposing a change.
 
+**Tool timeout:** every wirehand tool answers within 60 s (its deadline, see "Timeouts
+and unknown outcomes") plus a little overhead. The front-end's own timeout for tool calls
+must be **longer** than that, e.g. 90 s. If it is shorter, the front-end gives up first:
+the model never sees the `504 OUTCOME UNKNOWN`, and may report a change as failed or
+retry it while it is still running. Check this in Open WebUI and Onyx whenever you raise
+a `WIREHAND_DEADLINE_*` value.
+
 
 #### Extended prompt: forgotten tool switch
 
@@ -779,6 +808,59 @@ IOS-XR needs neither: `rollback configuration last 1` runs there without asking.
 wirehand a new question, add the pattern and its two answers to `prompts` - in
 `common.yaml`, or in one platform's file if only that platform asks it - and restart.
 
+## Timeouts and unknown outcomes
+
+Every tool call has an **overall deadline**. When it runs out, wirehand stops waiting,
+closes that device's SSH connection, and answers HTTP 504 with a text that says honestly
+what is known. It does **not** roll back automatically: after a timeout wirehand cannot
+tell what the device did, and undoing a change that never landed would be a change of
+its own.
+
+| Setting (env) | Default | Limits | When it expires |
+|---|---|---|---|
+| `WIREHAND_DEADLINE_READ` | 60 s | a whole `run_read` (all devices) or `get_facts` call | 504 `TIMED OUT ... Nothing was changed`; audit `read_timeout` |
+| `WIREHAND_DEADLINE_PROPOSE` | 60 s | `propose_change` / `rollback_change` (the configuration snapshot) | 504 `TIMED OUT ... Nothing was staged and nothing was applied`, no code; audit `propose_timeout` |
+| `WIREHAND_DEADLINE_CONFIRM` | 60 s | `confirm_change` (sending, commit/save, answering device questions) | 504 `OUTCOME UNKNOWN ... Do NOT retry`; the code is used up; audit `confirm_timeout` |
+| `WIREHAND_LOCK_WAIT` | 20 s | waiting for another call on the same device to finish | 409 `DEVICE BUSY ... Nothing was sent`, retry later; audit `device_busy`. For `confirm_change` the change stays staged under the same code |
+| `WIREHAND_CMD_TIMEOUT` | 45 s | one read command (Netmiko `read_timeout`) | the read is retried once on a fresh connection; if that fails too, the error appears in that command's output |
+| `WIREHAND_CHANGE_CMD_TIMEOUT` | 45 s | one change step: each exec/rollback command, the config lines, `commit` | 502 `NOT CONFIRMED - OUTCOME UNKNOWN`, never retried; audit `confirm_unknown` |
+| inventory `timeout` | 30 s | nothing over SSH (see "Every key a device accepts") | - |
+| `WIREHAND_CHECK_TIMEOUT` | 2 s | one TCP probe of `list_devices(check=true)` | the device is shown as `DOWN` |
+| SSH connect | 15 s TCP, 30 s banner | opening a session (fixed) | 502 `connection timeout` (read path: noted for that device) |
+
+The per-step limits are also capped at **the time left in the deadline**, and no step
+starts with less than 1 s left. Netmiko's `commit()` defaults to 120 s, so wirehand passes
+its own `read_timeout` (IOS-XR, VRPv8, Junos). `save_config()` (IOS, NX-OS, EOS, VRP5)
+takes no timeout in any Netmiko driver, so only the deadline limits it. Keep every
+per-step limit **below** its deadline. Otherwise the step never ends on its own timeout
+(with a clean error), and the deadline always cuts it off with a 504. wirehand logs a
+warning at startup when that is the case.
+
+**How a hung call ends.** The device work runs in a worker thread. At the deadline the
+endpoint stops waiting and force-closes the connection that call is using, without
+waiting for the device's lock, which the hung call still holds. The hung call's next read
+fails, it releases the lock, and the next call to that device reconnects. One case is
+not covered: a call that hangs while it is still *opening* the connection keeps the lock
+until the SSH connect limits above run out. Calls in that time get 409 `DEVICE BUSY`.
+
+**What the model is told after a confirm_change problem:**
+
+| Answer | Meaning | What the model should do |
+|---|---|---|
+| 504 `OUTCOME UNKNOWN` | the deadline ran out while the change was being applied | do not retry; check the state with `run_read`, report to the user |
+| 502 `NOT CONFIRMED - OUTCOME UNKNOWN` | a change step failed after it was sent (e.g. the connection dropped) | the same |
+| 502 `NOT COMPLETED` | the device is still asking a question; the operation did not run | report it; it needs a `prompts` fix on the host |
+| 409 `DEVICE BUSY` | another call still holds the device; nothing was sent | wait, then call `confirm_change` again; in totp mode with a **new** approval code |
+
+A change command is **never sent twice**. Reads reconnect and retry once after an error,
+because a pooled session may have been closed silently by the device. Change commands
+(`confirm_change` in exec and rollback mode) are not retried, because the first attempt
+may already have run.
+
+**The front-end must wait longer than the deadline** (see "Connecting the front-ends").
+If its tool timeout is 60 s or less, it gives up before wirehand answers, and the
+requester never sees the 504.
+
 ## Audit log & snapshots
 
 Everything lives in the named volume `wirehand_data` (`/app/data` inside the container):
@@ -813,7 +895,8 @@ docker cp wirehand:/app/data ./wirehand-data-backup
 ```
 
 Each audit entry holds timestamp, event (`run_read`, `propose_change`, `confirm_change`,
-`rollback_staged`, `rollback_snapshot`, `confirm_denied`, `confirm_incomplete`, ...), device, the commands/lines involved and, for changes, the confirmation
+`rollback_staged`, `rollback_snapshot`, `confirm_denied`, `confirm_incomplete`,
+`confirm_unknown`, `confirm_timeout`, `read_timeout`, `propose_timeout`, `device_busy`, ...), device, the commands/lines involved and, for changes, the confirmation
 code and snapshot path - never credentials. The file is plain JSONL: one JSON object per
 line, greppable and jq-able.
 
@@ -831,6 +914,10 @@ changes with age).
 | Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
 | `confirm_change` returns 502 `NOT COMPLETED: the device asked ...` | the platform asks a question wirehand does not know | add the pattern to `prompts` in `config/platforms/` and restart; nothing was applied, the session was dropped |
+| `confirm_change` returns 504 `OUTCOME UNKNOWN` | the device did not finish within `WIREHAND_DEADLINE_CONFIRM` | check the device state with `run_read` and decide by hand; nothing is rolled back automatically. If the device is just slow at committing, raise `WIREHAND_DEADLINE_CONFIRM` (and the front-end's tool timeout with it) |
+| `confirm_change` returns 502 `NOT CONFIRMED - OUTCOME UNKNOWN` | the connection broke after the change was sent | check the device state with `run_read`; the code is used up, propose again if needed |
+| HTTP 409 `DEVICE BUSY` | another call (often one that timed out) still holds that device | wait a minute and retry; nothing was sent |
+| The model reports a timeout, wirehand's audit log shows the call succeeded | the front-end's tool timeout is shorter than wirehand's deadline | raise the front-end's tool timeout above 60 s (or above your `WIREHAND_DEADLINE_*`) |
 | `confirm_change` returns 503 with a setup hint | `WIREHAND_CONFIRM_MODE=totp` but no usable `WIREHAND_TOTP_SECRET` | generate one (`docker exec wirehand python -m app.approval --new`), put it in `.env`, `docker compose up -d` - or set `WIREHAND_CONFIRM_MODE=off` |
 | `confirm_change` returns 403 "approval code is not valid (right now)" | phone clock drift, or the model made the number up | compare `docker exec wirehand python -m app.approval` with your app; the change stays staged, just send a fresh code |
 | "approval code is not valid - wrong, or expired" although you read it correctly | the model took longer than `WIREHAND_APPROVAL_MAX_AGE` to call `confirm_change`, or the phone clock is off | send a fresh code; raise `WIREHAND_APPROVAL_MAX_AGE` for slow models; enable automatic time on the phone |
@@ -849,7 +936,7 @@ changes with age).
 
 ```bash
 pip install -r requirements.txt pytest httpx
-python -m pytest tests/                  # read path, platform files, approval codes, device prompts, containerlab discovery
+python -m pytest tests/                  # read path, platform files, approval codes, device prompts, containerlab discovery, timeouts
 PYTHONPATH=. python tests/test_api.py    # full propose/confirm/rollback/approval flow against a fake pool
 ```
 

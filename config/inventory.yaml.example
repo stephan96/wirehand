@@ -30,7 +30,9 @@ devices:
   #   password: env:CORE_SW1_PASS
   #   secret: env:CORE_SW1_ENABLE  # enable password; used where config/platforms/ sets session.enable
   #   port: 2222                   # SSH port (default 22)
-  #   timeout: 60                  # seconds Netmiko waits for one command (default 30)
+  #   timeout: 60                  # Netmiko 'timeout'; over SSH practically no effect (default 30).
+  #                                # Command and call limits are WIREHAND_CMD_TIMEOUT and
+  #                                # WIREHAND_DEADLINE_* (docker-compose.yml)
   #   access: ro
   #   confirm: totp
   #   description: Core switch building A

@@ -19,7 +19,7 @@ services:
       args:
         APP_UID: "${UID:-1000}"
         APP_GID: "${GID:-1000}"
-    image: wirehand:0.5.6
+    image: wirehand:0.6.0
     container_name: wirehand
     restart: unless-stopped
     network_mode: host
@@ -35,7 +35,14 @@ services:
       WIREHAND_CLAB_RESCAN: "30"      # seconds between checks for deployed/destroyed labs
       WIREHAND_DATA: /app/data
       WIREHAND_IDLE_SECONDS: "300"
-      WIREHAND_CMD_TIMEOUT: "60"
+      # Timeouts, seconds - see "Timeouts and unknown outcomes" in the README.
+      # Keep every per-step limit below its deadline, and the front-end's tool timeout above it.
+      WIREHAND_DEADLINE_READ: "60"       # whole run_read / get_facts call
+      WIREHAND_DEADLINE_PROPOSE: "60"    # whole propose_change / rollback_change call
+      WIREHAND_DEADLINE_CONFIRM: "60"    # whole confirm_change call -> 504 OUTCOME UNKNOWN
+      WIREHAND_LOCK_WAIT: "20"           # wait for another call on the same device -> 409
+      WIREHAND_CMD_TIMEOUT: "45"         # one read command
+      WIREHAND_CHANGE_CMD_TIMEOUT: "45"  # one change step (command, config lines, commit)
       WIREHAND_CHANGE_TTL: "600"
       WIREHAND_CHECK_TIMEOUT: "2"      # seconds per device for list_devices(check=true)
       WIREHAND_SESSION_LOG: "0"        # "1" = write per-device session logs to /app/data (debugging)

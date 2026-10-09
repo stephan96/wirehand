@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="wirehand",
-    version="0.5.6",
+    version="0.6.0",
     license_info={"name": "Apache-2.0", "identifier": "Apache-2.0"},
     description=(
         "Tools to inspect and configure Linux servers and network devices "
