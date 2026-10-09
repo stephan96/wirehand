@@ -12,6 +12,7 @@ import time
 
 import socket
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
 
@@ -32,12 +33,18 @@ class OutcomeUnknown(RuntimeError):
     def __init__(self, device: str, what: str, exc: BaseException):
         super().__init__(f"{what} on {device} failed after it was sent: {type(exc).__name__}: {exc}")
 
+class DeviceBusy(RuntimeError):
+    """Another call held the device's session for longer than WIREHAND_LOCK_WAIT.
+    Nothing was sent to the device."""
+
 from . import platforms
 from .inventory import Device, RESCAN_SECONDS
 
 log = logging.getLogger("wirehand.transport")
 IDLE_SECONDS = int(os.environ.get("WIREHAND_IDLE_SECONDS", "300"))
 CMD_TIMEOUT = int(os.environ.get("WIREHAND_CMD_TIMEOUT", "60"))
+# Seconds a call waits for another call on the same device to finish.
+LOCK_WAIT = float(os.environ.get("WIREHAND_LOCK_WAIT", "20"))
 # How often we answer a follow-up question for a single command before giving up.
 MAX_PROMPT_ANSWERS = 3
 pending_prompt = platforms.pending_prompt   # re-exported: callers ask transport
@@ -124,6 +131,21 @@ class Pool:
                 s.close()
         threading.Thread(target=_worker, daemon=True, name="wirehand-close").start()
 
+    @staticmethod
+    @contextmanager
+    def _locked(s: _Session):
+        """Hold the session's lock, waiting at most LOCK_WAIT for it. A call that
+        hangs on a device must not make every later call hang behind it."""
+        if not s.lock.acquire(timeout=LOCK_WAIT):
+            raise DeviceBusy(
+                f"DEVICE BUSY: {s.device.name} is still working on another call (waited "
+                f"{LOCK_WAIT:g}s). Nothing was sent to the device by this call. It can be retried "
+                f"in a minute.")
+        try:
+            yield
+        finally:
+            s.lock.release()
+
     def run(self, device: Device, commands: list[str], timeout: int = CMD_TIMEOUT,
             prompts: str = "no", idempotent: bool = True) -> list[tuple[str, str]]:
         """Run exec-mode commands sequentially. Returns [(cmd, output)].
@@ -140,7 +162,7 @@ class Pool:
         OutcomeUnknown instead of turning into an error line in the output.
         """
         s = self._get(device)
-        with s.lock:
+        with self._locked(s):
             conn = self._open_or_raise(s)
             results = []
             for cmd in commands:
@@ -210,7 +232,7 @@ class Pool:
         `commit=False` skips the commit/save step.
         """
         s = self._get(device)
-        with s.lock:
+        with self._locked(s):
             conn = self._open_or_raise(s)
             plat = device.platform
             try:

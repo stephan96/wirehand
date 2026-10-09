@@ -156,3 +156,58 @@ def test_error_during_confirm_is_never_reported_as_success(staging):
     for word in ("APPLIED", "EXECUTED", "ROLLED BACK"):
         assert word not in r.text, r.text
     assert "confirm_unknown" in _audit_events()
+
+
+# ----------------------------------------------------------- lock wait ---
+
+import time  # noqa: E402
+
+from app.transport import DeviceBusy  # noqa: E402
+
+
+@pytest.fixture
+def held(pool, monkeypatch):
+    """The real pool, with r1's session lock held by 'another call'."""
+    monkeypatch.setattr(transport, "LOCK_WAIT", 0.3)
+    s = pool._get(_dev())
+    s.lock.acquire()
+    yield pool
+    s.lock.release()
+
+
+def test_busy_session_gives_up_after_lock_wait(held):
+    t0 = time.monotonic()
+    with pytest.raises(DeviceBusy, match="Nothing was sent"):
+        held.run(_dev(), ["show clock"])
+    assert 0.25 < time.monotonic() - t0 < 2
+    with pytest.raises(DeviceBusy):
+        held.configure(_dev(), ["interface Loopback1"], commit=True)
+    assert held.first.sent == []
+
+
+def test_busy_device_is_409_and_nothing_sent(held):
+    main.pool = held
+    t0 = time.monotonic()
+    r = client.get("/get_facts", params={"device": "r1"}, headers=H)
+    assert r.status_code == 409 and "Nothing was sent" in r.text, (r.status_code, r.text)
+    assert time.monotonic() - t0 < 2
+    assert client.get("/run_read", params={"device": "r1", "commands": "show clock"},
+                      headers=H).status_code == 409
+    r = client.post("/propose_change", json={"device": "r1", "config": "interface Loopback1"}, headers=H)
+    assert r.status_code == 409 and "STAGED" not in r.text, r.text
+    assert held.first.sent == []
+
+
+def test_busy_confirm_keeps_the_change_staged(held):
+    main.pool = held
+    s = held._get(_dev())
+    s.lock.release()
+    code = _staged("/rollback_change", params={"device": "r1"})
+    s.lock.acquire()
+    r = client.post("/confirm_change", params={"code": code}, headers=H)
+    assert r.status_code == 409 and "NOT APPLIED" in r.text and code in r.text, r.text
+    assert "rollback configuration last 1" not in held.first.sent
+    s.lock.release()
+    r = client.post("/confirm_change", params={"code": code}, headers=H)   # retry later works
+    assert r.status_code == 200 and "ROLLED BACK" in r.text, r.text
+    s.lock.acquire()

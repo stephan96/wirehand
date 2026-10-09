@@ -35,7 +35,7 @@ from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
 from .state import ChangeStore, audit, read_audit
 from .platforms import pending_prompt
-from .transport import AuthError, OutcomeUnknown, Pool, check_devices
+from .transport import AuthError, DeviceBusy, OutcomeUnknown, Pool, check_devices
 
 logging.basicConfig(level=os.environ.get("WIREHAND_LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("wirehand")
@@ -113,6 +113,11 @@ def _fmt(device: str, results: list[tuple[str, str]], flt: str = "", context: in
         body = filter_lines(out, flt, context) if flt else out
         blocks.append(f"=== {device} : {cmd} ===\n{body.rstrip()}\n")
     return truncate("\n".join(blocks), MAX_OUT)
+
+
+def _busy(dev, exc: DeviceBusy, **fields) -> HTTPException:
+    audit("device_busy", dev.name, **fields)
+    return HTTPException(409, str(exc))
 
 
 def _next_step(dev, code: str) -> str:
@@ -216,6 +221,8 @@ def get_facts(device: str = Query(..., description="Device name from list_device
     except AuthError as exc:
         audit("auth_failed", dev.name)
         raise HTTPException(401, str(exc))
+    except DeviceBusy as exc:
+        raise _busy(dev, exc, tool="get_facts")
     except RuntimeError as exc:
         raise HTTPException(502, str(exc))
     audit("get_facts", dev.name)
@@ -268,6 +275,12 @@ def run_read(
             res = pool.run(dev, cmds)
         except AuthError as exc:
             audit("auth_failed", dev.name, commands=cmds)
+            out.append(f"=== {dev.name} ===\n[{exc}]\n")
+            continue
+        except DeviceBusy as exc:
+            if len(devs) == 1:
+                raise _busy(dev, exc, tool="run_read")
+            audit("device_busy", dev.name, tool="run_read")
             out.append(f"=== {dev.name} ===\n[{exc}]\n")
             continue
         except RuntimeError as exc:
@@ -351,6 +364,8 @@ def propose_change(body: ProposeIn) -> str:
     except AuthError as exc:
         audit("auth_failed", dev.name)
         raise HTTPException(401, str(exc))
+    except DeviceBusy as exc:
+        raise _busy(dev, exc, tool="snapshot")
     except RuntimeError as exc:
         raise HTTPException(502, str(exc))
     snap_path = changes.save_snapshot(dev.name, snapshot)
@@ -432,6 +447,16 @@ def confirm_change(
     except AuthError as exc:
         audit("auth_failed", dev.name, code=code)
         raise HTTPException(401, str(exc))
+    except DeviceBusy as exc:
+        # Nothing was sent: the change is staged again under the same code.
+        changes.restore(pc)
+        again = ("Ask the user for a NEW 6-digit code from their authenticator app - the one just "
+                 "used does not work twice - and call confirm_change again with it."
+                 if approver.requires_approval(dev.confirm) else "Call confirm_change again.")
+        audit("device_busy", dev.name, tool="confirm_change", code=code)
+        raise HTTPException(409, (
+            f"{exc} NOT APPLIED. The change is still staged as {pc.code} until it expires. Wait a "
+            f"minute, then retry. {again}"))
     except OutcomeUnknown as exc:
         # Something went wrong after the change reached the device: it may or may
         # not have been applied. Saying "APPLIED" or "failed" would both be guesses.
@@ -503,6 +528,8 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
     except AuthError as exc:
         audit("auth_failed", dev.name)
         raise HTTPException(401, str(exc))
+    except DeviceBusy as exc:
+        raise _busy(dev, exc, tool="snapshot")
     except RuntimeError as exc:
         raise HTTPException(502, str(exc))
     snap_path = changes.save_snapshot(dev.name, snapshot)
