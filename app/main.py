@@ -83,12 +83,16 @@ async def lifespan(app: FastAPI):
     pool.close_all()
 
 
+# Also the start of the description: Open WebUI shows that on mouse-over in the
+# chat's tool selection, so users see which version they are talking to.
+VERSION = "0.6.0"
+
 app = FastAPI(
     title="wirehand",
-    version="0.6.0",
+    version=VERSION,
     license_info={"name": "Apache-2.0", "identifier": "Apache-2.0"},
     description=(
-        "Tools to inspect and configure Linux servers and network devices "
+        f"wirehand {VERSION} - Tools to inspect and configure Linux servers and network devices "
         "(Cisco IOS/IOS-XR, Huawei VRP, FortiGate, ...) over SSH. Device names come "
         "from list_devices. Read tools are safe to call freely. Configuration changes "
         "require propose_change followed by human approval and confirm_change."
