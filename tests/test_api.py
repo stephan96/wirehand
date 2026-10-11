@@ -75,7 +75,7 @@ info = c.get("/openapi.json").json()["info"]
 assert info["description"].startswith(f"wirehand {info['version']} - Tools to inspect"), info["description"]
 print("tools:", ops)
 print("OK")
-pre = c.options("/openapi.json", headers={"Origin": "http://llm-srv1:3000", "Access-Control-Request-Method": "GET"})
+pre = c.options("/openapi.json", headers={"Origin": "http://webui.example:3000", "Access-Control-Request-Method": "GET"})
 assert pre.status_code == 200 and pre.headers.get("access-control-allow-origin"), pre.status_code
 print("CORS OK")
 pre = c.options("/get_facts", params={"device": "r1"}, headers={"Origin": "http://x", "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization,content-type,x-requested-with,accept"})

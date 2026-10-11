@@ -251,7 +251,7 @@ WIREHAND_API_KEY=change-me-long-random-string
 WIREHAND_CONFIRM_MODE=totp                    # totp (default) | off - see "Approving changes"
 WIREHAND_TOTP_SECRET=JBSWY3DPEHPK3PXP...      # docker exec wirehand python -m app.approval --new
 WIREHAND_APPROVAL_MAX_AGE=120                 # seconds a code stays valid after the app moves on
-WIREHAND_CLAB_DIR=/home/stephan/containerlabs   # host path with your labs
+WIREHAND_CLAB_DIR=/path/to/containerlabs       # host path with your labs
 UBUNTU_USER=netops                           # credentials referenced from inventory.yaml
 UBUNTU_PASS=...
 ```
@@ -648,7 +648,7 @@ Docker on another host, its `api_server` and `background` containers need
 Two sources, merged at runtime; both can be used at the same time:
 
 1. **containerlab auto-discovery.** Point `WIREHAND_CLAB_DIR` at the folder that holds your
-   containerlab topologies (e.g. `/home/stephan/containerlabs`). For every *deployed* lab,
+   containerlab topologies (e.g. `/home/<user>/containerlabs`). For every *deployed* lab,
    containerlab generates a `clab-<lab>/ansible-inventory.yml` with node kind, management
    IP and default credentials - wirehand scans these recursively. Nodes appear under
    the name `<lab>-<node>` (e.g. `xrd-test-xrd1`) and disappear automatically when the lab

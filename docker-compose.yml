@@ -48,10 +48,10 @@ services:
       WIREHAND_CHECK_TIMEOUT: "2"      # seconds per device for list_devices(check=true)
       WIREHAND_SESSION_LOG: "0"        # "1" = write per-device session logs to /app/data (debugging)
       WIREHAND_MAX_OUTPUT_CHARS: "80000"   # ~20k tokens
-      WIREHAND_CORS_ORIGINS: "*"           # tighten to e.g. "http://llm-srv1:3000" once it works
+      WIREHAND_CORS_ORIGINS: "*"           # tighten to e.g. "http://<webui-host>:3000" once it works
     volumes:
       - ./config:/app/config:ro
-      - ${WIREHAND_CLAB_DIR:-./clab-empty}:/clab:ro   # host path from .env, e.g. /home/stephan/containerlabs
+      - ${WIREHAND_CLAB_DIR:-./clab-empty}:/clab:ro   # host path from .env, e.g. /home/<user>/containerlabs
       - wirehand_data:/app/data
     logging:
       driver: json-file
