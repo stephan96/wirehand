@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI):
 
 # Also the start of the description: Open WebUI shows that on mouse-over in the
 # chat's tool selection, so users see which version they are talking to.
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 app = FastAPI(
     title="wirehand",
@@ -214,12 +214,24 @@ def _next_step(dev, code: str) -> str:
     )
 
 
+def _confirm_label(dev) -> str:
+    """The effective approval mode for list_devices: '-' for read-only devices,
+    otherwise 'totp' or 'off' after the device > containerlab > global resolution.
+    A totp device with a missing/broken secret still says 'totp' (fail-closed)."""
+    if not dev.writable:
+        return "-"
+    return "totp" if approver.requires_approval(dev.confirm) else "off"
+
+
 # ---------------------------------------------------------------- tools ---
 
 @app.get("/list_devices", operation_id="list_devices", response_class=PlainTextResponse,
          summary="List all devices you may work with",
          description=(
              "Returns device names, platform and access level (ro = read only, rw = changes allowed). "
+             "CONFIRM says what applying a change needs: totp = the user must give you a 6-digit "
+             "authenticator code for confirm_change; off = the user's approval in the chat is enough; "
+             "- = read-only device. "
              "Call this first if you do not know the exact device name. "
              "With check=true, also tests which devices are currently reachable from the wirehand "
              "host (TCP connect to the SSH port; verifies network path, not credentials) and adds "
@@ -235,9 +247,13 @@ def list_devices(
         inventory.reload()
         safety.reload()
     devs = inventory.all()
+    # containerlab names are <lab>-<node> and easily exceed 24 characters; a fixed
+    # width would shift every column of those rows.
+    w = max([24] + [len(d.name) for d in devs])
     if not check:
-        rows = [f"{d.name:<24} {d.device_type:<14} {d.access:<3} {d.host:<15} {d.description}" for d in devs]
-        return "NAME                     PLATFORM       ACC MGMT-IP         DESCRIPTION\n" + "\n".join(rows)
+        rows = [f"{d.name:<{w}} {d.device_type:<14} {d.access:<3} {_confirm_label(d):<7} {d.host:<15} {d.description}"
+                for d in devs]
+        return f"{'NAME':<{w}} PLATFORM       ACC CONFIRM MGMT-IP         DESCRIPTION\n" + "\n".join(rows)
     state = check_devices(devs)
     # Several containerlab labs share the default management subnet (172.20.20.0/24),
     # so the same IP can appear in more than one lab's inventory. A TCP probe cannot
@@ -255,16 +271,19 @@ def list_devices(
             st = "up?"
         else:
             st = "up"
-        rows.append(f"{d.name:<24} {d.device_type:<14} {d.access:<3} {st:<5} {d.host:<15} {d.description}")
+        rows.append(f"{d.name:<{w}} {d.device_type:<14} {d.access:<3} {_confirm_label(d):<7} {st:<5} {d.host:<15} {d.description}")
     up = sum(1 for v in state.values() if v)
     audit("check_devices", "", up=up, total=len(devs), shared_ips=len(shared))
 
-    out = ("NAME                     PLATFORM       ACC STATE MGMT-IP         DESCRIPTION\n"
+    out = (f"{'NAME':<{w}} PLATFORM       ACC CONFIRM STATE MGMT-IP         DESCRIPTION\n"
            + "\n".join(rows)
            + f"\n\n{up}/{len(devs)} devices answered on the SSH port "
              "(checked from the wirehand host; this tests the network path, not the credentials).")
-    if shared:
-        groups = "; ".join(f"{h} -> {', '.join(sorted(n))}" for h, n in sorted(shared.items()))
+    # Only an IP that answered is ambiguous: if it did not, every device behind it
+    # is down and 'DOWN' is the truth, whichever lab the name belongs to.
+    ambiguous = {h: n for h, n in shared.items() if any(state.get(x) for x in n)}
+    if ambiguous:
+        groups = "; ".join(f"{h} -> {', '.join(sorted(n))}" for h, n in sorted(ambiguous.items()))
         out += (
             "\n\nWARNING - ambiguous results, marked 'up?':\n"
             f"These devices share a management IP: {groups}\n"

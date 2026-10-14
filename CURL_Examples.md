@@ -27,6 +27,7 @@ curl -s $WH/health
 
 ```bash
 curl -s -H "$AUTH" $WH/list_devices
+# NAME  PLATFORM  ACC  CONFIRM (totp | off | - for ro)  MGMT-IP  DESCRIPTION
 
 # force a re-read of inventory.yaml + containerlab rescan
 curl -s -H "$AUTH" "$WH/list_devices?refresh=true"

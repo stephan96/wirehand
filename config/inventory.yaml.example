@@ -1,5 +1,6 @@
 # ----------------------------------------------------------------------------
-# Manual devices. The LLM only sees: name, platform, access, description, tags.
+# Manual devices. list_devices shows the LLM: name, platform, access, confirm
+# (effective mode), mgmt IP, description. Tags are not shown.
 # Credentials: env:VARNAME -> resolved from the container environment (.env);
 #              works for username, password and secret.
 # access: ro (default) | rw.

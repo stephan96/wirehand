@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.6.0 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.1 · **License:** [Apache-2.0](LICENSE)
 
 ## Contents
 
@@ -83,7 +83,7 @@ long as it applies changes the way one of the existing platforms does (see
 
 | Tool | Type | What it does |
 |---|---|---|
-| `list_devices(refresh, check)` | read | Device names, platform, access level, mgmt IP. `refresh=true` forces a rescan; `check=true` adds a STATE column (up / DOWN / `up?`) by TCP-probing each SSH port from the wirehand host. |
+| `list_devices(refresh, check)` | read | Device names, platform, access level, CONFIRM (what applying a change needs: `totp` = authenticator code, `off` = chat approval, `-` = read-only), mgmt IP. `refresh=true` forces a rescan; `check=true` adds a STATE column (up / DOWN / `up?`) by TCP-probing each SSH port from the wirehand host. |
 | `get_facts(device)` | read | One-call overview bundle (version, interfaces, routing summary, neighbors, recent log) - the intended first step of an analysis. |
 | `run_read(device, commands, filter, context)` | read | Read-only commands. On network devices a blocklist plus argument-level checks; on **Linux devices an allow-list**: only known read-only commands run at all, everything else is refused (see "Key properties"). `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
 | `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char code. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
@@ -97,8 +97,10 @@ output together with the hint to use `filter`.
 
 ## Key properties
 
-- **Credentials never reach the LLM.** The model only knows device *names*. Hostnames,
-  IPs, users and passwords live server-side (inventory file + environment variables).
+- **Credentials never reach the LLM.** The model sees what `list_devices` returns: name,
+  platform, access level, approval mode, management IP and description. Usernames,
+  passwords, enable secrets and the TOTP secret stay server-side (inventory file +
+  environment variables).
 - **Reading is always safe.** `run_read` refuses write/privileged commands no matter what
   the model asks, in three layers: argument-level hard refusals (redirection, chaining,
   command substitution, `find -delete`, `awk 'BEGIN{system(...)}'`, `ethtool -s`,
@@ -251,7 +253,7 @@ WIREHAND_API_KEY=change-me-long-random-string
 WIREHAND_CONFIRM_MODE=totp                    # totp (default) | off - see "Approving changes"
 WIREHAND_TOTP_SECRET=JBSWY3DPEHPK3PXP...      # docker exec wirehand python -m app.approval --new
 WIREHAND_APPROVAL_MAX_AGE=120                 # seconds a code stays valid after the app moves on
-WIREHAND_CLAB_DIR=/home/stephan/containerlabs   # host path with your labs
+WIREHAND_CLAB_DIR=/path/to/containerlabs       # host path with your labs
 UBUNTU_USER=netops                           # credentials referenced from inventory.yaml
 UBUNTU_PASS=...
 ```
@@ -648,7 +650,7 @@ Docker on another host, its `api_server` and `background` containers need
 Two sources, merged at runtime; both can be used at the same time:
 
 1. **containerlab auto-discovery.** Point `WIREHAND_CLAB_DIR` at the folder that holds your
-   containerlab topologies (e.g. `/home/stephan/containerlabs`). For every *deployed* lab,
+   containerlab topologies (e.g. `/home/<user>/containerlabs`). For every *deployed* lab,
    containerlab generates a `clab-<lab>/ansible-inventory.yml` with node kind, management
    IP and default credentials - wirehand scans these recursively. Nodes appear under
    the name `<lab>-<node>` (e.g. `xrd-test-xrd1`) and disappear automatically when the lab
@@ -699,8 +701,10 @@ containerlab puts every lab on the same default management subnet (`172.20.20.0/
 unless told otherwise, so two labs can legitimately contain the same management IP - and
 stale `clab-*` folders from labs destroyed without `--cleanup` keep such entries alive in
 discovery. A TCP probe cannot tell which lab answered. wirehand therefore marks every
-device whose management IP is shared with another device as `up?` and appends a warning
-naming the colliding entries.
+device whose management IP is shared with another device and answered as `up?`, and
+appends a warning naming the colliding entries. A shared IP that does not answer is
+shown as `DOWN` without a warning: then every device behind it is down, whichever lab
+it belongs to.
 
 To get unambiguous results, give each lab its own subnet in its `.clab.yml`:
 
@@ -783,6 +787,13 @@ the whole fleet as `containerlab.default_confirm` - or per kind as
 ```
 device `confirm:`  >  kinds.<kind>.confirm  >  containerlab.default_confirm  >  WIREHAND_CONFIRM_MODE
 ```
+
+The model does not have to guess which rule applies: `list_devices` shows the effective
+mode per device in its CONFIRM column (`totp`, `off`, or `-` for read-only devices). It is
+the result of this resolution, not the raw `confirm:` key, so the model can tell you
+*before* proposing a change whether you will need your authenticator app. A `totp` device
+stays `totp` in that column even when no usable secret is configured, because
+`confirm_change` will refuse it.
 
 Write `off` unquoted if you like: YAML turns it into a boolean and Wirehand accepts that
 spelling. Anything other than `totp`/`off` fails the inventory load at startup. Until

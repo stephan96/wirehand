@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Inventory = manual devices (config/inventory.yaml) + auto-discovered
 containerlab nodes (WIREHAND_CLAB_DIR). Manual entries override discovered ones
-with the same name. Credentials may be given as `env:VARNAME`. The model only
-ever sees the device name, platform and access level."""
+with the same name. Credentials may be given as `env:VARNAME`. list_devices shows
+the model name, platform, access, effective confirm mode, mgmt IP and
+description - never credentials."""
 from __future__ import annotations
 
 import os

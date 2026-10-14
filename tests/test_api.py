@@ -75,7 +75,7 @@ info = c.get("/openapi.json").json()["info"]
 assert info["description"].startswith(f"wirehand {info['version']} - Tools to inspect"), info["description"]
 print("tools:", ops)
 print("OK")
-pre = c.options("/openapi.json", headers={"Origin": "http://llm-srv1:3000", "Access-Control-Request-Method": "GET"})
+pre = c.options("/openapi.json", headers={"Origin": "http://webui.example:3000", "Access-Control-Request-Method": "GET"})
 assert pre.status_code == 200 and pre.headers.get("access-control-allow-origin"), pre.status_code
 print("CORS OK")
 pre = c.options("/get_facts", params={"device": "r1"}, headers={"Origin": "http://x", "Access-Control-Request-Method": "GET", "Access-Control-Request-Headers": "authorization,content-type,x-requested-with,accept"})
@@ -144,6 +144,17 @@ open(os.environ["WIREHAND_INVENTORY"], "w").write(
 r = c.get("/list_devices", params={"refresh": "true", "check": "true"}, headers=H).text
 assert "up?" in r and "WARNING" in r and "172.20.20.2 -> labA-x, labB-x" in r, r
 assert r.count("up?   ") == 2 and "ipv4-subnet" in r, r
+# a shared IP that did not answer is not ambiguous: DOWN is true for every device on it
+_m.check_devices = lambda devs: {d.name: not d.name.startswith("lab") for d in devs}
+r = c.get("/list_devices", params={"check": "true"}, headers=H).text
+assert "up?" not in r and "WARNING" not in r and r.count("DOWN") == 2, r
+# with a second shared IP that does answer, only that one is listed
+open(os.environ["WIREHAND_INVENTORY"], "a").write(
+    "  labC-y: {host: 172.20.20.3, device_type: linux, username: u, password: p}\n"
+    "  labD-y: {host: 172.20.20.3, device_type: linux, username: u, password: p}\n")
+_m.check_devices = lambda devs: {d.name: not d.name.endswith("-x") for d in devs}
+r = c.get("/list_devices", params={"refresh": "true", "check": "true"}, headers=H).text
+assert "172.20.20.3 -> labC-y, labD-y" in r and "172.20.20.2 ->" not in r and r.count("up?   ") == 2, r
 _m.check_devices = orig_check
 print("SHARED IP WARNING OK")
 
@@ -234,3 +245,75 @@ assert main.pool.reset_called == ["r1"], "the session left at a prompt must be d
 assert "confirm_incomplete" in c.get("/get_audit_log", params={"n": 200}, headers=H).text
 assert pending_prompt(STUCK) and not pending_prompt(RUNNING)
 print("STUCK PROMPT NOT REPORTED AS SUCCESS OK")
+
+# ---------------------------------------------------------------------------
+# list_devices shows the EFFECTIVE approval mode per device (CONFIRM column), so
+# the model knows before proposing whether the user will need an authenticator code.
+# ---------------------------------------------------------------------------
+from pathlib import Path
+from app.inventory import Inventory
+
+def confirm_col(out: str) -> dict:
+    lines = out.splitlines()
+    assert lines[0].split()[:4] == ["NAME", "PLATFORM", "ACC", "CONFIRM"], lines[0]
+    rows = [l for l in lines[1:] if l and not l[0].isspace()][:len(main.inventory.all())]
+    return {l.split()[0]: l.split()[3] for l in rows}
+
+open(os.environ["WIREHAND_INVENTORY"], "w").write("""devices:
+  c-off:  {host: 1.1.2.1, device_type: cisco_xr, username: u, password: p, access: rw, confirm: off}
+  c-totp: {host: 1.1.2.2, device_type: cisco_xr, username: u, password: p, access: rw, confirm: totp}
+  c-glob: {host: 1.1.2.3, device_type: cisco_xr, username: u, password: p, access: rw}
+  c-ro:   {host: 1.1.2.4, device_type: linux, username: u, password: p, access: ro, confirm: off}
+  forti-hui-xrd-test1-viosl2_1: {host: 1.1.2.5, device_type: cisco_ios, username: u, password: p, access: rw}
+""")
+main.inventory.reload()
+_m.check_devices = lambda devs: {d.name: True for d in devs}
+# both global modes; the totp one with a broken secret, which must still SHOW totp (fail-closed)
+for glob, approver in (("off", Approver(secret=secret, mode="off")), ("totp", Approver(secret="nope", mode="totp"))):
+    main.approver = approver
+    want = {"c-off": "off", "c-totp": "totp", "c-glob": glob, "c-ro": "-", "forti-hui-xrd-test1-viosl2_1": glob}
+    plain = c.get("/list_devices", headers=H).text
+    checked = c.get("/list_devices", params={"check": "true"}, headers=H).text
+    assert confirm_col(plain) == want, plain
+    assert confirm_col(checked) == want, checked
+    assert checked.splitlines()[0].split()[4] == "STATE" and all(
+        l.split()[4] == "up" for l in checked.splitlines()[1:6]), checked
+    # fixed-width: every column starts at the same offset as its header, also next
+    # to a name longer than the default NAME width
+    for out, cols in ((plain, ["PLATFORM", "CONFIRM", "MGMT-IP"]), (checked, ["PLATFORM", "CONFIRM", "STATE", "MGMT-IP"])):
+        head, *rows = out.splitlines()
+        for name in cols:
+            assert all(r[head.index(name) - 1] == " " and r[head.index(name)] != " " for r in rows[:5]), out
+
+# containerlab: per-kind confirm and default_confirm reach the column
+clab_root = Path(tempfile.mkdtemp())
+(clab_root / "t" / "clab-t").mkdir(parents=True)
+(clab_root / "t" / "clab-t" / "ansible-inventory.yml").write_text("""all:
+  children:
+    cisco_xrd:
+      vars: {ansible_user: clab, ansible_password: clab@123}
+      hosts: {clab-t-xrd1: {ansible_host: 172.20.20.2}}
+    fortinet_fortigate:
+      vars: {ansible_user: admin, ansible_password: x}
+      hosts: {clab-t-fgt1: {ansible_host: 172.20.20.9}}
+    linux:
+      hosts: {clab-t-srv: {ansible_host: 172.20.20.5}}
+""")
+clab_inv = clab_root / "inventory.yaml"
+clab_inv.write_text("""devices: {}
+containerlab:
+  default_access: rw
+  default_confirm: totp
+  kinds:
+    cisco_xrd: {confirm: off}
+    linux: {access: ro}
+  credentials:
+    linux: {username: u, password: p}
+""")
+orig_inventory = main.inventory
+main.inventory = Inventory(clab_inv, str(clab_root))
+main.approver = Approver(secret=secret, mode="off")     # global off: default_confirm must win
+assert confirm_col(c.get("/list_devices", headers=H).text) == {"t-xrd1": "off", "t-fgt1": "totp", "t-srv": "-"}
+main.inventory = orig_inventory
+_m.check_devices = orig_check
+print("LIST_DEVICES CONFIRM COLUMN OK")
