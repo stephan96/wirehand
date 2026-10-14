@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.6.0 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.1 · **License:** [Apache-2.0](LICENSE)
 
 ## Contents
 
@@ -83,7 +83,7 @@ long as it applies changes the way one of the existing platforms does (see
 
 | Tool | Type | What it does |
 |---|---|---|
-| `list_devices(refresh, check)` | read | Device names, platform, access level, mgmt IP. `refresh=true` forces a rescan; `check=true` adds a STATE column (up / DOWN / `up?`) by TCP-probing each SSH port from the wirehand host. |
+| `list_devices(refresh, check)` | read | Device names, platform, access level, CONFIRM (what applying a change needs: `totp` = authenticator code, `off` = chat approval, `-` = read-only), mgmt IP. `refresh=true` forces a rescan; `check=true` adds a STATE column (up / DOWN / `up?`) by TCP-probing each SSH port from the wirehand host. |
 | `get_facts(device)` | read | One-call overview bundle (version, interfaces, routing summary, neighbors, recent log) - the intended first step of an analysis. |
 | `run_read(device, commands, filter, context)` | read | Read-only commands. On network devices a blocklist plus argument-level checks; on **Linux devices an allow-list**: only known read-only commands run at all, everything else is refused (see "Key properties"). `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
 | `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char code. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
@@ -97,8 +97,10 @@ output together with the hint to use `filter`.
 
 ## Key properties
 
-- **Credentials never reach the LLM.** The model only knows device *names*. Hostnames,
-  IPs, users and passwords live server-side (inventory file + environment variables).
+- **Credentials never reach the LLM.** The model sees what `list_devices` returns: name,
+  platform, access level, approval mode, management IP and description. Usernames,
+  passwords, enable secrets and the TOTP secret stay server-side (inventory file +
+  environment variables).
 - **Reading is always safe.** `run_read` refuses write/privileged commands no matter what
   the model asks, in three layers: argument-level hard refusals (redirection, chaining,
   command substitution, `find -delete`, `awk 'BEGIN{system(...)}'`, `ethtool -s`,
@@ -783,6 +785,13 @@ the whole fleet as `containerlab.default_confirm` - or per kind as
 ```
 device `confirm:`  >  kinds.<kind>.confirm  >  containerlab.default_confirm  >  WIREHAND_CONFIRM_MODE
 ```
+
+The model does not have to guess which rule applies: `list_devices` shows the effective
+mode per device in its CONFIRM column (`totp`, `off`, or `-` for read-only devices). It is
+the result of this resolution, not the raw `confirm:` key, so the model can tell you
+*before* proposing a change whether you will need your authenticator app. A `totp` device
+stays `totp` in that column even when no usable secret is configured, because
+`confirm_change` will refuse it.
 
 Write `off` unquoted if you like: YAML turns it into a boolean and Wirehand accepts that
 spelling. Anything other than `totp`/`off` fails the inventory load at startup. Until

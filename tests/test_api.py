@@ -234,3 +234,73 @@ assert main.pool.reset_called == ["r1"], "the session left at a prompt must be d
 assert "confirm_incomplete" in c.get("/get_audit_log", params={"n": 200}, headers=H).text
 assert pending_prompt(STUCK) and not pending_prompt(RUNNING)
 print("STUCK PROMPT NOT REPORTED AS SUCCESS OK")
+
+# ---------------------------------------------------------------------------
+# list_devices shows the EFFECTIVE approval mode per device (CONFIRM column), so
+# the model knows before proposing whether the user will need an authenticator code.
+# ---------------------------------------------------------------------------
+from pathlib import Path
+from app.inventory import Inventory
+
+def confirm_col(out: str) -> dict:
+    lines = out.splitlines()
+    assert lines[0].split()[:4] == ["NAME", "PLATFORM", "ACC", "CONFIRM"], lines[0]
+    rows = [l for l in lines[1:] if l and not l[0].isspace()][:len(main.inventory.all())]
+    return {l.split()[0]: l.split()[3] for l in rows}
+
+open(os.environ["WIREHAND_INVENTORY"], "w").write("""devices:
+  c-off:  {host: 1.1.2.1, device_type: cisco_xr, username: u, password: p, access: rw, confirm: off}
+  c-totp: {host: 1.1.2.2, device_type: cisco_xr, username: u, password: p, access: rw, confirm: totp}
+  c-glob: {host: 1.1.2.3, device_type: cisco_xr, username: u, password: p, access: rw}
+  c-ro:   {host: 1.1.2.4, device_type: linux, username: u, password: p, access: ro, confirm: off}
+""")
+main.inventory.reload()
+_m.check_devices = lambda devs: {d.name: True for d in devs}
+# both global modes; the totp one with a broken secret, which must still SHOW totp (fail-closed)
+for glob, approver in (("off", Approver(secret=secret, mode="off")), ("totp", Approver(secret="nope", mode="totp"))):
+    main.approver = approver
+    want = {"c-off": "off", "c-totp": "totp", "c-glob": glob, "c-ro": "-"}
+    plain = c.get("/list_devices", headers=H).text
+    checked = c.get("/list_devices", params={"check": "true"}, headers=H).text
+    assert confirm_col(plain) == want, plain
+    assert confirm_col(checked) == want, checked
+    assert checked.splitlines()[0].split()[4] == "STATE" and all(
+        l.split()[4] == "up" for l in checked.splitlines()[1:5]), checked
+    # fixed-width: every column starts at the same offset as its header
+    for out, cols in ((plain, ["CONFIRM", "MGMT-IP"]), (checked, ["CONFIRM", "STATE", "MGMT-IP"])):
+        head, *rows = out.splitlines()
+        for name in cols:
+            assert all(r[head.index(name) - 1] == " " and r[head.index(name)] != " " for r in rows[:4]), out
+
+# containerlab: per-kind confirm and default_confirm reach the column
+clab_root = Path(tempfile.mkdtemp())
+(clab_root / "t" / "clab-t").mkdir(parents=True)
+(clab_root / "t" / "clab-t" / "ansible-inventory.yml").write_text("""all:
+  children:
+    cisco_xrd:
+      vars: {ansible_user: clab, ansible_password: clab@123}
+      hosts: {clab-t-xrd1: {ansible_host: 172.20.20.2}}
+    fortinet_fortigate:
+      vars: {ansible_user: admin, ansible_password: x}
+      hosts: {clab-t-fgt1: {ansible_host: 172.20.20.9}}
+    linux:
+      hosts: {clab-t-srv: {ansible_host: 172.20.20.5}}
+""")
+clab_inv = clab_root / "inventory.yaml"
+clab_inv.write_text("""devices: {}
+containerlab:
+  default_access: rw
+  default_confirm: totp
+  kinds:
+    cisco_xrd: {confirm: off}
+    linux: {access: ro}
+  credentials:
+    linux: {username: u, password: p}
+""")
+orig_inventory = main.inventory
+main.inventory = Inventory(clab_inv, str(clab_root))
+main.approver = Approver(secret=secret, mode="off")     # global off: default_confirm must win
+assert confirm_col(c.get("/list_devices", headers=H).text) == {"t-xrd1": "off", "t-fgt1": "totp", "t-srv": "-"}
+main.inventory = orig_inventory
+_m.check_devices = orig_check
+print("LIST_DEVICES CONFIRM COLUMN OK")
