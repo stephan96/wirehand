@@ -701,8 +701,10 @@ containerlab puts every lab on the same default management subnet (`172.20.20.0/
 unless told otherwise, so two labs can legitimately contain the same management IP - and
 stale `clab-*` folders from labs destroyed without `--cleanup` keep such entries alive in
 discovery. A TCP probe cannot tell which lab answered. wirehand therefore marks every
-device whose management IP is shared with another device as `up?` and appends a warning
-naming the colliding entries.
+device whose management IP is shared with another device and answered as `up?`, and
+appends a warning naming the colliding entries. A shared IP that does not answer is
+shown as `DOWN` without a warning: then every device behind it is down, whichever lab
+it belongs to.
 
 To get unambiguous results, give each lab its own subnet in its `.clab.yml`:
 

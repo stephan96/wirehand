@@ -247,10 +247,13 @@ def list_devices(
         inventory.reload()
         safety.reload()
     devs = inventory.all()
+    # containerlab names are <lab>-<node> and easily exceed 24 characters; a fixed
+    # width would shift every column of those rows.
+    w = max([24] + [len(d.name) for d in devs])
     if not check:
-        rows = [f"{d.name:<24} {d.device_type:<14} {d.access:<3} {_confirm_label(d):<7} {d.host:<15} {d.description}"
+        rows = [f"{d.name:<{w}} {d.device_type:<14} {d.access:<3} {_confirm_label(d):<7} {d.host:<15} {d.description}"
                 for d in devs]
-        return "NAME                     PLATFORM       ACC CONFIRM MGMT-IP         DESCRIPTION\n" + "\n".join(rows)
+        return f"{'NAME':<{w}} PLATFORM       ACC CONFIRM MGMT-IP         DESCRIPTION\n" + "\n".join(rows)
     state = check_devices(devs)
     # Several containerlab labs share the default management subnet (172.20.20.0/24),
     # so the same IP can appear in more than one lab's inventory. A TCP probe cannot
@@ -268,16 +271,19 @@ def list_devices(
             st = "up?"
         else:
             st = "up"
-        rows.append(f"{d.name:<24} {d.device_type:<14} {d.access:<3} {_confirm_label(d):<7} {st:<5} {d.host:<15} {d.description}")
+        rows.append(f"{d.name:<{w}} {d.device_type:<14} {d.access:<3} {_confirm_label(d):<7} {st:<5} {d.host:<15} {d.description}")
     up = sum(1 for v in state.values() if v)
     audit("check_devices", "", up=up, total=len(devs), shared_ips=len(shared))
 
-    out = ("NAME                     PLATFORM       ACC CONFIRM STATE MGMT-IP         DESCRIPTION\n"
+    out = (f"{'NAME':<{w}} PLATFORM       ACC CONFIRM STATE MGMT-IP         DESCRIPTION\n"
            + "\n".join(rows)
            + f"\n\n{up}/{len(devs)} devices answered on the SSH port "
              "(checked from the wirehand host; this tests the network path, not the credentials).")
-    if shared:
-        groups = "; ".join(f"{h} -> {', '.join(sorted(n))}" for h, n in sorted(shared.items()))
+    # Only an IP that answered is ambiguous: if it did not, every device behind it
+    # is down and 'DOWN' is the truth, whichever lab the name belongs to.
+    ambiguous = {h: n for h, n in shared.items() if any(state.get(x) for x in n)}
+    if ambiguous:
+        groups = "; ".join(f"{h} -> {', '.join(sorted(n))}" for h, n in sorted(ambiguous.items()))
         out += (
             "\n\nWARNING - ambiguous results, marked 'up?':\n"
             f"These devices share a management IP: {groups}\n"
