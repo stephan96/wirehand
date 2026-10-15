@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.6.2 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.3 · **License:** [Apache-2.0](LICENSE)
 
 ## Contents
 
@@ -88,7 +88,9 @@ long as it applies changes the way one of the existing platforms does (see
 | `run_read(device, commands, filter, context)` | read | Read-only commands. On network devices a blocklist plus argument-level checks; on **Linux devices an allow-list**: only known read-only commands run at all, everything else is refused (see "Key properties"). `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
 | `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char change ID. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
 | `confirm_change(code, approval)` | write | Applies the staged change identified by its change ID (`code`): config mode + commit/save for `config`, plain exec for `exec` and for a staged `rollback`. Requires `access: rw` and - unless confirmation is switched off for that device - `approval`: the current 6-digit one-time code from the operator's authenticator app. See "Approving changes". |
-| `rollback_change(device)` | stage | IOS-XR / VRPv8 / Junos: *stages* a native rollback of the last commit and returns a change ID - **undoes nothing** until `confirm_change`. Other platforms: touches nothing and returns the pre-change snapshot so a corrective change can be proposed. |
+| `rollback_change(device)` | stage | IOS-XR / VRPv8 / Junos: *stages* a native rollback of the last commit and returns a change ID - **undoes nothing** until `confirm_change`. Other platforms: touches nothing and returns the snapshot from before the last **applied** change, so a corrective change can be proposed. Linux has no snapshots. |
+| `list_snapshots(device)` | read | The saved configuration snapshots of a device, newest first: change ID, what became of the change (applied, expired, denied, pending, ...), reason, and the rollback base. See "Audit log & snapshots". |
+| `get_snapshot(device, name, filter, context)` | read | One snapshot (`name` from `list_snapshots`, or `latest`): the configuration **before** the named change, unmodified. `filter` / `context` work as in `run_read`. |
 | `get_audit_log(device, n)` | read | The last `n` audit entries, optionally filtered by device. |
 
 Output of every tool is plain text (small local models handle text much better than
@@ -128,7 +130,8 @@ output together with the hint to use `filter`.
   `confirm_change` that runs out of time answers `OUTCOME UNKNOWN` instead of guessing,
   and a change command is never sent twice (see "Timeouts and unknown outcomes").
 - **Everything is logged.** Every tool call lands in an append-only audit log; every
-  proposed change first saves a configuration snapshot (see "Audit log & snapshots").
+  proposed change first saves a configuration snapshot - except on Linux, which has no
+  configuration to snapshot (see "Audit log & snapshots").
 
 ## Installation
 
@@ -240,6 +243,26 @@ only the apply step is gated.
   change step fails after it was sent. Before, a failed exec/rollback command was retried
   once and could still be reported as `EXECUTED` / `ROLLED BACK`.
 
+**Upgrading to 0.6.3:** two new read tools, `list_snapshots` and `get_snapshot`, and an
+automatic snapshot cleanup (see "Audit log & snapshots"). Behaviour changes:
+
+- **Cleanup instead of "last 20 files".** Per device, snapshots of never-applied changes
+  are removed after 7 days, all snapshots after 90 days, and beyond 20 the oldest go -
+  except the snapshot of the last applied change and those of pending or outcome-unknown
+  changes. On the first start after the update this can remove old snapshots at once;
+  copy `/app/data` out first if you want to keep them (`docker cp wirehand:/app/data ./backup`),
+  or set the three `WIREHAND_SNAPSHOT_*` variables to `0`.
+- **`rollback_change` without a native rollback** (IOS/XE/NX-OS, EOS, VRP5, FortiGate) now
+  returns the snapshot of the last **applied** change, not the newest snapshot (which could
+  belong to a proposal that was never applied). With no applied change it says so instead
+  of falling back to the newest one.
+- **Linux saves no placeholder snapshots any more.** `propose_change` says that backups are
+  part of the change; the audit entry has `snapshot=""`. Existing placeholder files are
+  marked in `list_snapshots` and removed by the cleanup.
+- `confirm_change` answers name the pre-change snapshot by name, with the `get_snapshot`
+  call to read it, instead of a file path.
+- After the update, **toggle the tool-server entry in Open WebUI off and on**: it caches
+  the OpenAPI schema and does not see the two new tools otherwise.
 
 **Open WebUI caches the tool description: after an update, toggle the tool-server entry
 off/on (or re-add it) so the model sees the new tool descriptions.**
@@ -491,12 +514,12 @@ rejected when the inventory loads, and every file needs its counterpart in
 | Key | What it decides |
 | --- | --- |
 | `facts` | the commands `get_facts` runs |
-| `snapshot` | the command whose output is saved before every change (`null` on Linux) |
+| `snapshot` | the command whose output is saved before every change (`null` on Linux: nothing is saved) |
 | `session.enable` | call `enable()` when the device has a `secret` |
 | `session.prep` | commands sent once when a session opens (Huawei: `mmi-mode enable`) |
 | `change.apply` | `config_set` (Netmiko config mode) or `shell` (each line is a command) |
 | `change.finish` | after `config_set`: `commit`, `save`, or `none` (FortiOS blocks close themselves) |
-| `change.rollback_last` | native rollback of the last commit, or `null` (snapshot only) |
+| `change.rollback_last` | native rollback of the last commit, or `null` (`rollback_change` returns the snapshot of the last applied change) |
 | `change.balance_end` | append missing `end` lines to open `config` blocks (FortiOS) |
 | `change.drop_trailing` | trailing lines dropped from a config change (`end`, `return`, `exit`) - the tool leaves config mode itself, and the preview names what was dropped |
 | `change.last_line_only` | lines that are dropped at the end like `drop_trailing`, but refused anywhere else (`end`, `return`: in the middle they leave config mode with the change uncommitted) |
@@ -723,9 +746,9 @@ Set per device type by `change.*` in `config/platforms/`:
 | device_type | Change path | Rollback |
 |---|---|---|
 | cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed; VRP needs `mmi-mode` (see below) |
-| cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot only -> corrective change |
-| fortinet | config-set (persists immediately) | snapshot only |
-| linux | commands run sequentially as the login user | none - include backups in the change (`sudo cp x x.bak`) |
+| cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot of last applied change -> corrective change |
+| fortinet | config-set (persists immediately) | snapshot of last applied change |
+| linux | commands run sequentially as the login user | none, and no snapshots - include backups in the change (`sudo cp x x.bak`) |
 
 `mode='exec'` runs in user/exec view on all platforms, commits nothing, and states that
 in its response.
@@ -905,12 +928,76 @@ requester never sees the 504.
 Everything lives in the named volume `wirehand_data` (`/app/data` inside the container):
 
 ```
-/app/data/audit.jsonl                    # append-only audit trail
-/app/data/snapshots/<device>/<ts>.txt    # pre-change config snapshots (last 20 per device)
+/app/data/audit.jsonl                                # append-only audit trail
+/app/data/snapshots/<device>/<YYYYmmdd-HHMMSS>.txt   # configuration BEFORE a staged change
 ```
 
+A snapshot is saved each time `propose_change` or `rollback_change` stages a change -
+**before** anything is applied, so it is the configuration *before* that change. Linux
+devices have no configuration to snapshot and save none (`snapshot: null` in
+`config/platforms/linux.yaml`); backups belong in the change itself. What became of the
+change is not stored with the file: wirehand reads it from the audit log by change ID.
+
 **From the chat:** ask "what was changed on xrd-test-xrd1 today?" - the model calls
-`get_audit_log`.
+`get_audit_log`. For snapshots:
+
+```
+User:  Which config snapshots are there for xrd-test-xrd1?
+Model: list_snapshots(device='xrd-test-xrd1')
+
+Snapshots for xrd-test-xrd1 (4, newest first). Each snapshot is the configuration BEFORE the change.
+
+NAME              SIZE    TRIGGER          CHANGE  STATUS              REASON
+20261015-201502   14.2k   propose_change   65C02D  applied             OSPF cost on Gi0/0/0/1
+20261015-193011   14.1k   propose_change   A1B2C3  expired             test loopback
+20261014-110847   14.1k   rollback_staged  9F3E21  applied (rollback)  -
+20261014-110120   13.9k   -                -       no audit entry      -
+
+Rollback base (last applied change): 20261015-201502
+Read one with get_snapshot(device='xrd-test-xrd1', name='20261015-201502').
+Retention - kept: max 20, 90 days, unapplied 7 days.
+
+User:  How was OSPF configured before the cost change?
+Model: get_snapshot(device='xrd-test-xrd1', name='20261015-201502', filter='router ospf|cost', context=2)
+```
+
+| STATUS | Meaning |
+|---|---|
+| `applied` / `applied (rollback)` | `confirm_change` applied it (a wrong approval code before does not matter) |
+| `outcome unknown` | `confirm_change` ran into a timeout or a broken connection after sending |
+| `pending (N min left)` | still staged, can still be confirmed |
+| `incomplete` | the device asked a question wirehand could not answer; nothing ran |
+| `failed` | `confirm_change` failed before anything reached the device (connection, credentials) |
+| `denied` | only refused approval codes, then the change ID expired |
+| `expired` | staged, never confirmed |
+| `no audit entry` | no audit entry names this file (e.g. the audit log was cleared) |
+
+**Snapshot content is returned unfiltered.** `get_snapshot` returns the file as the
+device printed it, including whatever secrets the running configuration contains
+(password hashes, keys, SNMP communities) - the same exposure as
+`run_read('show running-config')`. Only devices from the inventory can be queried.
+
+**Cleanup.** Per device, at startup, after every new snapshot and once a day. Set in
+`.env`; `0` switches a rule off:
+
+| Setting (env) | Default | Removes |
+|---|---|---|
+| `WIREHAND_SNAPSHOT_UNAPPLIED_DAYS` | 7 | snapshots older than this whose change was never applied (`expired`, `denied`, `incomplete`, `failed`, `no audit entry`) |
+| `WIREHAND_SNAPSHOT_MAX_AGE_DAYS` | 90 | any snapshot older than this |
+| `WIREHAND_SNAPSHOT_KEEP` | 20 | the oldest snapshots beyond this number |
+
+The rules run in this order. **Never removed**, whatever the rules say: the snapshot of
+the last applied configuration change (the rollback base, even when it is older than
+`MAX_AGE_DAYS`), and snapshots whose change is `pending` or has an `outcome unknown`.
+Protected snapshots count towards `KEEP`, but the next-oldest one goes instead. Each
+removal is audited as `snapshot_pruned` with `snapshot` and `reason` (`unapplied_age`,
+`max_age`, `max_count`); empty device folders are removed. The age comes from the file
+name (container local time). Startup logs the active rules, and warns when `KEEP` and
+`MAX_AGE_DAYS` are both `0`, because snapshots then grow without limit. Reading tools
+never remove anything.
+
+Two snapshots of the same device within the same second share a name; the second one
+overwrites the first.
 
 **From the shell:**
 
@@ -929,15 +1016,19 @@ docker exec wirehand cat /app/data/audit.jsonl \
 docker exec wirehand ls -l /app/data/snapshots/xrd-test-xrd1/
 docker exec wirehand cat /app/data/snapshots/xrd-test-xrd1/20260823-141502.txt
 
+# what the cleanup removed
+docker exec wirehand grep snapshot_pruned /app/data/audit.jsonl
+
 # copy everything out (backup)
 docker cp wirehand:/app/data ./wirehand-data-backup
 ```
 
 Each audit entry holds timestamp, event (`run_read`, `propose_change`, `confirm_change`,
 `rollback_staged`, `rollback_snapshot`, `confirm_denied`, `confirm_incomplete`,
-`confirm_unknown`, `confirm_timeout`, `read_timeout`, `propose_timeout`, `device_busy`, ...), device, the commands/lines involved and, for changes, the confirmation
-code and snapshot path - never credentials. The file is plain JSONL: one JSON object per
-line, greppable and jq-able.
+`confirm_unknown`, `confirm_timeout`, `read_timeout`, `propose_timeout`, `device_busy`,
+`list_snapshots`, `get_snapshot`, `snapshot_pruned`, ...), device, the commands/lines
+involved and, for changes, the change ID and snapshot path - never credentials. The file
+is plain JSONL: one JSON object per line, greppable and jq-able.
 
 **Operational endpoints** (curl, not exposed as LLM tools): `GET /health` (no auth;
 status, device count, pending changes) and `GET /pending` (Bearer auth; currently staged
@@ -950,7 +1041,7 @@ changes with age).
 | `PermissionError ... inventory.yaml` at startup | container uid != owner of the 600-file | rebuild with `docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)`; once: `docker volume rm wirehand_wirehand_data` |
 | `env var 'X' which is not set` | dotenv syntax (spaces, `#` in value) or `.env` edited without recreate | fix syntax; `docker compose up -d` (not `restart`) |
 | Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
-| Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
+| Open WebUI shows an old version, or the model does not know `list_snapshots` / `get_snapshot` | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
 | `confirm_change` returns 502 `NOT COMPLETED: the device asked ...` | the platform asks a question wirehand does not know | add the pattern to `prompts` in `config/platforms/` and restart; nothing was applied, the session was dropped |
 | `confirm_change` returns 504 `OUTCOME UNKNOWN` | the device did not finish within `WIREHAND_DEADLINE_CONFIRM` | check the device state with `run_read` and decide by hand; nothing is rolled back automatically. If the device is just slow at committing, raise `WIREHAND_DEADLINE_CONFIRM` (and the front-end's tool timeout with it) |
@@ -975,7 +1066,7 @@ changes with age).
 
 ```bash
 pip install -r requirements.txt pytest httpx
-python -m pytest tests/                  # read path, platform files, approval codes, device prompts, containerlab discovery, timeouts
+python -m pytest tests/                  # read path, platform files, approval codes, device prompts, containerlab discovery, timeouts, snapshots
 PYTHONPATH=. python tests/test_api.py    # full propose/confirm/rollback/approval flow against a fake pool
 ```
 
