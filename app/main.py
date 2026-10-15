@@ -35,6 +35,7 @@ from . import platforms, safety
 from .approval import Approver, ConfigError
 from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
+from . import state
 from .state import ChangeStore, audit, read_audit
 from .platforms import pending_prompt
 from . import transport
@@ -51,6 +52,7 @@ MAX_OUT = int(os.environ.get("WIREHAND_MAX_OUTPUT_CHARS", DEFAULT_MAX_OUTPUT_CHA
 DEADLINE_READ = float(os.environ.get("WIREHAND_DEADLINE_READ", "60"))        # run_read, get_facts
 DEADLINE_PROPOSE = float(os.environ.get("WIREHAND_DEADLINE_PROPOSE", "60"))  # propose_change, rollback_change
 DEADLINE_CONFIRM = float(os.environ.get("WIREHAND_DEADLINE_CONFIRM", "60"))  # confirm_change
+PRUNE_INTERVAL = 86400   # seconds between snapshot cleanups (also at startup and after every snapshot)
 
 inventory = Inventory()
 pool = Pool()
@@ -79,8 +81,34 @@ async def lifespan(app: FastAPI):
             log.warning("%s=%gs is not below %s=%gs: that step never ends on its own timeout, the "
                         "deadline cuts it off (504) instead", step, value, dname, deadline)
     log.info("loaded %d devices (inventory.yaml=%s, containerlab=%s)", len(inventory.all()), inventory.path, inventory.clab_dir or "off")
+    log.info("snapshot retention: %s (WIREHAND_SNAPSHOT_KEEP / _MAX_AGE_DAYS / _UNAPPLIED_DAYS)",
+             state.retention_summary())
+    if not state.SNAPSHOT_KEEP and not state.SNAPSHOT_MAX_AGE_DAYS:
+        log.warning("WIREHAND_SNAPSHOT_KEEP=0 and WIREHAND_SNAPSHOT_MAX_AGE_DAYS=0 - snapshots of applied "
+                    "changes are never removed and grow without limit")
+    _prune("startup")
+    stop = threading.Event()
+    pruner = threading.Thread(target=_prune_daily, args=(stop,), daemon=True, name="wirehand-prune")
+    pruner.start()
     yield
+    stop.set()
+    pruner.join(timeout=5)
     pool.close_all()
+
+
+def _prune(when: str) -> None:
+    try:
+        removed = changes.prune()
+    except Exception:
+        log.exception("snapshot cleanup (%s) failed", when)
+        return
+    if removed:
+        log.info("snapshot cleanup (%s): removed %d snapshot(s)", when, len(removed))
+
+
+def _prune_daily(stop: threading.Event) -> None:
+    while not stop.wait(PRUNE_INTERVAL):
+        _prune("daily")
 
 
 # Also the start of the description: Open WebUI shows that on mouse-over in the

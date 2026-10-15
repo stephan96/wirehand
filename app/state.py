@@ -30,6 +30,11 @@ SNAP_TIME_FORMAT = "%Y%m%d-%H%M%S"
 # What propose_change wrote on platforms without a snapshot command before 0.6.3.
 PLACEHOLDER_PREFIX = "(no config snapshot"
 
+# Snapshot retention per device; 0 switches a rule off. See prune().
+SNAPSHOT_KEEP = int(os.environ.get("WIREHAND_SNAPSHOT_KEEP", "20"))
+SNAPSHOT_MAX_AGE_DAYS = float(os.environ.get("WIREHAND_SNAPSHOT_MAX_AGE_DAYS", "90"))
+SNAPSHOT_UNAPPLIED_DAYS = float(os.environ.get("WIREHAND_SNAPSHOT_UNAPPLIED_DAYS", "7"))
+
 _audit_lock = threading.Lock()
 
 
@@ -199,6 +204,15 @@ def last_applied_snapshot(device: str, config_only: bool = True) -> Path | None:
     return snapshot_path(device, info.name) if info else None
 
 
+def retention_summary() -> str:
+    """The active retention rules, e.g. 'max 20, 90 days, unapplied 7 days'."""
+    return ", ".join([
+        f"max {SNAPSHOT_KEEP}" if SNAPSHOT_KEEP else "no count limit",
+        f"{SNAPSHOT_MAX_AGE_DAYS:g} days" if SNAPSHOT_MAX_AGE_DAYS else "no age limit",
+        f"unapplied {SNAPSHOT_UNAPPLIED_DAYS:g} days" if SNAPSHOT_UNAPPLIED_DAYS else "unapplied: no age limit",
+    ])
+
+
 def snapshot_time(path: Path) -> float:
     """When a snapshot was taken, from its name (container local time, like the
     time.strftime that made it); the file's mtime only if the name does not parse."""
@@ -235,9 +249,7 @@ class ChangeStore:
             d.mkdir(parents=True, exist_ok=True)
             p = d / (time.strftime(SNAP_TIME_FORMAT) + ".txt")
             p.write_text(content)
-            # keep last 20 snapshots per device
-            for old in sorted(d.glob("*.txt"))[:-20]:
-                old.unlink(missing_ok=True)
+            self.prune(device)
             return p
 
     def list_snapshots(self, device: str) -> list[Path]:
@@ -264,6 +276,74 @@ class ChangeStore:
         if p.parent != d or d.parent != SNAP_DIR.resolve():
             raise ValueError(f"invalid snapshot name '{name}'")
         return p if p.is_file() else None
+
+    def prune(self, device: str | None = None) -> list[tuple[str, str, str]]:
+        """Apply the retention rules to one device's snapshots, or to every
+        device's. Returns (device, name, reason) for each file removed.
+
+        Never removed: the rollback base (snapshot of the last applied config
+        change), and snapshots whose change is pending or has an unknown outcome.
+        Of the rest, in this order:
+          1. unapplied_age  not applied and older than SNAPSHOT_UNAPPLIED_DAYS
+          2. max_age        older than SNAPSHOT_MAX_AGE_DAYS
+          3. max_count      more than SNAPSHOT_KEEP: oldest first; protected
+                            snapshots count, but are skipped
+        """
+        with self._files:
+            if device is not None:
+                devices = [device]
+            else:
+                devices = sorted(p.name for p in SNAP_DIR.iterdir() if p.is_dir()) if SNAP_DIR.is_dir() else []
+            removed = []
+            for dev in devices:
+                removed += self._prune_device(dev)
+            return removed
+
+    def _prune_device(self, device: str) -> list[tuple[str, str, str]]:
+        files = self.list_snapshots(device)          # newest first
+        if not files:
+            self._remove_empty_dir(device)
+            return []
+        index = self.index(device)
+        base = last_applied(device, index=index)
+        keep = {n for n, i in index.items() if i.protected} | ({base.name} if base else set())
+        now = time.time()
+        doomed: dict[str, str] = {}
+        for p in files:
+            if p.stem in keep:
+                continue
+            info = index.get(p.stem) or SnapshotInfo(name=p.stem)
+            age_days = (now - snapshot_time(p)) / 86400
+            if SNAPSHOT_UNAPPLIED_DAYS and info.unapplied and age_days > SNAPSHOT_UNAPPLIED_DAYS:
+                doomed[p.stem] = "unapplied_age"
+            elif SNAPSHOT_MAX_AGE_DAYS and age_days > SNAPSHOT_MAX_AGE_DAYS:
+                doomed[p.stem] = "max_age"
+        if SNAPSHOT_KEEP:
+            left = [p for p in files if p.stem not in doomed]
+            count = len(left)
+            for p in reversed(left):                 # oldest first
+                if count <= SNAPSHOT_KEEP:
+                    break
+                if p.stem not in keep:
+                    doomed[p.stem] = "max_count"
+                    count -= 1
+        removed = []
+        for p in files:
+            reason = doomed.get(p.stem)
+            if reason is None:
+                continue
+            p.unlink(missing_ok=True)
+            audit("snapshot_pruned", device, snapshot=str(p), reason=reason)
+            removed.append((device, p.stem, reason))
+        self._remove_empty_dir(device)
+        return removed
+
+    @staticmethod
+    def _remove_empty_dir(device: str) -> None:
+        try:
+            (SNAP_DIR / device).rmdir()      # only succeeds when empty
+        except OSError:
+            pass
 
     def remaining(self) -> dict[str, float]:
         """Staged change ID -> seconds until it expires."""

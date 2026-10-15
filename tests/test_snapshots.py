@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 
 import pytest
@@ -200,3 +201,142 @@ def test_snapshot_time_from_the_name(data):
     odd.write_text("x")
     os.utime(odd, (1_000_000, 1_000_000))
     assert state.snapshot_time(odd) == 1_000_000
+
+
+# --------------------------------------------------------------- prune ---
+
+@pytest.fixture
+def retention(monkeypatch):
+    def set_(keep=20, max_age=90, unapplied=7):
+        monkeypatch.setattr(state, "SNAPSHOT_KEEP", keep)
+        monkeypatch.setattr(state, "SNAPSHOT_MAX_AGE_DAYS", max_age)
+        monkeypatch.setattr(state, "SNAPSHOT_UNAPPLIED_DAYS", unapplied)
+    set_()
+    return set_
+
+
+def applied(name, code, device="r1"):
+    snap(name, device)
+    staged(name, code, device)
+    ev("confirm_change", code, device)
+
+
+def left(device="r1"):
+    return {p.stem for p in main.changes.list_snapshots(device)}
+
+
+def pruned_events():
+    return [json.loads(l) for l in state.AUDIT_FILE.read_text().splitlines()
+            if json.loads(l)["event"] == "snapshot_pruned"]
+
+
+def test_prune_unapplied_age(data, retention):
+    old_expired, old_orphan, old_applied, young_expired = ago(8), ago(8, 1), ago(8, 2), ago(6)
+    for n, code in ((old_expired, "AAAAAA"), (young_expired, "BBBBBB")):
+        snap(n)
+        staged(n, code)
+    snap(old_orphan)
+    applied(old_applied, "CCCCCC")
+    applied(ago(1), "DDDDDD")                     # the rollback base is someone else
+    removed = main.changes.prune("r1")
+    assert sorted(removed) == sorted([("r1", old_expired, "unapplied_age"), ("r1", old_orphan, "unapplied_age")])
+    assert {old_applied, young_expired} <= left()
+    ev_ = pruned_events()
+    assert {(e["device"], os.path.basename(e["snapshot"]), e["reason"]) for e in ev_} == {
+        ("r1", f"{old_expired}.txt", "unapplied_age"), ("r1", f"{old_orphan}.txt", "unapplied_age")}
+
+
+def test_prune_max_age_keeps_the_rollback_base(data, retention):
+    base, older, young = ago(100), ago(120), ago(30)
+    applied(older, "AAAAAA")
+    applied(base, "BBBBBB")                       # last applied change, older than MAX_AGE_DAYS
+    snap(young)
+    staged(young, "CCCCCC")                       # expired, but young
+    retention(unapplied=0)
+    assert main.changes.prune("r1") == [("r1", older, "max_age")]
+    assert left() == {base, young}
+
+
+def test_prune_max_count_oldest_first_skipping_protected(data, retention):
+    names = [ago(1, i) for i in range(6)]         # names[0] newest
+    for i, n in enumerate(names):
+        snap(n)
+        staged(n, f"C0000{i}")
+    ev("confirm_change", "C00005")                # the oldest one is the rollback base
+    retention(keep=3)
+    removed = main.changes.prune("r1")
+    # the protected base counts towards the limit, but the next-oldest go instead of it
+    assert sorted(removed) == sorted(("r1", n, "max_count") for n in names[2:5])
+    assert left() == {names[0], names[1], names[5]}
+    retention(keep=1)                             # never below the protected ones
+    assert main.changes.prune("r1") == [("r1", names[0], "max_count"), ("r1", names[1], "max_count")]
+    assert left() == {names[5]}
+
+
+def test_prune_never_removes_pending_or_unknown(data, retention):
+    pend, unknown, timeout = ago(200), ago(200, 1), ago(200, 2)
+    for n, code in ((pend, "AAAAAA"), (unknown, "BBBBBB"), (timeout, "CCCCCC")):
+        snap(n)
+        staged(n, code)
+    main.changes._pending["AAAAAA"] = PendingChange("AAAAAA", "r1", ["x"], "")
+    ev("confirm_unknown", "BBBBBB")
+    ev("confirm_timeout", "CCCCCC")
+    retention(keep=1, max_age=1, unapplied=1)
+    assert main.changes.prune("r1") == []
+    assert left() == {pend, unknown, timeout}
+
+
+@pytest.mark.parametrize("off, want", [
+    ({"unapplied": 0, "max_age": 0, "keep": 0}, []),
+    ({"unapplied": 0, "keep": 0}, ["max_age"]),
+    ({"max_age": 0, "keep": 0}, ["unapplied_age"]),
+    ({"unapplied": 0, "max_age": 0}, ["max_count"]),
+])
+def test_prune_zero_switches_a_rule_off(data, retention, off, want):
+    old = ago(100)
+    snap(old)
+    staged(old, "AAAAAA")                         # expired, 100 days old
+    applied(ago(0, 60), "BBBBBB")                 # rollback base
+    retention(**{"keep": 1, "max_age": 90, "unapplied": 7, **off})
+    assert [r for _, _, r in main.changes.prune("r1")] == want
+
+
+def test_prune_count_only(data, retention):
+    for i in range(3):
+        snap(ago(0, 10 + i))
+    retention(keep=1, max_age=0, unapplied=0)
+    assert [r for _, _, r in main.changes.prune("r1")] == ["max_count", "max_count"]
+
+
+def test_prune_all_devices_and_empty_dirs(data, retention):
+    snap(ago(10), device="gone")
+    snap(ago(10), device="r1")
+    applied(ago(0, 5), "AAAAAA")
+    (state.SNAP_DIR / "empty").mkdir(parents=True)
+    removed = main.changes.prune()
+    assert {(d, r) for d, _, r in removed} == {("gone", "unapplied_age"), ("r1", "unapplied_age")}
+    assert not (state.SNAP_DIR / "gone").exists() and not (state.SNAP_DIR / "empty").exists()
+    assert (state.SNAP_DIR / "r1").is_dir()
+
+
+def test_save_snapshot_prunes_that_device(data, retention):
+    for i in range(3):
+        snap(ago(0, 10 + i))
+    snap(ago(0, 10), device="other")
+    snap(ago(0, 11), device="other")
+    retention(keep=2)
+    p = main.changes.save_snapshot("r1", RUNNING)
+    assert p.stem in left() and len(left()) == 2
+    assert len(left("other")) == 2                # other devices untouched
+
+
+def test_startup_prunes_and_logs_retention(data, retention, caplog):
+    snap(ago(10))
+    retention(keep=0, max_age=0)
+    caplog.set_level("INFO", logger="wirehand")
+    with TestClient(main.app):
+        assert left() == set()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("snapshot retention: no count limit, no age limit, unapplied 7 days" in m for m in msgs), msgs
+    assert any("grow without limit" in m for m in msgs), msgs
+    assert not any(t.name == "wirehand-prune" for t in threading.enumerate()), "stopped at shutdown"
