@@ -539,10 +539,10 @@ def confirm_change(
         try:
             verdict = approver.verify(approval)
         except ConfigError as exc:
-            audit("confirm_denied", dev.name, code=code, reason="approval not configured")
+            audit("confirm_denied", dev.name, code=pc.code, reason="approval not configured")
             raise HTTPException(503, str(exc))
         if not verdict.ok:
-            audit("confirm_denied", dev.name, code=code, reason=verdict.reason, approval_given=bool(approval.strip()))
+            audit("confirm_denied", dev.name, code=pc.code, reason=verdict.reason, approval_given=bool(approval.strip()))
             raise HTTPException(403, (
                 f"NOT APPLIED - {verdict.reason}. The change is still staged as {pc.code} until it "
                 f"expires. Ask the user for the current 6-digit code from their authenticator app "
@@ -566,14 +566,14 @@ def confirm_change(
     except ToolTimeout as t:
         # No automatic rollback: wirehand cannot tell what the device did, and
         # undoing a change that never landed is a change of its own.
-        audit("confirm_timeout", dev.name, code=code, mode=pc.mode, seconds=round(t.elapsed, 1))
+        audit("confirm_timeout", dev.name, code=pc.code, mode=pc.mode, seconds=round(t.elapsed, 1))
         raise HTTPException(504, (
             f"OUTCOME UNKNOWN on {dev.name} after {t.elapsed:.1f}s (deadline {t.seconds:g}s). The "
             f"change may or may not have been applied. Do NOT retry: the change ID {code} is used up and "
             f"the staged change is gone. Verify the current state with run_read and report it to the "
             f"user. The configuration from before this change was saved as {pc.snapshot_path}."))
     except AuthError as exc:
-        audit("auth_failed", dev.name, code=code)
+        audit("auth_failed", dev.name, code=pc.code)
         raise HTTPException(401, str(exc))
     except DeviceBusy as exc:
         # Nothing was sent: the change is staged again under the same change ID.
@@ -581,20 +581,20 @@ def confirm_change(
         again = ("Ask the user for a NEW 6-digit code from their authenticator app - the one just "
                  "used does not work twice - and call confirm_change again with it."
                  if approver.requires_approval(dev.confirm) else "Call confirm_change again.")
-        audit("device_busy", dev.name, tool="confirm_change", code=code)
+        audit("device_busy", dev.name, tool="confirm_change", code=pc.code)
         raise HTTPException(409, (
             f"{exc} NOT APPLIED. The change is still staged as {pc.code} until it expires. {again}"))
     except OutcomeUnknown as exc:
         # Something went wrong after the change reached the device: it may or may
         # not have been applied. Saying "APPLIED" or "failed" would both be guesses.
-        audit("confirm_unknown", dev.name, code=code, mode=pc.mode, error=str(exc))
+        audit("confirm_unknown", dev.name, code=pc.code, mode=pc.mode, error=str(exc))
         raise HTTPException(502, (
             f"NOT CONFIRMED - OUTCOME UNKNOWN on {dev.name}: {exc}. The change may or may not have "
             f"been applied. Do NOT retry confirm_change; the change ID {code} is used up. Verify the "
             f"current state with run_read and report it to the user. The configuration from before "
             f"this change was saved as {pc.snapshot_path}."))
     except Exception as exc:
-        audit("confirm_change_error", dev.name, code=code, error=str(exc))
+        audit("confirm_change_error", dev.name, code=pc.code, error=str(exc))
         raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. Snapshot {pc.snapshot_path} is available for rollback.")
     # Never report success while the device is still asking a question: the
     # command has not run then, and saying "ROLLED BACK" when nothing was rolled
@@ -602,13 +602,13 @@ def confirm_change(
     stuck = pending_prompt(out, dev.device_type)
     if stuck:
         pool.reset(dev)          # the session is sitting at that question
-        audit("confirm_incomplete", dev.name, code=code, mode=pc.mode, question=stuck[0])
+        audit("confirm_incomplete", dev.name, code=pc.code, mode=pc.mode, question=stuck[0])
         raise HTTPException(502, (
             f"NOT COMPLETED on {dev.name}: the device asked '{stuck[0]}' and is still waiting, "
             f"so the operation did NOT run. Nothing was applied by this call. Report this to the "
             f"user - it needs a fix on the wirehand host (the prompt is unknown to the "
             f"'prompts' in config/platforms/), not another attempt.\n\n{truncate(out, 4000)}"))
-    audit("confirm_change", dev.name, code=code, lines=pc.lines, mode=pc.mode,
+    audit("confirm_change", dev.name, code=pc.code, lines=pc.lines, mode=pc.mode,
           approval=approver.mode_for(dev.confirm))
     if pc.mode == "rollback":
         return truncate(f"ROLLED BACK on {dev.name} (change ID {code}). The device is back to the state "
