@@ -23,6 +23,10 @@ for m in list(sys.modules):
 from fastapi.testclient import TestClient
 from app import main
 
+def change_id(text):
+    """The 6-character staging handle from a propose_change / rollback_change response."""
+    return text.split("Change ID: ")[1][:6]
+
 RUNNING = "interface Loopback0\n ipv4 address 1.1.1.1/32\ninterface GigabitEthernet0/0/0/0\n description uplink\n"
 
 class FakePool:
@@ -51,7 +55,7 @@ assert c.get("/run_read", params={"device": "nope", "commands": "uptime"}, heade
 
 p = c.post("/propose_change", json={"device": "r1", "config": "interface Loopback10\n description test"}, headers=H)
 assert p.status_code == 200 and "STAGED" in p.text, p.text
-code = p.text.split("code: ")[1][:6]
+code = change_id(p.text)
 assert c.post("/propose_change", json={"device": "s1", "config": "echo hi"}, headers=H).status_code == 403
 assert c.post("/confirm_change", params={"code": "ZZZZZZ"}, headers=H).status_code == 404
 a = c.post("/confirm_change", params={"code": code}, headers=H)
@@ -60,7 +64,7 @@ assert c.post("/confirm_change", params={"code": code}, headers=H).status_code =
 # rollback_change is a WRITE: it must stage like propose_change, not apply on its own
 rb = c.post("/rollback_change", params={"device": "r1"}, headers=H)
 assert rb.status_code == 200 and "STAGED, NOT APPLIED" in rb.text and "rollback configuration last 1" in rb.text, rb.text
-rb_code = rb.text.split("code: ")[1][:6]
+rb_code = change_id(rb.text)
 assert all("rollback configuration last 1" not in " ".join(lines) for _, lines, _ in main.pool.configured), main.pool.configured
 a = c.post("/confirm_change", params={"code": rb_code}, headers=H)
 assert a.status_code == 200 and "ROLLED BACK" in a.text and "rollback configuration last 1" in a.text, a.text
@@ -83,7 +87,7 @@ assert pre.status_code == 200, pre.text
 print("CORS wide OK")
 p = c.post("/propose_change", json={"device": "r1", "config": "reset ospf process 1", "mode": "exec"}, headers=H)
 assert p.status_code == 200 and "user/exec view" in p.text, p.text
-code2 = p.text.split("code: ")[1][:6]
+code2 = change_id(p.text)
 a = c.post("/confirm_change", params={"code": code2}, headers=H)
 assert "EXECUTED" in a.text and "reset ospf process 1" in a.text and len(main.pool.configured) == 1, a.text
 assert c.post("/propose_change", json={"device": "r1", "config": "x", "mode": "wrong"}, headers=H).status_code == 400
@@ -95,7 +99,7 @@ open(os.environ["WIREHAND_INVENTORY"], "w").write(inv2 + "  fgt: {host: 1.1.1.3,
 c.get("/list_devices", params={"refresh": "true"}, headers=H)
 p = c.post("/propose_change", json={"device": "fgt", "config": "config system global\nset lldp-reception enable"}, headers=H)
 assert p.status_code == 200 and "+ end" in p.text and "lldp-reception" in p.text, p.text
-code3 = p.text.split("code: ")[1][:6]
+code3 = change_id(p.text)
 a = c.post("/confirm_change", params={"code": code3}, headers=H)
 assert a.status_code == 200 and main.pool.configured[-1][1][-1] == "end", a.text
 # non-FortiGate platforms still refuse exec commands inside a config change
@@ -105,7 +109,7 @@ assert p.status_code == 400 and "do reload" in p.text, p.text
 p = c.post("/propose_change", json={"device": "r1", "config": "interface Lo1\n description x\n exit\nend"}, headers=H)
 assert p.status_code == 200 and "+ end" not in p.text and "dropped from the end: ' exit', 'end'" in p.text, p.text
 n = len(main.pool.configured)
-a = c.post("/confirm_change", params={"code": p.text.split("code: ")[1][:6]}, headers=H)
+a = c.post("/confirm_change", params={"code": change_id(p.text)}, headers=H)
 assert a.status_code == 200 and main.pool.configured[n][1] == ["interface Lo1", " description x"], main.pool.configured
 assert c.post("/propose_change", json={"device": "r1", "config": "end"}, headers=H).status_code == 400
 # ... but in the middle it would leave config mode uncommitted (XR then asks and the session hangs)
@@ -171,8 +175,8 @@ main.approver = Approver(secret=secret, mode="totp", max_failures=3, lockout=60)
 main.pool = FakePool()
 
 p = c.post("/propose_change", json={"device": "r1", "config": "interface Loopback9\n description gated"}, headers=H)
-assert p.status_code == 200 and "STOP HERE" in p.text and "authenticator app" in p.text, p.text
-gated = p.text.split("code: ")[1][:6]
+assert p.status_code == 200 and "STOP HERE" in p.text and "authenticator app" in p.text and "Change ID: " in p.text, p.text
+gated = change_id(p.text)
 
 r = c.post("/confirm_change", params={"code": gated}, headers=H)                      # self-confirm
 assert r.status_code == 403 and main.pool.configured == [], (r.status_code, r.text)
@@ -187,14 +191,14 @@ assert a.status_code == 200 and "APPLIED" in a.text, a.text
 assert main.pool.configured[-1][1] == ["interface Loopback9", " description gated"], main.pool.configured
 
 p2 = c.post("/propose_change", json={"device": "r1", "config": "interface Loopback8"}, headers=H)
-g2 = p2.text.split("code: ")[1][:6]
+g2 = change_id(p2.text)
 r = c.post("/confirm_change", params={"code": g2, "approval": human}, headers=H)       # replay
 assert r.status_code == 403 and "already used" in r.text, r.text
 assert len(main.pool.configured) == 1, main.pool.configured
 
 rb = c.post("/rollback_change", params={"device": "r1"}, headers=H)                    # rollback is gated too
 assert "STOP HERE" in rb.text, rb.text
-rbc = rb.text.split("code: ")[1][:6]
+rbc = change_id(rb.text)
 assert c.post("/confirm_change", params={"code": rbc}, headers=H).status_code == 403
 print("APPROVAL ENFORCED OK")
 
@@ -204,14 +208,15 @@ open(os.environ["WIREHAND_INVENTORY"], "w").write(
     inv4 + "  lab1: {host: 1.1.1.9, device_type: cisco_xr, username: u, password: p, access: rw, confirm: off}\n")
 c.get("/list_devices", params={"refresh": "true"}, headers=H)
 p = c.post("/propose_change", json={"device": "lab1", "config": "interface Loopback7"}, headers=H)
-assert "STOP HERE" not in p.text and "Ask the user to approve" in p.text, p.text
-a = c.post("/confirm_change", params={"code": p.text.split("code: ")[1][:6]}, headers=H)
+assert "If the user agrees in the chat" in p.text and "No authenticator code is needed" in p.text, p.text
+assert "STOP HERE" not in p.text and "Ask the user to approve" not in p.text, p.text
+a = c.post("/confirm_change", params={"code": change_id(p.text)}, headers=H)
 assert a.status_code == 200 and "APPLIED" in a.text, a.text
 
 # ... and a missing/broken secret fails CLOSED, with a setup hint for the operator
 main.approver = Approver(secret="", mode="totp")
 p = c.post("/propose_change", json={"device": "r1", "config": "interface Loopback6"}, headers=H)
-r = c.post("/confirm_change", params={"code": p.text.split("code: ")[1][:6], "approval": "123456"}, headers=H)
+r = c.post("/confirm_change", params={"code": change_id(p.text), "approval": "123456"}, headers=H)
 assert r.status_code == 503 and "WIREHAND_TOTP_SECRET" in r.text, (r.status_code, r.text)
 
 log = c.get("/get_audit_log", params={"n": 200}, headers=H).text
@@ -238,7 +243,7 @@ main.approver = Approver(secret=secret, mode="off")
 main.pool = StuckPool()
 rb = c.post("/rollback_change", params={"device": "r1"}, headers=H)
 assert rb.status_code == 200 and "STAGED" in rb.text, rb.text
-r = c.post("/confirm_change", params={"code": rb.text.split("code: ")[1][:6]}, headers=H)
+r = c.post("/confirm_change", params={"code": change_id(rb.text)}, headers=H)
 assert r.status_code == 502, (r.status_code, r.text)
 assert "NOT COMPLETED" in r.text and "[Y/N]" in r.text, r.text
 assert main.pool.reset_called == ["r1"], "the session left at a prompt must be dropped"

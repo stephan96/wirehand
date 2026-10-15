@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Human approval for confirm_change.
 
-The problem this solves: the confirmation code from propose_change travels back
+The problem this solves: the change ID from propose_change travels back
 to the model, so a model that decides to approve on the user's behalf just calls
 confirm_change with the code it was handed a moment ago - which is exactly what
 small local models do:
