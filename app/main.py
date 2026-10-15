@@ -648,7 +648,7 @@ def confirm_change(
                         f"saved as {pc.snapshot_path}.\n\n{out}", MAX_OUT)
     if pc.mode == "exec":
         return truncate(f"EXECUTED on {dev.name} (change ID {code}, exec mode - nothing was committed).\n\n{out}", MAX_OUT)
-    rb = "native rollback available via rollback_change" if dev.platform.rollback_last else "no native rollback on this platform - rollback_change returns the snapshot for manual restore"
+    rb = "native rollback available via rollback_change" if dev.platform.rollback_last else "no native rollback on this platform - rollback_change returns the snapshot from before this change for a manual restore"
     return truncate(f"APPLIED on {dev.name} (change ID {code}). {rb}.\n\n{out}", MAX_OUT)
 
 
@@ -660,8 +660,8 @@ def confirm_change(
               "nothing is undone yet. Show the preview to the user, then apply it with confirm_change "
               "and that change ID. Whether the user must additionally give a 6-digit authenticator "
               "code depends on the device's CONFIRM mode (see list_devices). On platforms without a native rollback it "
-              "changes nothing and returns the pre-change snapshot instead, so you can derive a "
-              "corrective propose_change from it. "
+              "changes nothing and returns the snapshot taken before the last APPLIED change instead, "
+              "so you can derive a corrective propose_change from it. "
               "Example: rollback_change(device='r1')"
           ), dependencies=[Depends(auth)])
 def rollback_change(device: str = Query(..., description="Device name")) -> str:
@@ -670,14 +670,7 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
         raise HTTPException(403, f"device '{dev.name}' is read-only (access=ro)")
     cmds = list(dev.platform.rollback_last or [])
     if not cmds:
-        # No native rollback: returning the snapshot changes nothing on the device.
-        snap = changes.latest_snapshot(dev.name)
-        audit("rollback_snapshot", dev.name, snapshot=str(snap))
-        if not snap:
-            return f"No native rollback on {dev.device_type} and no snapshot found for {dev.name}."
-        return truncate(
-            f"No native rollback on {dev.device_type}. Pre-change snapshot {snap.name} follows; "
-            f"derive a corrective propose_change from it.\n\n{snap.read_text()}", MAX_OUT)
+        return _rollback_snapshot(dev)
 
     # A native rollback overwrites the running configuration - that is a write, so
     # it goes through the same two-stage gate (and the device's confirm mode) as any
@@ -705,6 +698,32 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
         f"as {snap_path.name} first.\n\n{preview}\n\n"
         + _next_step(dev, pc.code)
     )
+
+
+def _rollback_snapshot(dev) -> str:
+    """rollback_change without a native rollback: return the snapshot of the last
+    APPLIED change, which changes nothing on the device. Not simply the newest
+    snapshot - that may belong to a proposal that was never applied."""
+    index = changes.index(dev.name)
+    info = state.last_applied(dev.name, index=index)
+    if info is None:
+        audit("rollback_snapshot", dev.name, snapshot="", code="")
+        return (f"No native rollback on {dev.device_type}, and no applied change on {dev.name} has a "
+                f"saved snapshot. Nothing was changed. Do not use the newest snapshot instead - it may "
+                f"belong to a change that was never applied. list_snapshots(device='{dev.name}') shows "
+                f"what is there.")
+    path = state.snapshot_path(dev.name, info.name)
+    audit("rollback_snapshot", dev.name, snapshot=str(path), code=info.code)
+    head = (f"No native rollback on {dev.device_type}. Nothing was changed.\n"
+            f"Snapshot {info.name} is the configuration BEFORE change {info.code} - the last change "
+            f"applied on {dev.name} (applied {info.applied_ts}, reason: {info.reason or '-'}). "
+            f"Derive a corrective propose_change from it.\n")
+    newer = [n for n, i in sorted(index.items(), reverse=True)
+             if n > info.name and not i.applied and state.snapshot_path(dev.name, n).is_file()]
+    if newer:
+        head += (f"Newer snapshots belong to changes that were never applied and are NOT the rollback "
+                 f"base: {', '.join(newer[:5])}{', ...' if len(newer) > 5 else ''}.\n")
+    return truncate(f"{head}\n{path.read_text()}", MAX_OUT)
 
 
 def _size(n: int) -> str:

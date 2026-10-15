@@ -467,3 +467,30 @@ def test_openapi_has_the_snapshot_tools():
         assert f"{tool}(device='r1'" in op["description"]
     params = {p["name"] for p in paths["/get_snapshot"]["get"]["parameters"]}
     assert {"device", "name", "filter", "context"} <= params, params
+
+
+# -------------------------------------------- rollback without native ---
+
+def test_rollback_without_native_uses_the_last_applied_snapshot(data):
+    snap("20261015-100000", device="ios1", text="hostname before-A\n")
+    staged("20261015-100000", "AAAAAA", device="ios1", reason="OSPF cost")
+    ev("confirm_change", "AAAAAA", device="ios1", ts="2026-10-15T10:01:00+0200")
+    snap("20261015-110000", device="ios1", text="hostname before-B\n")
+    staged("20261015-110000", "BBBBBB", device="ios1")          # proposed, never applied
+    r = client.post("/rollback_change", params={"device": "ios1"}, headers=H)
+    assert r.status_code == 200, r.text
+    assert "Snapshot 20261015-100000 is the configuration BEFORE change AAAAAA" in r.text, r.text
+    assert "reason: OSPF cost" in r.text and "Nothing was changed" in r.text
+    assert "never applied" in r.text and "20261015-110000" in r.text
+    assert r.text.endswith("hostname before-A\n") and "before-B" not in r.text
+    last = json.loads(state.AUDIT_FILE.read_text().splitlines()[-1])
+    assert last["event"] == "rollback_snapshot" and last["code"] == "AAAAAA"
+    assert last["snapshot"].endswith("ios1/20261015-100000.txt")
+
+
+def test_rollback_without_native_and_nothing_applied(data):
+    snap("20261015-110000", device="ios1")
+    staged("20261015-110000", "BBBBBB", device="ios1")
+    r = client.post("/rollback_change", params={"device": "ios1"}, headers=H)
+    assert r.status_code == 200 and "no applied change on ios1 has a saved snapshot" in r.text, r.text
+    assert "list_snapshots(device='ios1')" in r.text and RUNNING not in r.text
