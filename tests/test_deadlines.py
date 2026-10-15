@@ -126,7 +126,7 @@ class RecordingPool:
 def _staged(path, **kw):
     r = client.post(path, headers=H, **kw)
     assert r.status_code == 200 and "STAGED" in r.text, r.text
-    return r.text.split("code: ")[1][:6]
+    return r.text.split("Change ID: ")[1][:6]
 
 
 def _audit_events():

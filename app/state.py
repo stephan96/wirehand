@@ -95,7 +95,7 @@ class ChangeStore:
             self._purge()
             pc = self._pending.get(code.strip().upper())
         if pc is None:
-            raise KeyError(f"no pending change with code '{code}' (expired after {CHANGE_TTL}s, or already applied)")
+            raise KeyError(f"no pending change with change ID '{code}' (expired after {CHANGE_TTL}s, or already applied)")
         return pc
 
     def pop(self, code: str) -> PendingChange:
@@ -103,7 +103,7 @@ class ChangeStore:
             self._purge()
             pc = self._pending.pop(code.strip().upper(), None)
         if pc is None:
-            raise KeyError(f"no pending change with code '{code}' (expired after {CHANGE_TTL}s, or already applied)")
+            raise KeyError(f"no pending change with change ID '{code}' (expired after {CHANGE_TTL}s, or already applied)")
         return pc
 
     def restore(self, pc: PendingChange) -> None:

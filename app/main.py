@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI):
 
 # Also the start of the description: Open WebUI shows that on mouse-over in the
 # chat's tool selection, so users see which version they are talking to.
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 
 app = FastAPI(
     title="wirehand",
@@ -189,7 +189,7 @@ def _propose_timeout(t: ToolTimeout, dev, tool: str) -> HTTPException:
     return HTTPException(504, (
         f"TIMED OUT on {dev.name} after {t.elapsed:.1f}s (deadline {t.seconds:g}s) while taking the "
         f"configuration snapshot. Nothing was staged and nothing was applied - there is no "
-        f"confirmation code. Check the device with list_devices(check=true), then call {tool} again."))
+        f"change ID. Check the device with list_devices(check=true), then call {tool} again."))
 
 
 def _busy(dev, exc: DeviceBusy, **fields) -> HTTPException:
@@ -201,15 +201,17 @@ def _next_step(dev, code: str) -> str:
     """What the model must do to get the staged change applied. In totp mode it
     cannot do it alone, and the text says so in the imperative the small models
     actually follow - the old 'Ask the user to approve. Then call confirm_change'
-    was read by some as 'call confirm_change now'."""
+    was read by some as 'call confirm_change now'. In off mode nothing enforces a
+    human step, so the text does not pretend one exists."""
     if not approver.requires_approval(dev.confirm):
-        return f"Ask the user to approve. Then call confirm_change(code='{code}')."
+        return (f"Show the preview above to the user. If the user agrees in the chat, apply it "
+                f"with confirm_change(code='{code}'). No authenticator code is needed for this device.")
     return (
         f"STOP HERE. This device needs approval by a human: the user must read the current "
         f"6-digit code from their authenticator app and send it to you. You cannot generate, "
         f"guess or remember that number, and a code you used before will not work again. "
         f"If it is not in the user's NEXT message, ask for it and wait - do not call any tool. "
-        f"Once the user gives you the number, call "
+        f"Once the user gives you the number, call confirm_change with change ID {code}: "
         f"confirm_change(code='{code}', approval='<the 6 digits from the user>')."
     )
 
@@ -230,7 +232,8 @@ def _confirm_label(dev) -> str:
          description=(
              "Returns device names, platform and access level (ro = read only, rw = changes allowed). "
              "CONFIRM says what applying a change needs: totp = the user must give you a 6-digit "
-             "authenticator code for confirm_change; off = the user's approval in the chat is enough; "
+             "authenticator code for confirm_change; off = no authenticator code needed; confirm_change "
+             "only needs the change ID; "
              "- = read-only device. "
              "Call this first if you do not know the exact device name. "
              "With check=true, also tests which devices are currently reachable from the wirehand "
@@ -416,16 +419,18 @@ class ProposeIn(BaseModel):
         "config (default): configuration lines applied in config/system view and committed/saved. "
         "exec: operational maintenance commands run in user/exec view WITHOUT entering config mode - "
         "use this for reset/clear/process-restart commands (e.g. Huawei 'reset ospf process 1', "
-        "Cisco 'clear bgp ipv4 unicast *'). Both modes require user approval via confirm_change."))
+        "Cisco 'clear bgp ipv4 unicast *'). Both modes are only staged here and applied via confirm_change."))
 
 
 @app.post("/propose_change", operation_id="propose_change", response_class=PlainTextResponse,
           summary="Stage a configuration change (does NOT apply it)",
           description=(
               "Step 1 of 2 for any change. Takes a snapshot of the current configuration, shows a "
-              "diff/preview and returns a 6-character confirmation code. NOTHING is applied yet. "
-              "Show the code and the preview to the user and ask for explicit approval. Only after "
-              "the user approves, call confirm_change with that code. Codes expire after 10 minutes. "
+              "diff/preview and returns a 6-character change ID. NOTHING is applied yet. "
+              "Show the preview to the user, then apply it with confirm_change and that change ID. "
+              "Whether the user must additionally give a 6-digit authenticator code depends on the "
+              "device's CONFIRM mode (see list_devices); the response says which. "
+              "Change IDs are single-use and expire after 10 minutes. "
               "Examples: propose_change(device='r1', config='interface Loopback10\\n description test\\n ipv4 address 10.0.0.10/32', reason='add test loopback') | "
               "maintenance: propose_change(device='ne1', config='reset ospf process 1', mode='exec', reason='restart OSPF after area change')"
           ), dependencies=[Depends(auth)])
@@ -497,16 +502,16 @@ def propose_change(body: ProposeIn) -> str:
     pc = changes.create(dev.name, lines, snap_path, preview, mode=body.mode)
     audit("propose_change", dev.name, code=pc.code, lines=lines, reason=body.reason, mode=body.mode, snapshot=str(snap_path))
     return (
-        f"STAGED, NOT APPLIED. Confirmation code: {pc.code}  (device {dev.name}, expires in 10 min)\n"
+        f"STAGED, NOT APPLIED. Change ID: {pc.code}  (device {dev.name}, expires in 10 min)\n"
         f"Snapshot saved: {snap_path.name}\n\n{preview}\n\n"
         + _next_step(dev, pc.code)
     )
 
 
 @app.post("/confirm_change", operation_id="confirm_change", response_class=PlainTextResponse,
-          summary="Apply a previously proposed change after the user approved it",
+          summary="Apply a previously staged change",
           description=(
-              "Step 2 of 2. Applies the staged change identified by the code from propose_change "
+              "Step 2 of 2. Applies the staged change identified by the change ID from propose_change "
               "or rollback_change, commits/saves it and returns the device output. Most devices "
               "additionally require `approval`: the current 6-digit one-time code from the USER's "
               "authenticator app, which only the user can read. Never call this tool with an "
@@ -516,7 +521,7 @@ def propose_change(body: ProposeIn) -> str:
               "Example: confirm_change(code='A1B2C3', approval='481502')"
           ), dependencies=[Depends(auth)])
 def confirm_change(
-    code: str = Query(..., min_length=6, max_length=6, description="6-character code from propose_change / rollback_change"),
+    code: str = Query(..., min_length=6, max_length=6, description="6-character change ID from propose_change / rollback_change"),
     approval: str = Query("", description=(
         "The current 6-digit code from the USER's authenticator app, exactly as the user sent it. "
         "It changes every 30 seconds and each code works only once. You cannot compute or recall "
@@ -564,14 +569,14 @@ def confirm_change(
         audit("confirm_timeout", dev.name, code=code, mode=pc.mode, seconds=round(t.elapsed, 1))
         raise HTTPException(504, (
             f"OUTCOME UNKNOWN on {dev.name} after {t.elapsed:.1f}s (deadline {t.seconds:g}s). The "
-            f"change may or may not have been applied. Do NOT retry: the code {code} is used up and "
+            f"change may or may not have been applied. Do NOT retry: the change ID {code} is used up and "
             f"the staged change is gone. Verify the current state with run_read and report it to the "
             f"user. The configuration from before this change was saved as {pc.snapshot_path}."))
     except AuthError as exc:
         audit("auth_failed", dev.name, code=code)
         raise HTTPException(401, str(exc))
     except DeviceBusy as exc:
-        # Nothing was sent: the change is staged again under the same code.
+        # Nothing was sent: the change is staged again under the same change ID.
         changes.restore(pc)
         again = ("Ask the user for a NEW 6-digit code from their authenticator app - the one just "
                  "used does not work twice - and call confirm_change again with it."
@@ -585,7 +590,7 @@ def confirm_change(
         audit("confirm_unknown", dev.name, code=code, mode=pc.mode, error=str(exc))
         raise HTTPException(502, (
             f"NOT CONFIRMED - OUTCOME UNKNOWN on {dev.name}: {exc}. The change may or may not have "
-            f"been applied. Do NOT retry confirm_change; the code {code} is used up. Verify the "
+            f"been applied. Do NOT retry confirm_change; the change ID {code} is used up. Verify the "
             f"current state with run_read and report it to the user. The configuration from before "
             f"this change was saved as {pc.snapshot_path}."))
     except Exception as exc:
@@ -606,22 +611,23 @@ def confirm_change(
     audit("confirm_change", dev.name, code=code, lines=pc.lines, mode=pc.mode,
           approval=approver.mode_for(dev.confirm))
     if pc.mode == "rollback":
-        return truncate(f"ROLLED BACK on {dev.name} (code {code}). The device is back to the state "
+        return truncate(f"ROLLED BACK on {dev.name} (change ID {code}). The device is back to the state "
                         f"before its last commit; the configuration from before this rollback was "
                         f"saved as {pc.snapshot_path}.\n\n{out}", MAX_OUT)
     if pc.mode == "exec":
-        return truncate(f"EXECUTED on {dev.name} (code {code}, exec mode - nothing was committed).\n\n{out}", MAX_OUT)
+        return truncate(f"EXECUTED on {dev.name} (change ID {code}, exec mode - nothing was committed).\n\n{out}", MAX_OUT)
     rb = "native rollback available via rollback_change" if dev.platform.rollback_last else "no native rollback on this platform - rollback_change returns the snapshot for manual restore"
-    return truncate(f"APPLIED on {dev.name} (code {code}). {rb}.\n\n{out}", MAX_OUT)
+    return truncate(f"APPLIED on {dev.name} (change ID {code}). {rb}.\n\n{out}", MAX_OUT)
 
 
 @app.post("/rollback_change", operation_id="rollback_change", response_class=PlainTextResponse,
           summary="Stage an undo of the last applied change (does NOT apply it)",
           description=(
               "Step 1 of 2, exactly like propose_change: on IOS-XR / Huawei VRPv8 / Junos this STAGES "
-              "a native rollback of the last commit and returns a 6-character confirmation code - "
-              "nothing is undone yet. Show the code to the user, ask for explicit approval, and only "
-              "then call confirm_change with that code. On platforms without a native rollback it "
+              "a native rollback of the last commit and returns a 6-character change ID - "
+              "nothing is undone yet. Show the preview to the user, then apply it with confirm_change "
+              "and that change ID. Whether the user must additionally give a 6-digit authenticator "
+              "code depends on the device's CONFIRM mode (see list_devices). On platforms without a native rollback it "
               "changes nothing and returns the pre-change snapshot instead, so you can derive a "
               "corrective propose_change from it. "
               "Example: rollback_change(device='r1')"
@@ -642,8 +648,8 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
             f"derive a corrective propose_change from it.\n\n{snap.read_text()}", MAX_OUT)
 
     # A native rollback overwrites the running configuration - that is a write, so
-    # it goes through the same human-approved two-stage gate as any other change
-    # instead of applying on a single call.
+    # it goes through the same two-stage gate (and the device's confirm mode) as any
+    # other change instead of applying on a single call.
     snap_cmd = dev.platform.snapshot
     try:
         snapshot = (_within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1] if snap_cmd
@@ -662,7 +668,7 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
     pc = changes.create(dev.name, cmds, snap_path, preview, mode="rollback")
     audit("rollback_staged", dev.name, code=pc.code, lines=cmds, snapshot=str(snap_path))
     return (
-        f"STAGED, NOT APPLIED. Confirmation code: {pc.code}  (device {dev.name}, expires in 10 min)\n"
+        f"STAGED, NOT APPLIED. Change ID: {pc.code}  (device {dev.name}, expires in 10 min)\n"
         f"This undoes the last commit on {dev.name}. The configuration as it is RIGHT NOW was saved "
         f"as {snap_path.name} first.\n\n{preview}\n\n"
         + _next_step(dev, pc.code)

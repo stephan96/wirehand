@@ -2,7 +2,7 @@
 
 *A hand on the wires - with a glove on.*
 
-**Version:** 0.6.1 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.2 · **License:** [Apache-2.0](LICENSE)
 
 ## Contents
 
@@ -83,12 +83,12 @@ long as it applies changes the way one of the existing platforms does (see
 
 | Tool | Type | What it does |
 |---|---|---|
-| `list_devices(refresh, check)` | read | Device names, platform, access level, CONFIRM (what applying a change needs: `totp` = authenticator code, `off` = chat approval, `-` = read-only), mgmt IP. `refresh=true` forces a rescan; `check=true` adds a STATE column (up / DOWN / `up?`) by TCP-probing each SSH port from the wirehand host. |
+| `list_devices(refresh, check)` | read | Device names, platform, access level, CONFIRM (what applying a change needs: `totp` = authenticator code + change ID, `off` = change ID only, `-` = read-only), mgmt IP. `refresh=true` forces a rescan; `check=true` adds a STATE column (up / DOWN / `up?`) by TCP-probing each SSH port from the wirehand host. |
 | `get_facts(device)` | read | One-call overview bundle (version, interfaces, routing summary, neighbors, recent log) - the intended first step of an analysis. |
 | `run_read(device, commands, filter, context)` | read | Read-only commands. On network devices a blocklist plus argument-level checks; on **Linux devices an allow-list**: only known read-only commands run at all, everything else is refused (see "Key properties"). `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
-| `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char code. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
-| `confirm_change(code, approval)` | write | Applies the staged change: config mode + commit/save for `config`, plain exec for `exec` and for a staged `rollback`. Requires `access: rw` and - unless confirmation is switched off for that device - `approval`: the current 6-digit one-time code from the operator's authenticator app. See "Approving changes". |
-| `rollback_change(device)` | stage | IOS-XR / VRPv8 / Junos: *stages* a native rollback of the last commit and returns a confirmation code - **undoes nothing** until `confirm_change`. Other platforms: touches nothing and returns the pre-change snapshot so a corrective change can be proposed. |
+| `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char change ID. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
+| `confirm_change(code, approval)` | write | Applies the staged change identified by its change ID (`code`): config mode + commit/save for `config`, plain exec for `exec` and for a staged `rollback`. Requires `access: rw` and - unless confirmation is switched off for that device - `approval`: the current 6-digit one-time code from the operator's authenticator app. See "Approving changes". |
+| `rollback_change(device)` | stage | IOS-XR / VRPv8 / Junos: *stages* a native rollback of the last commit and returns a change ID - **undoes nothing** until `confirm_change`. Other platforms: touches nothing and returns the pre-change snapshot so a corrective change can be proposed. |
 | `get_audit_log(device, n)` | read | The last `n` audit entries, optionally filtered by device. |
 
 Output of every tool is plain text (small local models handle text much better than
@@ -115,11 +115,11 @@ output together with the hint to use `filter`.
   they live in `config/safety/` - one file per device type plus a shared `common.yaml`
   (see "Configuration") - and are validated on load.
 - **Every write is two-stage and human-gated.** `propose_change` and `rollback_change` only
-  *stage* an operation and return a confirmation code. Codes are single-use and expire after
+  *stage* an operation and return a change ID. Change IDs are single-use and expire after
   10 minutes.
-- **The approval is something the model cannot produce.** The staged code travels back
+- **The approval is something the model cannot produce.** The change ID travels back
   through the model, so on its own it proves nothing - a model that decides to approve for
-  you simply calls `confirm_change` with the code it was just handed, and small local models
+  you simply calls `confirm_change` with the change ID it was just handed, and small local models
   do exactly that. `confirm_change` therefore also wants a one-time code (TOTP) from the
   operator's authenticator app: valid ~30 seconds, consumed on first use, never visible to
   the model until a human types it into the chat. No system prompt can replace this - see
@@ -574,9 +574,9 @@ system prompt:
 > filter regex. Never claim a command ran unless you called a tool; base all findings
 > on tool output only. On AUTHENTICATION FAILED, report it and stop for that device; if
 > the user says the credentials are fixed, call list_devices(refresh=true) and try
-> again. Changes: call propose_change, show the user the preview and the code, then
+> again. Changes: call propose_change, show the user the preview and the change ID, then
 > stop and wait for explicit approval; only then call confirm_change with that exact
-> code. Maintenance commands (reset, clear, process restarts) go through propose_change
+> change ID. Maintenance commands (reset, clear, process restarts) go through propose_change
 > with mode='exec', never run_read. If unsure about platform CLI syntax, verify it via
 > web search before proposing a change.
 
@@ -615,9 +615,9 @@ message. Same text as above, with the middle paragraph added:
 > questions that need no device access (concepts, CLI syntax, planning) are answered
 > normally.
 >
-> Changes: call propose_change, show the user the preview and the code, then stop and
-> wait for explicit approval; only then call confirm_change with that exact code. The
-> same applies to rollback_change: it only stages the undo and returns a code, so show
+> Changes: call propose_change, show the user the preview and the change ID, then stop
+> and wait for explicit approval; only then call confirm_change with that exact change ID.
+> The same applies to rollback_change: it only stages the undo and returns a change ID, so show
 > it, wait for approval, then call confirm_change. If the tool answer asks for an
 > approval code, the user has to read a 6-digit number from their authenticator app:
 > ask for it in plain words and wait for their reply. Never put a number there that
@@ -769,14 +769,18 @@ Thought: Executing confirm_change...
 confirm_change(code='65C02D')
 ```
 
-Nothing in a system prompt fixes this. The model is *told* to wait, and the code it needs
+(That transcript is from before 0.6.2. The 6-character code is now labelled
+"Change ID", and in `off` mode the next-step text no longer says "Ask the user to
+approve" - it says what actually happens.)
+
+Nothing in a system prompt fixes this. The model is *told* to wait, and the change ID it needs
 is in its own context - instructions it can ignore, plus a secret it already has. So the
 approval is a **time-based one-time code (TOTP)** that only a human can read:
 
 | `WIREHAND_CONFIRM_MODE` | `confirm_change` needs | Use for |
 |---|---|---|
-| `totp` (default) | `code` **and** a fresh 6-digit code from your authenticator app | anything you care about |
-| `off` | `code` only - the model may apply its own proposal | disposable labs, unattended runs |
+| `totp` (default) | the change ID (`code`) **and** a fresh 6-digit code from your authenticator app | anything you care about |
+| `off` | the change ID (`code`) only - the model may apply its own proposal | disposable labs, unattended runs |
 
 `confirm: totp` / `confirm: off` per device in [`config/inventory.yaml`](#configinventoryyaml)
 overrides the global mode, so lab nodes can stay frictionless while real devices need a
@@ -817,7 +821,7 @@ returns it**, precisely so a front-end (and with it the model) cannot fetch it.
 
 ```
 you:   add a loopback on vrp1
-model: <calls propose_change, shows the preview and the code, then stops and asks>
+model: <calls propose_change, shows the preview and the change ID, then stops and asks>
 you:   734891                       <- read from the authenticator app
 model: <calls confirm_change(code='65C02D', approval='734891')>  -> APPLIED
 ```
@@ -851,7 +855,7 @@ its own.
 |---|---|---|---|
 | `WIREHAND_DEADLINE_READ` | 60 s | a whole `run_read` (all devices) or `get_facts` call | 504 `TIMED OUT ... Nothing was changed`; audit `read_timeout` |
 | `WIREHAND_DEADLINE_PROPOSE` | 60 s | `propose_change` / `rollback_change` (the configuration snapshot) | 504 `TIMED OUT ... Nothing was staged and nothing was applied`, no code; audit `propose_timeout` |
-| `WIREHAND_DEADLINE_CONFIRM` | 60 s | `confirm_change` (sending, commit/save, answering device questions) | 504 `OUTCOME UNKNOWN ... Do NOT retry`; the code is used up; audit `confirm_timeout` |
+| `WIREHAND_DEADLINE_CONFIRM` | 60 s | `confirm_change` (sending, commit/save, answering device questions) | 504 `OUTCOME UNKNOWN ... Do NOT retry`; the change ID is used up; audit `confirm_timeout` |
 | `WIREHAND_LOCK_WAIT` | 20 s | waiting for another call on the same device to finish | 409 `DEVICE BUSY ... Nothing was sent`, retry later; audit `device_busy`. For `confirm_change` the change stays staged under the same code |
 | `WIREHAND_CMD_TIMEOUT` | 45 s | one read command (Netmiko `read_timeout`) | the read is retried once on a fresh connection; if that fails too, the error appears in that command's output |
 | `WIREHAND_CHANGE_CMD_TIMEOUT` | 45 s | one change step: each exec/rollback command, the config lines, `commit` | 502 `NOT CONFIRMED - OUTCOME UNKNOWN`, never retried; audit `confirm_unknown` |
@@ -950,7 +954,7 @@ changes with age).
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
 | `confirm_change` returns 502 `NOT COMPLETED: the device asked ...` | the platform asks a question wirehand does not know | add the pattern to `prompts` in `config/platforms/` and restart; nothing was applied, the session was dropped |
 | `confirm_change` returns 504 `OUTCOME UNKNOWN` | the device did not finish within `WIREHAND_DEADLINE_CONFIRM` | check the device state with `run_read` and decide by hand; nothing is rolled back automatically. If the device is just slow at committing, raise `WIREHAND_DEADLINE_CONFIRM` (and the front-end's tool timeout with it) |
-| `confirm_change` returns 502 `NOT CONFIRMED - OUTCOME UNKNOWN` | the connection broke after the change was sent | check the device state with `run_read`; the code is used up, propose again if needed |
+| `confirm_change` returns 502 `NOT CONFIRMED - OUTCOME UNKNOWN` | the connection broke after the change was sent | check the device state with `run_read`; the change ID is used up, propose again if needed |
 | HTTP 409 `DEVICE BUSY` | another call (often one that timed out) still holds that device | wait a minute and retry; nothing was sent |
 | The model reports a timeout, wirehand's audit log shows the call succeeded | the front-end's tool timeout is shorter than wirehand's deadline | raise the front-end's tool timeout above 60 s (or above your `WIREHAND_DEADLINE_*`) |
 | `confirm_change` returns 503 with a setup hint | `WIREHAND_CONFIRM_MODE=totp` but no usable `WIREHAND_TOTP_SECRET` | generate one (`docker exec wirehand python -m app.approval --new`), put it in `.env`, `docker compose up -d` - or set `WIREHAND_CONFIRM_MODE=off` |
@@ -1045,10 +1049,10 @@ and changes need a code that a human must approve. See "Key properties".
 
 **8. Exactly one server process.**
 Web services are often run as several parallel copies (*workers*) for speed. wirehand
-deliberately runs a single one. The confirmation codes of changes waiting for approval,
+deliberately runs a single one. The change IDs of changes waiting to be confirmed,
 and the open SSH connections to devices, are kept in that process's memory. With two
 copies, a change could be proposed in one and confirmed in the other, which would not
-know the code - approval would fail at random. For a tool used by a few people through
+know the change ID - confirmation would fail at random. For a tool used by a few people through
 a chat, one process is fast enough.
 
 ### The short version

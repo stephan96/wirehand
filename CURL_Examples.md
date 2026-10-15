@@ -130,8 +130,8 @@ curl -s -H "$AUTH" -H "Content-Type: application/json" -X POST $WH/propose_chang
 }'
 ```
 
-The response ends with the 6-character code, e.g.
-`STAGED, NOT APPLIED. Confirmation code: 7F80AE`.
+The response starts with the 6-character change ID, e.g.
+`STAGED, NOT APPLIED. Change ID: 7F80AE`.
 
 ## 5. confirm_change - apply the staged change
 
@@ -152,13 +152,13 @@ curl -s -i -H "$AUTH" -X POST "$WH/confirm_change?code=7F80AE&approval=123456" |
 docker exec wirehand python -m app.approval
 ```
 
-Propose and confirm in one go (grabs the code automatically - convenient for smoke tests,
-never do this in production, it bypasses the human approval the code exists for):
+Propose and confirm in one go (grabs the change ID automatically - convenient for smoke
+tests on a `confirm: off` device, never do this in production):
 
 ```bash
 CODE=$(curl -s -H "$AUTH" -H "Content-Type: application/json" -X POST $WH/propose_change \
   -d '{"device":"xrd-test-xrd1","config":"interface Loopback10\n description test","reason":"smoke"}' \
-  | sed -n 's/.*Confirmation code: \([A-F0-9]\{6\}\).*/\1/p')
+  | sed -n 's/.*Change ID: \([A-F0-9]\{6\}\).*/\1/p')
 echo "code=$CODE"
 curl -s -H "$AUTH" -X POST "$WH/confirm_change?code=$CODE"
 ```
@@ -166,7 +166,7 @@ curl -s -H "$AUTH" -X POST "$WH/confirm_change?code=$CODE"
 Error cases worth testing once:
 
 ```bash
-# unknown/expired code -> 404
+# unknown/expired change ID -> 404
 curl -s -i -H "$AUTH" -X POST "$WH/confirm_change?code=ZZZZZZ" | head -1
 
 # read-only device -> 403
@@ -177,14 +177,14 @@ curl -s -i -H "$AUTH" -H "Content-Type: application/json" -X POST $WH/propose_ch
 ## 6. rollback_change - stage an undo of the last change
 
 Like propose_change, this applies nothing: on IOS-XR / VRPv8 / Junos it stages the native
-rollback and returns a code, which confirm_change then applies.
+rollback and returns a change ID, which confirm_change then applies.
 
 ```bash
 curl -s -H "$AUTH" -X POST "$WH/rollback_change?device=xrd-test-xrd1"
-# STAGED, NOT APPLIED. Confirmation code: 3C19B4 ...
+# STAGED, NOT APPLIED. Change ID: 3C19B4 ...
 
 curl -s -H "$AUTH" -X POST "$WH/confirm_change?code=3C19B4"
-# ROLLED BACK on xrd-test-xrd1 (code 3C19B4). ...
+# ROLLED BACK on xrd-test-xrd1 (change ID 3C19B4). ...
 ```
 
 Platforms without a native rollback (IOS/NX-OS/EOS/VRP5/FortiGate/Linux) touch nothing and
