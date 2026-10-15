@@ -795,10 +795,10 @@ def list_snapshots(device: str = Query(..., description="Device name from list_d
         if p.stem in placeholders:
             reason = "[placeholder] " + (i.reason or "")
         rows.append(f"{p.stem:<17} {_size(p.stat().st_size):<7} {i.trigger or '-':<16} {i.code or '-':<7} "
-                    f"{i.status:<{sw}} {reason}".rstrip())
+                    f"{i.status:<{sw}}  {reason}".rstrip())
     out = [f"Snapshots for {dev.name} ({len(files)}, newest first). Each snapshot is the configuration "
            f"BEFORE the change.", "",
-           f"{'NAME':<17} {'SIZE':<7} {'TRIGGER':<16} {'CHANGE':<7} {'STATUS':<{sw}} REASON", *rows, ""]
+           f"{'NAME':<17} {'SIZE':<7} {'TRIGGER':<16} {'CHANGE':<7} {'STATUS':<{sw}}  REASON", *rows, ""]
     if placeholders:
         out.append(PLACEHOLDER_NOTE)
     example = base.name if base else files[0].stem
