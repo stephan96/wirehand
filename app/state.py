@@ -27,8 +27,9 @@ CHANGE_TTL = int(os.environ.get("WIREHAND_CHANGE_TTL", "600"))
 
 SNAP_NAME = re.compile(r"^\d{8}-\d{6}$")
 SNAP_TIME_FORMAT = "%Y%m%d-%H%M%S"
-# What propose_change wrote on platforms without a snapshot command before 0.6.3.
-PLACEHOLDER_PREFIX = "(no config snapshot"
+# What propose_change wrote on platforms without a snapshot command before 0.6.3,
+# e.g. "(no config snapshot on this platform; ...)" or "(linux: no config snapshot; ...)".
+PLACEHOLDER_MARK = "no config snapshot"
 
 # Snapshot retention per device; 0 switches a rule off. See prune().
 SNAPSHOT_KEEP = int(os.environ.get("WIREHAND_SNAPSHOT_KEEP", "20"))
@@ -175,9 +176,10 @@ def is_placeholder(path: Path) -> bool:
     """A pre-0.6.3 marker file from a platform without a snapshot command."""
     try:
         with path.open() as fh:
-            return fh.read(len(PLACEHOLDER_PREFIX)) == PLACEHOLDER_PREFIX
-    except OSError:
+            head = fh.read(80)
+    except (OSError, UnicodeDecodeError):
         return False
+    return head.startswith("(") and PLACEHOLDER_MARK in head
 
 
 def last_applied(device: str, config_only: bool = True,

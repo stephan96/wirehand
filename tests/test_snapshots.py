@@ -170,11 +170,18 @@ def test_last_applied_snapshot(data):
     assert state.last_applied_snapshot("r1").stem == "20261015-110000"
 
 
-def test_last_applied_skips_placeholders(data):
-    snap("20261015-100000", text="(no config snapshot on this platform; per-file backups ...)")
+@pytest.mark.parametrize("text", [
+    "(no config snapshot on this platform; per-file backups are your responsibility - ...)",
+    "(linux: no config snapshot; per-file backups are your responsibility - ...)",
+    "(no config snapshot for this platform)",
+])
+def test_last_applied_skips_placeholders(data, text):
+    snap("20261015-100000", text=text)
     staged("20261015-100000", "AAAAAA")
     ev("confirm_change", "AAAAAA")
+    assert state.is_placeholder(state.snapshot_path("r1", "20261015-100000"))
     assert state.last_applied_snapshot("r1") is None
+    assert not state.is_placeholder(snap("20261015-100001"))
 
 
 # ---------------------------------------------------------- ChangeStore ---
