@@ -494,3 +494,48 @@ def test_rollback_without_native_and_nothing_applied(data):
     r = client.post("/rollback_change", params={"device": "ios1"}, headers=H)
     assert r.status_code == 200 and "no applied change on ios1 has a saved snapshot" in r.text, r.text
     assert "list_snapshots(device='ios1')" in r.text and RUNNING not in r.text
+
+
+# --------------------------------------------- platforms without snapshot ---
+
+class ChangePool(TextPool):
+    def __init__(self):
+        self.ran = []
+
+    def run(self, dev, cmds, **kw):
+        self.ran.append(list(cmds))
+        return super().run(dev, cmds)
+
+    def configure(self, dev, lines, commit, **kw):
+        return "\n".join(f"$ {ln}" for ln in lines)
+
+
+def test_linux_propose_saves_no_snapshot(data, monkeypatch):
+    monkeypatch.setattr(main, "pool", ChangePool())
+    r = client.post("/propose_change", json={"device": "srv1", "config": "sudo cp /etc/x /etc/x.bak"}, headers=H)
+    assert r.status_code == 200 and "STAGED" in r.text, r.text
+    assert "No config snapshot: this platform has none" in r.text and "Snapshot saved" not in r.text
+    assert main.pool.ran == [], "no snapshot command is run"
+    assert not (state.SNAP_DIR / "srv1").exists()
+    rec = [json.loads(l) for l in state.AUDIT_FILE.read_text().splitlines()][-1]
+    assert rec["event"] == "propose_change" and rec["snapshot"] == ""
+    code = r.text.split("Change ID: ")[1][:6]
+    a = client.post("/confirm_change", params={"code": code}, headers=H)
+    assert a.status_code == 200 and "APPLIED" in a.text and "corrective propose_change" in a.text, a.text
+    assert state.snapshot_index("srv1") == {}
+    r = client.post("/rollback_change", params={"device": "srv1"}, headers=H)
+    assert r.status_code == 200 and "no configuration snapshots either" in r.text, r.text
+    r = get("/list_snapshots", device="srv1")
+    assert "has no configuration to snapshot" in r.text, r.text
+
+
+def test_snapshot_platforms_still_save_one(data, monkeypatch):
+    monkeypatch.setattr(main, "pool", ChangePool())
+    r = client.post("/propose_change", json={"device": "r1", "config": "interface Loopback1"}, headers=H)
+    name = r.text.split("Snapshot saved: ")[1].split("\n")[0]
+    assert state.SNAP_NAME.match(name) and state.snapshot_path("r1", name).read_text() == RUNNING, r.text
+    code = r.text.split("Change ID: ")[1][:6]
+    assert main.changes.index("r1")[name].status.startswith("pending")
+    client.post("/confirm_change", params={"code": code}, headers=H)
+    assert main.changes.index("r1")[name].status == "applied"
+    assert "Rollback base (last applied change): " + name in get("/list_snapshots", device="r1").text

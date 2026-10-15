@@ -24,6 +24,7 @@ import os
 import threading
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -227,6 +228,39 @@ def _propose_timeout(t: ToolTimeout, dev, tool: str) -> HTTPException:
 def _busy(dev, exc: DeviceBusy, **fields) -> HTTPException:
     audit("device_busy", dev.name, **fields)
     return HTTPException(409, str(exc))
+
+
+NO_SNAPSHOT = ("No config snapshot: this platform has none. Backups are part of the change itself - "
+               "include them in it, e.g. 'sudo cp /etc/x /etc/x.bak'.")
+
+
+def _take_snapshot(dev, tool: str) -> Path | None:
+    """Save the configuration before a change is staged; None on platforms
+    without a snapshot command (Linux), which save nothing at all."""
+    snap_cmd = dev.platform.snapshot
+    if not snap_cmd:
+        return None
+    try:
+        snapshot = _within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1]
+    except ToolTimeout as t:
+        raise _propose_timeout(t, dev, tool)
+    except AuthError as exc:
+        audit("auth_failed", dev.name)
+        raise HTTPException(401, str(exc))
+    except DeviceBusy as exc:
+        raise _busy(dev, exc, tool="snapshot")
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc))
+    return changes.save_snapshot(dev.name, snapshot)
+
+
+def _before(dev, pc, what: str = "this change") -> str:
+    """Where the configuration from before a staged change is, for confirm_change answers."""
+    if not pc.snapshot_path:
+        return f"There is no configuration snapshot from before {what} on this platform."
+    name = Path(pc.snapshot_path).stem
+    return (f"The configuration from before {what} was saved as snapshot {name}: "
+            f"get_snapshot(device='{dev.name}', name='{name}').")
 
 
 def _next_step(dev, code: str) -> str:
@@ -503,20 +537,7 @@ def propose_change(body: ProposeIn) -> str:
             if opens > ends:
                 lines = lines + ["end"] * (opens - ends)
 
-    snap_cmd = plat.snapshot
-    try:
-        snapshot = (_within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1] if snap_cmd
-                    else "(no config snapshot on this platform; per-file backups are your responsibility - include them in the change, e.g. 'sudo cp /etc/x /etc/x.bak')")
-    except ToolTimeout as t:
-        raise _propose_timeout(t, dev, "propose_change")
-    except AuthError as exc:
-        audit("auth_failed", dev.name)
-        raise HTTPException(401, str(exc))
-    except DeviceBusy as exc:
-        raise _busy(dev, exc, tool="snapshot")
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc))
-    snap_path = changes.save_snapshot(dev.name, snapshot)
+    snap_path = _take_snapshot(dev, "propose_change")
 
     # Preview: ALWAYS the exact lines that will be sent. (An earlier version diffed
     # against the snapshot line-set; on hierarchical configs the same 'set ...' line can
@@ -532,10 +553,12 @@ def propose_change(body: ProposeIn) -> str:
             preview += (f"\n(dropped from the end: {', '.join(repr(d) for d in dropped)} - "
                         f"the tool leaves config mode itself)")
     pc = changes.create(dev.name, lines, snap_path, preview, mode=body.mode)
-    audit("propose_change", dev.name, code=pc.code, lines=lines, reason=body.reason, mode=body.mode, snapshot=str(snap_path))
+    audit("propose_change", dev.name, code=pc.code, lines=lines, reason=body.reason, mode=body.mode,
+          snapshot=str(snap_path or ""))
+    saved = f"Snapshot saved: {snap_path.stem}" if snap_path else NO_SNAPSHOT
     return (
         f"STAGED, NOT APPLIED. Change ID: {pc.code}  (device {dev.name}, expires in 10 min)\n"
-        f"Snapshot saved: {snap_path.name}\n\n{preview}\n\n"
+        f"{saved}\n\n{preview}\n\n"
         + _next_step(dev, pc.code)
     )
 
@@ -603,7 +626,7 @@ def confirm_change(
             f"OUTCOME UNKNOWN on {dev.name} after {t.elapsed:.1f}s (deadline {t.seconds:g}s). The "
             f"change may or may not have been applied. Do NOT retry: the change ID {code} is used up and "
             f"the staged change is gone. Verify the current state with run_read and report it to the "
-            f"user. The configuration from before this change was saved as {pc.snapshot_path}."))
+            f"user. {_before(dev, pc)}"))
     except AuthError as exc:
         audit("auth_failed", dev.name, code=pc.code)
         raise HTTPException(401, str(exc))
@@ -623,11 +646,10 @@ def confirm_change(
         raise HTTPException(502, (
             f"NOT CONFIRMED - OUTCOME UNKNOWN on {dev.name}: {exc}. The change may or may not have "
             f"been applied. Do NOT retry confirm_change; the change ID {code} is used up. Verify the "
-            f"current state with run_read and report it to the user. The configuration from before "
-            f"this change was saved as {pc.snapshot_path}."))
+            f"current state with run_read and report it to the user. {_before(dev, pc)}"))
     except Exception as exc:
         audit("confirm_change_error", dev.name, code=pc.code, error=str(exc))
-        raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. Snapshot {pc.snapshot_path} is available for rollback.")
+        raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. {_before(dev, pc)}")
     # Never report success while the device is still asking a question: the
     # command has not run then, and saying "ROLLED BACK" when nothing was rolled
     # back is worse than failing.
@@ -644,11 +666,15 @@ def confirm_change(
           approval=approver.mode_for(dev.confirm))
     if pc.mode == "rollback":
         return truncate(f"ROLLED BACK on {dev.name} (change ID {code}). The device is back to the state "
-                        f"before its last commit; the configuration from before this rollback was "
-                        f"saved as {pc.snapshot_path}.\n\n{out}", MAX_OUT)
+                        f"before its last commit. {_before(dev, pc, 'this rollback')}\n\n{out}", MAX_OUT)
     if pc.mode == "exec":
         return truncate(f"EXECUTED on {dev.name} (change ID {code}, exec mode - nothing was committed).\n\n{out}", MAX_OUT)
-    rb = "native rollback available via rollback_change" if dev.platform.rollback_last else "no native rollback on this platform - rollback_change returns the snapshot from before this change for a manual restore"
+    if dev.platform.rollback_last:
+        rb = "native rollback available via rollback_change"
+    elif pc.snapshot_path:
+        rb = "no native rollback on this platform - rollback_change returns the snapshot from before this change for a manual restore"
+    else:
+        rb = "no rollback and no configuration snapshot on this platform - undo it with a corrective propose_change"
     return truncate(f"APPLIED on {dev.name} (change ID {code}). {rb}.\n\n{out}", MAX_OUT)
 
 
@@ -670,32 +696,26 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
         raise HTTPException(403, f"device '{dev.name}' is read-only (access=ro)")
     cmds = list(dev.platform.rollback_last or [])
     if not cmds:
+        if dev.platform.snapshot is None:
+            audit("rollback_snapshot", dev.name, snapshot="", code="")
+            return (f"No native rollback on {dev.device_type}, and no configuration snapshots either: "
+                    f"there is no configuration to snapshot. Nothing was changed. Undo a change with a "
+                    f"corrective propose_change, using the backups that change made (e.g. "
+                    f"'sudo cp /etc/x.bak /etc/x').")
         return _rollback_snapshot(dev)
 
     # A native rollback overwrites the running configuration - that is a write, so
     # it goes through the same two-stage gate (and the device's confirm mode) as any
     # other change instead of applying on a single call.
-    snap_cmd = dev.platform.snapshot
-    try:
-        snapshot = (_within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1] if snap_cmd
-                    else "(no config snapshot for this platform)")
-    except ToolTimeout as t:
-        raise _propose_timeout(t, dev, "rollback_change")
-    except AuthError as exc:
-        audit("auth_failed", dev.name)
-        raise HTTPException(401, str(exc))
-    except DeviceBusy as exc:
-        raise _busy(dev, exc, tool="snapshot")
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc))
-    snap_path = changes.save_snapshot(dev.name, snapshot)
+    snap_path = _take_snapshot(dev, "rollback_change")
     preview = "Rollback commands (user/exec view):\n" + "\n".join(f"  > {c}" for c in cmds)
     pc = changes.create(dev.name, cmds, snap_path, preview, mode="rollback")
-    audit("rollback_staged", dev.name, code=pc.code, lines=cmds, snapshot=str(snap_path))
+    audit("rollback_staged", dev.name, code=pc.code, lines=cmds, snapshot=str(snap_path or ""))
+    saved = (f"The configuration as it is RIGHT NOW was saved as snapshot {snap_path.stem} first."
+             if snap_path else NO_SNAPSHOT)
     return (
         f"STAGED, NOT APPLIED. Change ID: {pc.code}  (device {dev.name}, expires in 10 min)\n"
-        f"This undoes the last commit on {dev.name}. The configuration as it is RIGHT NOW was saved "
-        f"as {snap_path.name} first.\n\n{preview}\n\n"
+        f"This undoes the last commit on {dev.name}. {saved}\n\n{preview}\n\n"
         + _next_step(dev, pc.code)
     )
 
