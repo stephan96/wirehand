@@ -152,11 +152,15 @@ def _device(name: str):
         raise HTTPException(404, str(exc))
 
 
+def _filtered(text: str, flt: str = "", context: int = 0) -> str:
+    """The `filter` / `context` semantics of run_read, for any text."""
+    return filter_lines(text, flt, context) if flt else text
+
+
 def _fmt(device: str, results: list[tuple[str, str]], flt: str = "", context: int = 0) -> str:
     blocks = []
     for cmd, out in results:
-        body = filter_lines(out, flt, context) if flt else out
-        blocks.append(f"=== {device} : {cmd} ===\n{body.rstrip()}\n")
+        blocks.append(f"=== {device} : {cmd} ===\n{_filtered(out, flt, context).rstrip()}\n")
     return truncate("\n".join(blocks), MAX_OUT)
 
 
@@ -701,6 +705,111 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
         f"as {snap_path.name} first.\n\n{preview}\n\n"
         + _next_step(dev, pc.code)
     )
+
+
+def _size(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1000 * 1024:
+        return f"{n / 1024:.1f}k"
+    return f"{n / 1024 / 1024:.1f}M"
+
+
+PLACEHOLDER_NOTE = ("[placeholder] = an empty marker from before 0.6.3: this platform has no "
+                    "configuration to snapshot. Removed by the normal cleanup.")
+
+
+@app.get("/list_snapshots", operation_id="list_snapshots", response_class=PlainTextResponse,
+         summary="List the saved configuration snapshots of a device",
+         description=(
+             "wirehand saves the device's configuration every time propose_change or rollback_change "
+             "stages a change. Each snapshot is the configuration BEFORE that change. This lists them, "
+             "newest first, with the change ID, what became of the change (applied, expired, denied, "
+             "pending, outcome unknown, ...) and its reason, and names the rollback base: the snapshot "
+             "of the last applied change. Read one with get_snapshot. "
+             "Example: list_snapshots(device='r1')"
+         ), dependencies=[Depends(auth)])
+def list_snapshots(device: str = Query(..., description="Device name from list_devices")) -> str:
+    dev = _device(device)
+    files = changes.list_snapshots(dev.name)
+    audit("list_snapshots", dev.name, count=len(files))
+    retention = f"Retention - kept: {state.retention_summary()}."
+    if not files:
+        if dev.platform.snapshot is None:
+            why = (f"{dev.device_type} has no configuration to snapshot, so wirehand saves none. "
+                   f"Backups of changed files must be part of the change itself.")
+        elif not dev.writable:
+            why = ("the device is read-only (access=ro), so no change was ever staged on it - "
+                   "snapshots are only taken when a change is staged.")
+        else:
+            why = ("no change has been staged on it yet (or the snapshots were removed by the cleanup). "
+                   "A snapshot is saved each time propose_change or rollback_change stages a change.")
+        return f"No snapshots for {dev.name}: {why}\n{retention}"
+    index = changes.index(dev.name)
+    base = state.last_applied(dev.name, index=index)
+    infos = [index.get(p.stem) or state.SnapshotInfo(name=p.stem) for p in files]
+    placeholders = {p.stem for p in files if state.is_placeholder(p)}
+    sw = max([len("STATUS")] + [len(i.status) for i in infos])
+    rows = []
+    for p, i in zip(files, infos):
+        reason = i.reason or "-"
+        if p.stem in placeholders:
+            reason = "[placeholder] " + (i.reason or "")
+        rows.append(f"{p.stem:<17} {_size(p.stat().st_size):<7} {i.trigger or '-':<16} {i.code or '-':<7} "
+                    f"{i.status:<{sw}} {reason}".rstrip())
+    out = [f"Snapshots for {dev.name} ({len(files)}, newest first). Each snapshot is the configuration "
+           f"BEFORE the change.", "",
+           f"{'NAME':<17} {'SIZE':<7} {'TRIGGER':<16} {'CHANGE':<7} {'STATUS':<{sw}} REASON", *rows, ""]
+    if placeholders:
+        out.append(PLACEHOLDER_NOTE)
+    example = base.name if base else files[0].stem
+    out += [f"Rollback base (last applied change): {base.name if base else 'none'}",
+            f"Read one with get_snapshot(device='{dev.name}', name='{example}').",
+            retention]
+    return truncate("\n".join(out), MAX_OUT)
+
+
+@app.get("/get_snapshot", operation_id="get_snapshot", response_class=PlainTextResponse,
+         summary="Read a saved configuration snapshot of a device",
+         description=(
+             "Returns one snapshot from list_snapshots: the device's configuration as it was BEFORE "
+             "the change named in the header, unmodified. name is the NAME column of list_snapshots "
+             "or 'latest' (the newest snapshot, which is not necessarily the one before the last "
+             "APPLIED change - list_snapshots names that one as rollback base). Snapshots are long: "
+             "set filter to a regex so only matching lines are returned; use context to include "
+             "surrounding lines. "
+             "Examples: get_snapshot(device='r1', name='20261015-201502') | "
+             "get_snapshot(device='r1', name='latest', filter='router ospf|cost', context=2)"
+         ), dependencies=[Depends(auth)])
+def get_snapshot(
+    device: str = Query(..., description="Device name from list_devices"),
+    name: str = Query(..., description="Snapshot NAME from list_snapshots (YYYYmmdd-HHMMSS), or 'latest'"),
+    filter: str = Query("", description="Optional case-insensitive regex; only matching lines are returned"),
+    context: int = Query(0, ge=0, le=20, description="Lines of context around each filter match"),
+) -> str:
+    dev = _device(device)
+    try:
+        path = changes.get_snapshot(dev.name, name)
+    except ValueError:
+        raise HTTPException(400, (
+            f"invalid snapshot name '{name}': use a NAME from list_snapshots, format YYYYmmdd-HHMMSS "
+            f"without '.txt' (e.g. 20261015-201502), or 'latest'"))
+    if path is None:
+        raise HTTPException(404, (
+            f"no snapshot '{name}' for {dev.name}. list_snapshots(device='{dev.name}') shows the "
+            f"available ones."))
+    info = changes.index(dev.name).get(path.stem) or state.SnapshotInfo(name=path.stem)
+    audit("get_snapshot", dev.name, snapshot=path.stem, filter=filter)
+    head = (f"=== {dev.name} : snapshot {path.stem} ===\n"
+            f"Status: {info.status} | Change ID: {info.code or '-'} | Trigger: {info.trigger or '-'} | "
+            f"Reason: {info.reason or '-'}\n")
+    if info.code:
+        head += f"This is the configuration BEFORE change {info.code} (staged {info.staged_ts}).\n"
+    else:
+        head += "No audit entry names this snapshot: it is the configuration before an unknown change.\n"
+    if state.is_placeholder(path):
+        head += "Placeholder from before 0.6.3 - this platform has no configuration to snapshot.\n"
+    return truncate(head + "\n" + _filtered(path.read_text(), filter, context).rstrip() + "\n", MAX_OUT)
 
 
 @app.get("/get_audit_log", operation_id="get_audit_log", response_class=PlainTextResponse,

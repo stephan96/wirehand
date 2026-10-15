@@ -340,3 +340,130 @@ def test_startup_prunes_and_logs_retention(data, retention, caplog):
     assert any("snapshot retention: no count limit, no age limit, unapplied 7 days" in m for m in msgs), msgs
     assert any("grow without limit" in m for m in msgs), msgs
     assert not any(t.name == "wirehand-prune" for t in threading.enumerate()), "stopped at shutdown"
+
+
+# --------------------------------------------------------------- tools ---
+
+def get(path, **params):
+    return client.get(path, params=params, headers=H)
+
+
+def test_list_snapshots_table(data):
+    snap("20261014-110120")
+    for name, code, kw in [("20261014-110847", "9F3E21", {"event": "rollback_staged"}),
+                           ("20261015-193011", "A1B2C3", {"reason": "test loopback"}),
+                           ("20261015-201502", "65C02D", {"reason": "OSPF cost on Gi0/0/0/1"})]:
+        snap(name)
+        staged(name, code, **kw)
+    ev("confirm_change", "9F3E21", mode="rollback")
+    ev("confirm_change", "65C02D")
+    r = get("/list_snapshots", device="r1")
+    assert r.status_code == 200, r.text
+    lines = r.text.splitlines()
+    assert lines[0] == ("Snapshots for r1 (4, newest first). Each snapshot is the configuration "
+                        "BEFORE the change.")
+    assert lines[2].split() == ["NAME", "SIZE", "TRIGGER", "CHANGE", "STATUS", "REASON"]
+    rows = [l.split(None, 5) for l in lines[3:7]]
+    assert [r_[0] for r_ in rows] == ["20261015-201502", "20261015-193011", "20261014-110847", "20261014-110120"]
+    assert rows[0][2:] == ["propose_change", "65C02D", "applied", "OSPF cost on Gi0/0/0/1"]
+    assert rows[1][2:] == ["propose_change", "A1B2C3", "expired", "test loopback"]
+    assert lines[5].split()[2:] == ["rollback_staged", "9F3E21", "applied", "(rollback)", "-"]
+    assert lines[6].split()[2:] == ["-", "-", "no", "audit", "entry", "-"]
+    head = lines[2]
+    for row in lines[3:7]:                         # fixed columns, like list_devices
+        for col in ("SIZE", "TRIGGER", "CHANGE", "STATUS", "REASON"):
+            assert row[head.index(col) - 1] == " " and row[head.index(col)] != " ", (col, row)
+    assert "Rollback base (last applied change): 20261015-201502" in r.text
+    assert "get_snapshot(device='r1', name='20261015-201502')" in r.text
+    assert "Retention - kept: max 20, 90 days, unapplied 7 days." in r.text
+    assert "list_snapshots" in state.AUDIT_FILE.read_text()
+
+
+def test_list_snapshots_marks_placeholders(data):
+    snap("20261001-100000", device="srv1", text="(no config snapshot on this platform; per-file backups ...)")
+    staged("20261001-100000", "AAAAAA", device="srv1", reason="nginx")
+    r = get("/list_snapshots", device="srv1")
+    assert "[placeholder] nginx" in r.text and "an empty marker from before 0.6.3" in r.text, r.text
+    assert "Rollback base (last applied change): none" in r.text
+
+
+@pytest.mark.parametrize("device, why", [
+    ("srv1", "has no configuration to snapshot"),
+    ("ro1", "read-only (access=ro)"),
+    ("r1", "no change has been staged on it yet"),
+])
+def test_list_snapshots_empty(data, device, why):
+    r = get("/list_snapshots", device=device)
+    assert r.status_code == 200 and r.text.startswith(f"No snapshots for {device}: ") and why in r.text, r.text
+
+
+def test_snapshot_tools_unknown_device(data):
+    assert get("/list_snapshots", device="nope").status_code == 404
+    assert get("/get_snapshot", device="nope", name="latest").status_code == 404
+    assert get("/list_snapshots", device="r1").status_code == 200
+    assert client.get("/list_snapshots", params={"device": "r1"}).status_code == 401
+
+
+def test_get_snapshot(data):
+    snap("20261014-110120", text="old config\n")
+    snap("20261015-201502")
+    staged("20261015-201502", "65C02D", reason="OSPF cost")
+    r = get("/get_snapshot", device="r1", name="latest")
+    assert r.status_code == 200, r.text
+    assert r.text.startswith("=== r1 : snapshot 20261015-201502 ===\n"
+                             "Status: expired | Change ID: 65C02D | Trigger: propose_change | Reason: OSPF cost\n"
+                             "This is the configuration BEFORE change 65C02D"), r.text
+    assert r.text.endswith("\n\n" + RUNNING), r.text           # content unchanged
+    r = get("/get_snapshot", device="r1", name="20261014-110120")
+    assert "No audit entry names this snapshot" in r.text and r.text.endswith("\nold config\n"), r.text
+    log_ = [json.loads(l) for l in state.AUDIT_FILE.read_text().splitlines()]
+    assert {"event": "get_snapshot", "snapshot": "20261014-110120", "filter": ""}.items() <= log_[-1].items()
+
+
+@pytest.mark.parametrize("bad", ["../x", "2026", "20261015-201502.txt", "x/../y", "../../audit"])
+def test_get_snapshot_bad_name_is_400(data, bad):
+    snap("20261015-201502")
+    r = get("/get_snapshot", device="r1", name=bad)
+    assert r.status_code == 400 and "YYYYmmdd-HHMMSS" in r.text, r.text
+
+
+def test_get_snapshot_missing_is_404(data):
+    r = get("/get_snapshot", device="r1", name="latest")
+    assert r.status_code == 404 and "list_snapshots(device='r1')" in r.text, r.text
+    snap("20261015-201502")
+    r = get("/get_snapshot", device="r1", name="20261015-201503")
+    assert r.status_code == 404 and "list_snapshots" in r.text, r.text
+
+
+class TextPool:
+    def run(self, dev, cmds, **kw):
+        return [(c, RUNNING) for c in cmds]
+
+    def close_all(self):
+        pass
+
+
+@pytest.mark.parametrize("flt, ctx", [("", 0), ("cost|loopback", 0), ("description", 2), ("nomatch", 1), ("([", 0)])
+def test_get_snapshot_filter_matches_run_read(data, monkeypatch, flt, ctx):
+    monkeypatch.setattr(main, "pool", TextPool())
+    snap("20261015-201502")
+    read = get("/run_read", device="r1", commands="show running-config", filter=flt, context=ctx).text
+    got = get("/get_snapshot", device="r1", name="latest", filter=flt, context=ctx).text
+    assert read.split("===\n", 1)[1] == got.split("\n\n", 1)[1], (read, got)
+
+
+def test_get_snapshot_truncates_with_filter_hint(data, monkeypatch):
+    monkeypatch.setattr(main, "MAX_OUT", 300)
+    snap("20261015-201502", text="x" * 1000)
+    r = get("/get_snapshot", device="r1", name="latest")
+    assert "output truncated at 300 chars - use filter=" in r.text, r.text
+
+
+def test_openapi_has_the_snapshot_tools():
+    paths = client.get("/openapi.json").json()["paths"]
+    for tool in ("list_snapshots", "get_snapshot"):
+        op = paths[f"/{tool}"]["get"]
+        assert op["operationId"] == tool
+        assert f"{tool}(device='r1'" in op["description"]
+    params = {p["name"] for p in paths["/get_snapshot"]["get"]["parameters"]}
+    assert {"device", "name", "filter", "context"} <= params, params
