@@ -10,19 +10,22 @@
 - [How it works](#how-it-works)
 - [Key properties](#key-properties)
 - [Installation](#installation)
-- [Updating to a new version](#updating-to-a-new-version)
+  - [Updating to a new version](#updating-to-a-new-version)
 - [Configuration](#configuration)
 - [Connecting the front-ends](#connecting-the-front-ends)
-- [Where devices come from](#where-devices-come-from)
-- [containerlab kind mapping](#containerlab-kind-mapping)
-- [Reachability check and overlapping lab subnets](#reachability-check-and-overlapping-lab-subnets)
-- [Platform behavior for changes](#platform-behavior-for-changes)
-- [Approving changes](#approving-changes)
+- [Devices](#devices)
+  - [Inventory](#inventory)
+  - [containerlab](#containerlab)
+  - [containerlab kind mapping](#containerlab-kind-mapping)
+  - [Reachability check](#reachability-check)
+- [Changes](#changes)
+  - [Platform behavior](#platform-behavior)
+  - [Approving changes](#approving-changes)
 - [Timeouts and unknown outcomes](#timeouts-and-unknown-outcomes)
 - [Audit log & snapshots](#audit-log--snapshots)
 - [Troubleshooting](#troubleshooting)
 - [Tests](#tests)
-- [Design rules (why it looks the way it does)](#design-rules-why-it-looks-the-way-it-does)
+- [Design rules](#design-rules)
 - [License](#license)
 
 ## Summary
@@ -209,7 +212,10 @@ normally-bridged container cannot reach the containerlab management bridge
 directly on the host and the local machine is reachable from inside the container as
 `127.0.0.1`.
 
-## Updating to a new version
+### Updating to a new version
+
+With a git clone, `git pull` in `~/docker/wirehand` replaces the first line below; the
+build and start steps are the same.
 
 Do **not** unpack the tarball *inside* `~/docker/wirehand` - the archive contains the
 `wirehand/` folder as prefix and you would end up with a nested copy while building
@@ -261,8 +267,6 @@ automatic snapshot cleanup (see "Audit log & snapshots"). Behaviour changes:
   marked in `list_snapshots` and removed by the cleanup.
 - `confirm_change` answers name the pre-change snapshot by name, with the `get_snapshot`
   call to read it, instead of a file path.
-- After the update, **toggle the tool-server entry in Open WebUI off and on**: it caches
-  the OpenAPI schema and does not see the two new tools otherwise.
 
 **Open WebUI caches the tool description: after an update, toggle the tool-server entry
 off/on (or re-add it) so the model sees the new tool descriptions.**
@@ -628,7 +632,8 @@ message. Same text as above, with the middle paragraph added:
 > again.
 >
 > Tool availability: the wirehand tools (list_devices, get_facts, run_read,
-> propose_change, confirm_change, rollback_change, get_audit_log) are only present when
+> propose_change, confirm_change, rollback_change, list_snapshots, get_snapshot,
+> get_audit_log) are only present when
 > the wirehand tool server is enabled for this chat. If a request requires one of them
 > and it is not among your available tools, do NOT answer from your own knowledge, do
 > not guess device names, inventory contents or command output, and do not describe
@@ -668,20 +673,11 @@ auth header `Authorization: Bearer <key>`, attach the action to an Agent. If Ony
 Docker on another host, its `api_server` and `background` containers need
 `extra_hosts: ["host.docker.internal:host-gateway"]` to resolve host-mapped services.
 
-## Where devices come from
+## Devices
 
-Two sources, merged at runtime; both can be used at the same time:
-
-1. **containerlab auto-discovery.** Point `WIREHAND_CLAB_DIR` at the folder that holds your
-   containerlab topologies (e.g. `/home/<user>/containerlabs`). For every *deployed* lab,
-   containerlab generates a `clab-<lab>/ansible-inventory.yml` with node kind, management
-   IP and default credentials - wirehand scans these recursively. Nodes appear under
-   the name `<lab>-<node>` (e.g. `xrd-test-xrd1`) and disappear automatically when the lab
-   is destroyed, because destroying a lab removes the generated folder.
-2. **Manual entries** in `config/inventory.yaml` under `devices:` - for anything that is
-   not a lab node (the containerlab host itself, physical routers, servers). A manual
-   entry with the same name as a discovered node overrides it, which is also the way to
-   pin different credentials or a different access level for a single lab node.
+wirehand knows two sources of devices, merged at runtime; both can be used at the same
+time. A manual entry with the same name as a discovered node overrides it, which is also
+the way to pin different credentials or a different access level for a single lab node.
 
 Both sources are re-checked every 30 s (`WIREHAND_CLAB_RESCAN`) using file modification
 times, so deploying/destroying a lab or editing `inventory.yaml` shows up without a
@@ -690,10 +686,26 @@ restart. To force an immediate reload, ask the model to call `list_devices` with
 because environment variables are fixed when a container starts - that is a Docker
 property, not a tool limitation.
 
+### Inventory
+
+Manual entries go in `config/inventory.yaml` under `devices:` - for anything that is not
+a lab node (the containerlab host itself, physical routers, servers). Every key a device
+accepts is listed under "Configuration".
+
 The file `config/inventory.yaml` is **never written by the tool** - it is your file, and
 it is mounted read-only into the container.
 
-## containerlab kind mapping
+### containerlab
+
+Point `WIREHAND_CLAB_DIR` at the folder that holds your containerlab topologies (e.g.
+`/home/<user>/containerlabs`). For every *deployed* lab, containerlab generates a
+`clab-<lab>/ansible-inventory.yml` with node kind, management IP and default credentials -
+wirehand scans these recursively. Nodes appear under the name `<lab>-<node>` (e.g.
+`xrd-test-xrd1`) and disappear automatically when the lab is destroyed, because destroying
+a lab removes the generated folder. Defaults for discovered nodes (access, confirm mode,
+credentials) are set under `containerlab:` in `config/inventory.yaml`.
+
+### containerlab kind mapping
 
 Shipped in the `containerlab.kinds` of `config/platforms/*.yaml`:
 
@@ -714,7 +726,7 @@ Precedence: `containerlab.credentials` in inventory.yaml > generated
 inventory.yaml can map a kind to a different driver. Unmapped kinds are
 skipped with a log line (`docker logs wirehand`).
 
-## Reachability check and overlapping lab subnets
+### Reachability check
 
 `list_devices(check=true)` opens a TCP connection to each device's SSH port (2 s timeout,
 `WIREHAND_CHECK_TIMEOUT`, all devices in parallel). It verifies the network path and a
@@ -739,13 +751,19 @@ mgmt:
 
 and destroy unused labs with `--cleanup` so their generated folders disappear.
 
-## Platform behavior for changes
+## Changes
+
+Every change goes the same way: `propose_change` (or `rollback_change`) stages it and
+returns a change ID, `confirm_change` applies it. How it is applied depends on the
+platform; who may approve it depends on the confirm mode.
+
+### Platform behavior
 
 Set per device type by `change.*` in `config/platforms/`:
 
 | device_type | Change path | Rollback |
 |---|---|---|
-| cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed; VRP needs `mmi-mode` (see below) |
+| cisco_xr, huawei_vrpv8, juniper_junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed; VRP needs `mmi-mode` (see below) |
 | cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot of last applied change -> corrective change |
 | fortinet | config-set (persists immediately) | snapshot of last applied change |
 | linux | commands run sequentially as the login user | none, and no snapshots - include backups in the change (`sudo cp x x.bak`) |
@@ -753,7 +771,7 @@ Set per device type by `change.*` in `config/platforms/`:
 `mode='exec'` runs in user/exec view on all platforms, commits nothing, and states that
 in its response.
 
-### Devices that ask before they act
+#### Devices that ask before they act
 
 Huawei VRP answers a maintenance command with a question:
 
@@ -780,7 +798,7 @@ IOS-XR needs neither: `rollback configuration last 1` runs there without asking.
 wirehand a new question, add the pattern and its two answers to `prompts` - in
 `common.yaml`, or in one platform's file if only that platform asks it - and restart.
 
-## Approving changes
+### Approving changes
 
 Wirehand refuses to let the model approve its own proposal, because that is the one thing
 it will eventually try. A real transcript (qwen3.6:35b-a3b):
@@ -827,7 +845,7 @@ spelling. Anything other than `totp`/`off` fails the inventory load at startup. 
 0.5.2 that boolean was read as "unset" on the containerlab path, so a per-kind
 `confirm: off` was silently ignored and the node kept asking for a code.
 
-### Setting it up
+#### Setting it up
 
 ```bash
 docker exec wirehand python -m app.approval --new     # prints secret + otpauth:// URI
@@ -840,7 +858,7 @@ typing it or by scanning the URI - `qrencode -t ANSIUTF8 '<uri>'` turns it into 
 in the terminal. The secret lives only in `.env` and the app; **no API endpoint ever
 returns it**, precisely so a front-end (and with it the model) cannot fetch it.
 
-### What a change looks like in the chat
+#### What a change looks like in the chat
 
 ```
 you:   add a loopback on vrp1
@@ -1070,10 +1088,12 @@ python -m pytest tests/                  # read path, platform files, approval c
 PYTHONPATH=. python tests/test_api.py    # full propose/confirm/rollback/approval flow against a fake pool
 ```
 
-`tests/toolcall_suite.md` is a 16-prompt regression set for judging how reliably a
+`tests/toolcall_suite.md` is an 18-prompt regression set for judging how reliably a
 given LLM drives these tools - run it after every model or prompt change.
 
-## Design rules (why it looks the way it does)
+## Design rules
+
+*Why it looks the way it does.*
 
 Some of wirehand's choices may look unusual or even old-fashioned. They are deliberate.
 This section explains them without assuming background in AI or operations tooling.
@@ -1095,8 +1115,8 @@ observed in practice.
 
 **1. Few tools, each with a clear job.**
 With twenty similar-sounding tools, a small model regularly picks the wrong one. wirehand
-has seven, and their names say what they do (`list_devices`, `run_read`,
-`propose_change`, ...). Fewer choices mean fewer wrong choices.
+has nine, and their names say what they do (`list_devices`, `run_read`,
+`propose_change`, `list_snapshots`, ...). Fewer choices mean fewer wrong choices.
 
 **2. Simple arguments - mostly plain text.**
 Tools take a few simple values: a device name, a block of commands as text, a yes/no
