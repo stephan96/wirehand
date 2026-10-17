@@ -8,11 +8,24 @@
 
 - [Summary](#summary)
 - [How it works](#how-it-works)
+  - [Overview](#overview)
+  - [Tools](#tools)
 - [Key properties](#key-properties)
 - [Installation](#installation)
+  - [Quick start (git clone)](#quick-start-git-clone)
+  - [Development install (tarball)](#development-install-tarball)
   - [Updating to a new version](#updating-to-a-new-version)
 - [Configuration](#configuration)
+  - [`.env`](#env-next-to-docker-composeyml-chmod-600)
+  - [`config/inventory.yaml`](#configinventoryyaml)
+  - [Device keys reference](#device-keys-reference)
+  - [Access control](#access-control)
+  - [`config/safety/` - read-path rules per device type](#configsafety---read-path-rules-per-device-type)
+  - [`config/platforms/` - how wirehand works with each device type](#configplatforms---how-wirehand-works-with-each-device-type)
+  - [Adding a device type](#adding-a-device-type)
 - [Connecting the front-ends](#connecting-the-front-ends)
+  - [Open WebUI](#open-webui)
+  - [Onyx](#onyx)
 - [Devices](#devices)
   - [Inventory](#inventory)
   - [containerlab](#containerlab)
@@ -26,6 +39,11 @@
 - [Troubleshooting](#troubleshooting)
 - [Tests](#tests)
 - [Design rules](#design-rules)
+  - [Who is actually using the tools](#who-is-actually-using-the-tools)
+  - [The rules, and the problem each one solves](#the-rules-and-the-problem-each-one-solves)
+  - [The short version](#the-short-version)
+- [Scaling](#scaling)
+- [Roadmap](#roadmap)
 - [License](#license)
 
 ## Summary
@@ -47,18 +65,22 @@ handful of well-described tools via OpenAPI. Any front-end that can use an
 
 **Platform support**
 
-wirehand uses [Netmiko](https://github.com/ktbyers/netmiko) for SSH, but only accepts
-the device types it has platform logic for (facts bundles, commit/rollback handling):
+wirehand uses [Netmiko](https://github.com/ktbyers/netmiko) for SSH. It currently
+accepts the device types it has platform logic for (facts bundles, commit/rollback
+handling), so not every device type Netmiko supports works with wirehand yet:
 
 | Status | `device_type` |
 |---|---|
 | Tested | `cisco_xr`, `huawei_vrpv8`, `fortinet`, `linux` |
 | Implemented, not yet tested | `cisco_ios`, `cisco_xe`, `cisco_nxos`, `huawei`, `arista_eos`, `juniper_junos` |
 
-Other Netmiko platforms are rejected when the inventory loads. Supporting one needs a
-file in `config/platforms/` and its read-path rules in `config/safety/` - no Python, as
-long as it applies changes the way one of the existing platforms does (see
-"`config/platforms/`" under Configuration).
+A device with any other type in `config/inventory.yaml` stops the inventory from
+loading; the error names the device and lists the supported types.
+
+Adding a device type takes two files: one in `config/platforms/` and its read-path rules
+in `config/safety/`. No Python is needed as long as the new type applies changes the way
+one of the existing platforms does. See
+[Adding a device type](#adding-a-device-type) under Configuration.
 
 **Security by design**
 
@@ -69,9 +91,9 @@ long as it applies changes the way one of the existing platforms does (see
 
 ## How it works
 
+### Overview
+
 ![wirehand high-level view](wirehand_high_level_view_v0.1.png)
-
-
 
 1. **LLM & Orchestration:** the user chats in Open WebUI; the model (here a local LLM
    served by ollama) decides to call a wirehand tool, which Open WebUI sends over HTTP.
@@ -82,7 +104,9 @@ long as it applies changes the way one of the existing platforms does (see
    (containers or VMs) or physical/Linux hosts - and the output travels back as plain
    text to the chat.
 
-### The tools, in the order a session uses them
+### Tools
+
+Listed in the order a session typically uses them.
 
 | Tool | Type | What it does |
 |---|---|---|
@@ -325,7 +349,9 @@ for them. A node listed under `devices:` is a manual device and uses its own `co
 `config/inventory.yaml.example` ships the same structure with every key spelled out,
 including the ones the example above leaves at their default.
 
-### Every key a device accepts
+### Device keys reference
+
+These are the keys a device entry under `devices:` in `config/inventory.yaml` accepts.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -372,7 +398,7 @@ A missing `host`, `device_type` or `username` fails the same way.
 Missing `env:` variables fail the whole inventory load at startup - deliberately
 (fail-fast beats a device with half-empty credentials). Remove dead references.
 
-### Access levels and Linux accounts
+### Access control
 
 `access: ro` allows `get_facts`/`run_read` only; `rw` additionally allows
 propose/confirm/rollback (config **and** exec mode - a rollback is staged and confirmed
@@ -580,6 +606,57 @@ docker exec wirehand python -m app.platforms --lint   # or: python -m app.platfo
 
 Quote prompt answers and reasons that look like booleans (`'Y'`, `'yes'`, `'no'`) - YAML
 reads a bare `yes`/`no` as true/false, and the loader refuses that rather than guess.
+
+### Adding a device type
+
+A new device type is two YAML files, one in each of the two directories above, named
+after the Netmiko driver (`<device_type>.yaml`). No Python is needed as long as the
+device applies changes the way one of the existing platforms does:
+
+| `change.apply` + `change.finish` | How a change is applied | Used by |
+|---|---|---|
+| `config_set` + `commit` | config mode, then `commit` | `cisco_xr`, `huawei_vrpv8`, `juniper_junos` |
+| `config_set` + `save` | config mode, leave it, then save | `cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos`, `huawei` |
+| `config_set` + `none` | config mode; the lines close their own blocks and persist at once | `fortinet` |
+| `shell` + `none` | every line is a command of its own | `linux` |
+
+If none of these fits (a different commit dialogue, say), the platform needs a code
+change first.
+
+1. **Pick the driver name.** The file name must be a Netmiko `device_type`; the loader
+   refuses any other name.
+2. **Write the platform file.** Copy the closest existing file in `config/platforms/` to
+   `<device_type>.yaml` and adjust `name`, `facts`, `snapshot`, `session` and `change`.
+   If the new type only differs in a few keys, start it with `extends: <existing type>`
+   and set only those keys (`cisco_xe.yaml` is an example). For `refuse_in_config`, list
+   every verb that commits, saves, reboots or runs an exec command from config mode, in
+   its shortest abbreviation.
+3. **Write the read-path rules.** Copy the closest vendor file in `config/safety/` to
+   `<device_type>.yaml`. Put the platform's write verbs in `blocklist`, its shell escapes
+   in `hard_refusals`, and keep `default: allow` for a network CLI (or `deny` for
+   anything that can start programs, like a shell).
+4. **Check both files:**
+
+   ```bash
+   docker exec wirehand python -m app.platforms --lint
+   docker exec wirehand python -m app.safety --lint
+   docker exec wirehand python -m app.safety --explain <device_type> 'configure terminal'
+   ```
+
+   Run `--explain` for the platform's config, save and reboot commands; each one must be
+   `REFUSED`.
+5. **Restart and try it read-only.** `docker compose restart wirehand`, add a device with
+   the new `device_type` and `access: ro` to `config/inventory.yaml`, then check
+   `list_devices`, `get_facts` and a few `run_read` calls.
+6. **Test changes on a disposable node.** Switch it to `access: rw` and run a small
+   `propose_change` / `confirm_change`, then a rollback. If the device asks a question on
+   the way (`NOT COMPLETED`), add it to `prompts` (see "Devices that ask before they act").
+7. **Optional: containerlab.** List the containerlab kinds that map to the new type under
+   `containerlab.kinds` in the platform file, with their default credentials.
+
+Your new files are not part of the repository, so a `git pull` or a tarball update leaves
+them in place, but they also get none of the fixes made to the shipped files. If the
+type works, consider contributing it.
 
 ## Connecting the front-ends
 
@@ -1171,6 +1248,30 @@ a chat, one process is fast enough.
 Every rule trades a little elegance for reliability: keep the model's choices few, its
 inputs simple, its outputs readable and bounded - and never rely on the model for
 anything that must not go wrong.
+
+## Scaling
+
+The current version is built for small, local setups: one user or a few, working on
+some 10 lab devices. It has not been designed or tested beyond that.
+
+What this means in practice:
+
+- **One process.** wirehand runs with a single uvicorn worker (`--workers 1`). Pending
+  change IDs and the SSH connection pool live in that process, so it cannot be scaled
+  out to several workers or containers.
+- **Shared identities.** All front-ends use the same `WIREHAND_API_KEY`, and every
+  approval uses the same `WIREHAND_TOTP_SECRET`. wirehand cannot tell users apart, so
+  the audit log does not record who proposed or approved a change.
+- **Local files.** The audit log and snapshots are plain files under `WIREHAND_DATA`.
+
+Multi-user use has not been designed yet. Before several people work through one
+wirehand instance, how their sessions interact has to be checked and designed: for
+example two users staging changes on the same device, or one user confirming a change
+another user proposed.
+
+## Roadmap
+
+To be continued.
 
 ## License
 
