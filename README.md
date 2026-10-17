@@ -1,6 +1,6 @@
 # wirehand
 
-*A hand on the wires - with a glove on.*
+*LLM-driven network operations, with human approval for every change.*
 
 **Version:** 0.6.3 · **License:** [Apache-2.0](LICENSE)
 

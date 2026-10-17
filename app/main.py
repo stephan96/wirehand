@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """wirehand: SSH-backed device analysis & change tool for LLM front-ends.
 
-"A hand on the wires" - the LLM works the devices through wirehand, wirehand keeps the glove on.
-
 Exposed as an OpenAPI tool server. Register http://host.docker.internal:8110
 in Open WebUI (Admin -> Settings -> External Tools) and in Onyx (Actions ->
 OpenAPI schema). Auth: `Authorization: Bearer <WIREHAND_API_KEY>`.
