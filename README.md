@@ -203,6 +203,38 @@ wirehand-lab-xrd-xrd3 cisco_xr       rw  off     172.20.25.2     containerlab wi
 CONFIRM is `off` here because this lab runs with `WIREHAND_CONFIRM_MODE=off`; with the
 shipped default (`totp`) the column reads `totp`.
 
+To let an LLM use the tools, register wirehand in your front-end; see
+[Connecting the front-ends](#connecting-the-front-ends).
+
+If you want to start without an LLM, have a look at [CURL_Examples.md](CURL_Examples.md):
+every tool is a plain HTTP endpoint. For example, a read-only command on one of the
+routers:
+
+```bash
+export WH=http://localhost:8110
+export AUTH="Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)"
+
+curl -s -H "$AUTH" --get \
+  --data-urlencode "device=wirehand-lab-xrd-xrd1" \
+  --data-urlencode "commands=show lldp neighbors" \
+  $WH/run_read
+```
+
+```
+=== wirehand-lab-xrd-xrd1 : show lldp neighbors ===
+
+Sat Oct 17 08:05:48.967 UTC
+Capability codes:
+        (R) Router, (B) Bridge, (T) Telephone, (C) DOCSIS Cable Device
+        (W) WLAN Access Point, (P) Repeater, (S) Station, (O) Other
+
+Device ID       Local Intf                      Hold-time  Capability      Port ID
+xrd2            GigabitEthernet0/0/0/1          120        R               GigabitEthernet0/0/0/1
+xrd3            GigabitEthernet0/0/0/2          120        R               GigabitEthernet0/0/0/1
+
+Total entries displayed: 2
+```
+
 `.env` and `config/inventory.yaml` are listed in `.gitignore`, so a later `git pull`
 never overwrites them. The read-path rules in `config/safety/` and the platform definitions
 in `config/platforms/` need no copying - they ship ready to use, and
