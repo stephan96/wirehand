@@ -184,6 +184,25 @@ curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
      http://localhost:8110/list_devices
 ```
 
+The two `.env` lines to set at least:
+
+```bash
+WIREHAND_API_KEY=change-me-long-random-string
+WIREHAND_CLAB_DIR=/home/<user>/containerlabs   # host folder with your containerlab topologies
+```
+
+With a containerlab lab of three XRd routers deployed, the `curl` returns:
+
+```
+NAME                  PLATFORM       ACC CONFIRM MGMT-IP         DESCRIPTION
+wirehand-lab-xrd-xrd1 cisco_xr       rw  off     172.20.25.4     containerlab wirehand-lab-xrd / cisco_xrd
+wirehand-lab-xrd-xrd2 cisco_xr       rw  off     172.20.25.3     containerlab wirehand-lab-xrd / cisco_xrd
+wirehand-lab-xrd-xrd3 cisco_xr       rw  off     172.20.25.2     containerlab wirehand-lab-xrd / cisco_xrd
+```
+
+CONFIRM is `off` here because this lab runs with `WIREHAND_CONFIRM_MODE=off`; with the
+shipped default (`totp`) the column reads `totp`.
+
 `.env` and `config/inventory.yaml` are listed in `.gitignore`, so a later `git pull`
 never overwrites them. The read-path rules in `config/safety/` and the platform definitions
 in `config/platforms/` need no copying - they ship ready to use, and
