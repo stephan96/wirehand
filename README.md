@@ -93,15 +93,15 @@ one of the existing platforms does. See
 
 ### Overview
 
-![wirehand high-level view](wirehand_high_level_view_v0.1.png)
+![wirehand high-level view](wirehand_high_level_view_v0.2.png)
 
-1. **LLM & Orchestration:** the user chats in Open WebUI; the model (here a local LLM
-   served by ollama) decides to call a wirehand tool, which Open WebUI sends over HTTP.
+1. **LLM & Orchestration:** The user chats in Open WebUI. The model (local LLM
+   served by ollama or optionally a Cloud LLM) decides to call a wirehand tool, which Open WebUI sends over HTTP.
 2. **Tool Server:** wirehand's FastAPI/OpenAPI server resolves the device name via the
    inventory, checks permissions (access level, read-only command rules), looks up the
    credentials server-side, and hands the commands to Netmiko.
-3. **Target Devices:** Netmiko runs the commands over SSH on the device - lab nodes
-   (containers or VMs) or physical/Linux hosts - and the output travels back as plain
+3. **Target Devices:** Netmiko runs the commands over SSH on the device which can be 
+   containers, virtual machines or physical hosts. The output travels back as plain
    text to the chat.
 
 ### Tools
