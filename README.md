@@ -1,28 +1,49 @@
 # wirehand
 
-*A hand on the wires - with a glove on.*
+*LLM-driven network operations, with human approval for every change.*
 
-**Version:** 0.6.2 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.3 · **License:** [Apache-2.0](LICENSE)
 
 ## Contents
 
 - [Summary](#summary)
 - [How it works](#how-it-works)
+  - [Overview](#overview)
+  - [Tools](#tools)
 - [Key properties](#key-properties)
 - [Installation](#installation)
-- [Updating to a new version](#updating-to-a-new-version)
+  - [Quick start (git clone)](#quick-start-git-clone)
+  - [Development install (tarball)](#development-install-tarball)
+  - [Updating to a new version](#updating-to-a-new-version)
 - [Configuration](#configuration)
+  - [`.env`](#env-next-to-docker-composeyml-chmod-600)
+  - [`config/inventory.yaml`](#configinventoryyaml)
+  - [Device keys reference](#device-keys-reference)
+  - [Access control](#access-control)
+  - [`config/safety/` - read-path rules per device type](#configsafety---read-path-rules-per-device-type)
+  - [`config/platforms/` - how wirehand works with each device type](#configplatforms---how-wirehand-works-with-each-device-type)
+  - [Adding a device type](#adding-a-device-type)
 - [Connecting the front-ends](#connecting-the-front-ends)
-- [Where devices come from](#where-devices-come-from)
-- [containerlab kind mapping](#containerlab-kind-mapping)
-- [Reachability check and overlapping lab subnets](#reachability-check-and-overlapping-lab-subnets)
-- [Platform behavior for changes](#platform-behavior-for-changes)
-- [Approving changes](#approving-changes)
+  - [Open WebUI](#open-webui)
+  - [Onyx](#onyx)
+- [Devices](#devices)
+  - [Inventory](#inventory)
+  - [containerlab](#containerlab)
+  - [containerlab kind mapping](#containerlab-kind-mapping)
+  - [Reachability check](#reachability-check)
+- [Changes](#changes)
+  - [Platform behavior](#platform-behavior)
+  - [Approving changes](#approving-changes)
 - [Timeouts and unknown outcomes](#timeouts-and-unknown-outcomes)
 - [Audit log & snapshots](#audit-log--snapshots)
 - [Troubleshooting](#troubleshooting)
 - [Tests](#tests)
-- [Design rules (why it looks the way it does)](#design-rules-why-it-looks-the-way-it-does)
+- [Design rules](#design-rules)
+  - [Who is actually using the tools](#who-is-actually-using-the-tools)
+  - [The rules, and the problem each one solves](#the-rules-and-the-problem-each-one-solves)
+  - [The short version](#the-short-version)
+- [Scaling](#scaling)
+- [Roadmap](#roadmap)
 - [License](#license)
 
 ## Summary
@@ -44,18 +65,22 @@ handful of well-described tools via OpenAPI. Any front-end that can use an
 
 **Platform support**
 
-wirehand uses [Netmiko](https://github.com/ktbyers/netmiko) for SSH, but only accepts
-the device types it has platform logic for (facts bundles, commit/rollback handling):
+wirehand uses [Netmiko](https://github.com/ktbyers/netmiko) for SSH. It currently
+accepts the device types it has platform logic for (facts bundles, commit/rollback
+handling), so not every device type Netmiko supports works with wirehand yet:
 
 | Status | `device_type` |
 |---|---|
 | Tested | `cisco_xr`, `huawei_vrpv8`, `fortinet`, `linux` |
 | Implemented, not yet tested | `cisco_ios`, `cisco_xe`, `cisco_nxos`, `huawei`, `arista_eos`, `juniper_junos` |
 
-Other Netmiko platforms are rejected when the inventory loads. Supporting one needs a
-file in `config/platforms/` and its read-path rules in `config/safety/` - no Python, as
-long as it applies changes the way one of the existing platforms does (see
-"`config/platforms/`" under Configuration).
+A device with any other type in `config/inventory.yaml` stops the inventory from
+loading; the error names the device and lists the supported types.
+
+Adding a device type takes two files: one in `config/platforms/` and its read-path rules
+in `config/safety/`. No Python is needed as long as the new type applies changes the way
+one of the existing platforms does. See
+[Adding a device type](#adding-a-device-type) under Configuration.
 
 **Security by design**
 
@@ -66,20 +91,22 @@ long as it applies changes the way one of the existing platforms does (see
 
 ## How it works
 
-![wirehand high-level view](wirehand_high_level_view_v0.1.png)
+### Overview
 
+![wirehand high-level view](wirehand_high_level_view_v0.2.png)
 
-
-1. **LLM & Orchestration:** the user chats in Open WebUI; the model (here a local LLM
-   served by ollama) decides to call a wirehand tool, which Open WebUI sends over HTTP.
+1. **LLM & Orchestration:** The user chats in Open WebUI. The model (local LLM
+   served by ollama or optionally a Cloud LLM) decides to call a wirehand tool, which Open WebUI sends over HTTP.
 2. **Tool Server:** wirehand's FastAPI/OpenAPI server resolves the device name via the
    inventory, checks permissions (access level, read-only command rules), looks up the
    credentials server-side, and hands the commands to Netmiko.
-3. **Target Devices:** Netmiko runs the commands over SSH on the device - lab nodes
-   (containers or VMs) or physical/Linux hosts - and the output travels back as plain
+3. **Target Devices:** Netmiko runs the commands over SSH on the device which can be 
+   containers, virtual machines or physical hosts. The output travels back as plain
    text to the chat.
 
-### The tools, in the order a session uses them
+### Tools
+
+Listed in the order a session typically uses them.
 
 | Tool | Type | What it does |
 |---|---|---|
@@ -88,7 +115,9 @@ long as it applies changes the way one of the existing platforms does (see
 | `run_read(device, commands, filter, context)` | read | Read-only commands. On network devices a blocklist plus argument-level checks; on **Linux devices an allow-list**: only known read-only commands run at all, everything else is refused (see "Key properties"). `device` accepts several names comma-separated. `filter` is a server-side case-insensitive regex; only matching lines (plus `context` surrounding lines) are returned - essential for running-configs and logs. |
 | `propose_change(device, config, reason, mode)` | stage | Takes a snapshot, builds a preview, returns a 6-char change ID. **Applies nothing.** `mode='config'` (default) = configuration lines; `mode='exec'` = operational maintenance commands (reset, clear, process restarts) that must run in user/exec view - e.g. Huawei `reset ospf process 1`. |
 | `confirm_change(code, approval)` | write | Applies the staged change identified by its change ID (`code`): config mode + commit/save for `config`, plain exec for `exec` and for a staged `rollback`. Requires `access: rw` and - unless confirmation is switched off for that device - `approval`: the current 6-digit one-time code from the operator's authenticator app. See "Approving changes". |
-| `rollback_change(device)` | stage | IOS-XR / VRPv8 / Junos: *stages* a native rollback of the last commit and returns a change ID - **undoes nothing** until `confirm_change`. Other platforms: touches nothing and returns the pre-change snapshot so a corrective change can be proposed. |
+| `rollback_change(device)` | stage | IOS-XR / VRPv8 / Junos: *stages* a native rollback of the last commit and returns a change ID - **undoes nothing** until `confirm_change`. Other platforms: touches nothing and returns the snapshot from before the last **applied** change, so a corrective change can be proposed. Linux has no snapshots. |
+| `list_snapshots(device)` | read | The saved configuration snapshots of a device, newest first: change ID, what became of the change (applied, expired, denied, pending, ...), reason, and the rollback base. See "Audit log & snapshots". |
+| `get_snapshot(device, name, filter, context)` | read | One snapshot (`name` from `list_snapshots`, or `latest`): the configuration **before** the named change, unmodified. `filter` / `context` work as in `run_read`. |
 | `get_audit_log(device, n)` | read | The last `n` audit entries, optionally filtered by device. |
 
 Output of every tool is plain text (small local models handle text much better than
@@ -128,7 +157,8 @@ output together with the hint to use `filter`.
   `confirm_change` that runs out of time answers `OUTCOME UNKNOWN` instead of guessing,
   and a change command is never sent twice (see "Timeouts and unknown outcomes").
 - **Everything is logged.** Every tool call lands in an append-only audit log; every
-  proposed change first saves a configuration snapshot (see "Audit log & snapshots").
+  proposed change first saves a configuration snapshot - except on Linux, which has no
+  configuration to snapshot (see "Audit log & snapshots").
 
 ## Installation
 
@@ -152,6 +182,57 @@ docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)
 docker compose up -d
 curl -H "Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)" \
      http://localhost:8110/list_devices
+```
+
+The two `.env` lines to set at least:
+
+```bash
+WIREHAND_API_KEY=change-me-long-random-string
+WIREHAND_CLAB_DIR=/home/<user>/containerlabs   # host folder with your containerlab topologies
+```
+
+With a containerlab lab of three XRd routers deployed, the `curl` returns:
+
+```
+NAME                  PLATFORM       ACC CONFIRM MGMT-IP         DESCRIPTION
+wirehand-lab-xrd-xrd1 cisco_xr       rw  off     172.20.25.4     containerlab wirehand-lab-xrd / cisco_xrd
+wirehand-lab-xrd-xrd2 cisco_xr       rw  off     172.20.25.3     containerlab wirehand-lab-xrd / cisco_xrd
+wirehand-lab-xrd-xrd3 cisco_xr       rw  off     172.20.25.2     containerlab wirehand-lab-xrd / cisco_xrd
+```
+
+CONFIRM is `off` here because this lab runs with `WIREHAND_CONFIRM_MODE=off`; with the
+shipped default (`totp`) the column reads `totp`.
+
+To let an LLM use the tools, register wirehand in your front-end; see
+[Connecting the front-ends](#connecting-the-front-ends).
+
+If you want to start without an LLM, have a look at [CURL_Examples.md](CURL_Examples.md):
+every tool is a plain HTTP endpoint. For example, a read-only command on one of the
+routers:
+
+```bash
+export WH=http://localhost:8110
+export AUTH="Authorization: Bearer $(grep WIREHAND_API_KEY .env | cut -d= -f2)"
+
+curl -s -H "$AUTH" --get \
+  --data-urlencode "device=wirehand-lab-xrd-xrd1" \
+  --data-urlencode "commands=show lldp neighbors" \
+  $WH/run_read
+```
+
+```
+=== wirehand-lab-xrd-xrd1 : show lldp neighbors ===
+
+Sat Oct 17 08:05:48.967 UTC
+Capability codes:
+        (R) Router, (B) Bridge, (T) Telephone, (C) DOCSIS Cable Device
+        (W) WLAN Access Point, (P) Repeater, (S) Station, (O) Other
+
+Device ID       Local Intf                      Hold-time  Capability      Port ID
+xrd2            GigabitEthernet0/0/0/1          120        R               GigabitEthernet0/0/0/1
+xrd3            GigabitEthernet0/0/0/2          120        R               GigabitEthernet0/0/0/1
+
+Total entries displayed: 2
 ```
 
 `.env` and `config/inventory.yaml` are listed in `.gitignore`, so a later `git pull`
@@ -206,7 +287,10 @@ normally-bridged container cannot reach the containerlab management bridge
 directly on the host and the local machine is reachable from inside the container as
 `127.0.0.1`.
 
-## Updating to a new version
+### Updating to a new version
+
+With a git clone, `git pull` in `~/docker/wirehand` replaces the first line below; the
+build and start steps are the same.
 
 Do **not** unpack the tarball *inside* `~/docker/wirehand` - the archive contains the
 `wirehand/` folder as prefix and you would end up with a nested copy while building
@@ -240,6 +324,24 @@ only the apply step is gated.
   change step fails after it was sent. Before, a failed exec/rollback command was retried
   once and could still be reported as `EXECUTED` / `ROLLED BACK`.
 
+**Upgrading to 0.6.3:** two new read tools, `list_snapshots` and `get_snapshot`, and an
+automatic snapshot cleanup (see "Audit log & snapshots"). Behaviour changes:
+
+- **Cleanup instead of "last 20 files".** Per device, snapshots of never-applied changes
+  are removed after 7 days, all snapshots after 90 days, and beyond 20 the oldest go -
+  except the snapshot of the last applied change and those of pending or outcome-unknown
+  changes. On the first start after the update this can remove old snapshots at once;
+  copy `/app/data` out first if you want to keep them (`docker cp wirehand:/app/data ./backup`),
+  or set the three `WIREHAND_SNAPSHOT_*` variables to `0`.
+- **`rollback_change` without a native rollback** (IOS/XE/NX-OS, EOS, VRP5, FortiGate) now
+  returns the snapshot of the last **applied** change, not the newest snapshot (which could
+  belong to a proposal that was never applied). With no applied change it says so instead
+  of falling back to the newest one.
+- **Linux saves no placeholder snapshots any more.** `propose_change` says that backups are
+  part of the change; the audit entry has `snapshot=""`. Existing placeholder files are
+  marked in `list_snapshots` and removed by the cleanup.
+- `confirm_change` answers name the pre-change snapshot by name, with the `get_snapshot`
+  call to read it, instead of a file path.
 
 **Open WebUI caches the tool description: after an update, toggle the tool-server entry
 off/on (or re-add it) so the model sees the new tool descriptions.**
@@ -298,7 +400,9 @@ for them. A node listed under `devices:` is a manual device and uses its own `co
 `config/inventory.yaml.example` ships the same structure with every key spelled out,
 including the ones the example above leaves at their default.
 
-### Every key a device accepts
+### Device keys reference
+
+These are the keys a device entry under `devices:` in `config/inventory.yaml` accepts.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -345,7 +449,7 @@ A missing `host`, `device_type` or `username` fails the same way.
 Missing `env:` variables fail the whole inventory load at startup - deliberately
 (fail-fast beats a device with half-empty credentials). Remove dead references.
 
-### Access levels and Linux accounts
+### Access control
 
 `access: ro` allows `get_facts`/`run_read` only; `rw` additionally allows
 propose/confirm/rollback (config **and** exec mode - a rollback is staged and confirmed
@@ -491,12 +595,12 @@ rejected when the inventory loads, and every file needs its counterpart in
 | Key | What it decides |
 | --- | --- |
 | `facts` | the commands `get_facts` runs |
-| `snapshot` | the command whose output is saved before every change (`null` on Linux) |
+| `snapshot` | the command whose output is saved before every change (`null` on Linux: nothing is saved) |
 | `session.enable` | call `enable()` when the device has a `secret` |
 | `session.prep` | commands sent once when a session opens (Huawei: `mmi-mode enable`) |
 | `change.apply` | `config_set` (Netmiko config mode) or `shell` (each line is a command) |
 | `change.finish` | after `config_set`: `commit`, `save`, or `none` (FortiOS blocks close themselves) |
-| `change.rollback_last` | native rollback of the last commit, or `null` (snapshot only) |
+| `change.rollback_last` | native rollback of the last commit, or `null` (`rollback_change` returns the snapshot of the last applied change) |
 | `change.balance_end` | append missing `end` lines to open `config` blocks (FortiOS) |
 | `change.drop_trailing` | trailing lines dropped from a config change (`end`, `return`, `exit`) - the tool leaves config mode itself, and the preview names what was dropped |
 | `change.last_line_only` | lines that are dropped at the end like `drop_trailing`, but refused anywhere else (`end`, `return`: in the middle they leave config mode with the change uncommitted) |
@@ -554,6 +658,57 @@ docker exec wirehand python -m app.platforms --lint   # or: python -m app.platfo
 Quote prompt answers and reasons that look like booleans (`'Y'`, `'yes'`, `'no'`) - YAML
 reads a bare `yes`/`no` as true/false, and the loader refuses that rather than guess.
 
+### Adding a device type
+
+A new device type is two YAML files, one in each of the two directories above, named
+after the Netmiko driver (`<device_type>.yaml`). No Python is needed as long as the
+device applies changes the way one of the existing platforms does:
+
+| `change.apply` + `change.finish` | How a change is applied | Used by |
+|---|---|---|
+| `config_set` + `commit` | config mode, then `commit` | `cisco_xr`, `huawei_vrpv8`, `juniper_junos` |
+| `config_set` + `save` | config mode, leave it, then save | `cisco_ios`, `cisco_xe`, `cisco_nxos`, `arista_eos`, `huawei` |
+| `config_set` + `none` | config mode; the lines close their own blocks and persist at once | `fortinet` |
+| `shell` + `none` | every line is a command of its own | `linux` |
+
+If none of these fits (a different commit dialogue, say), the platform needs a code
+change first.
+
+1. **Pick the driver name.** The file name must be a Netmiko `device_type`; the loader
+   refuses any other name.
+2. **Write the platform file.** Copy the closest existing file in `config/platforms/` to
+   `<device_type>.yaml` and adjust `name`, `facts`, `snapshot`, `session` and `change`.
+   If the new type only differs in a few keys, start it with `extends: <existing type>`
+   and set only those keys (`cisco_xe.yaml` is an example). For `refuse_in_config`, list
+   every verb that commits, saves, reboots or runs an exec command from config mode, in
+   its shortest abbreviation.
+3. **Write the read-path rules.** Copy the closest vendor file in `config/safety/` to
+   `<device_type>.yaml`. Put the platform's write verbs in `blocklist`, its shell escapes
+   in `hard_refusals`, and keep `default: allow` for a network CLI (or `deny` for
+   anything that can start programs, like a shell).
+4. **Check both files:**
+
+   ```bash
+   docker exec wirehand python -m app.platforms --lint
+   docker exec wirehand python -m app.safety --lint
+   docker exec wirehand python -m app.safety --explain <device_type> 'configure terminal'
+   ```
+
+   Run `--explain` for the platform's config, save and reboot commands; each one must be
+   `REFUSED`.
+5. **Restart and try it read-only.** `docker compose restart wirehand`, add a device with
+   the new `device_type` and `access: ro` to `config/inventory.yaml`, then check
+   `list_devices`, `get_facts` and a few `run_read` calls.
+6. **Test changes on a disposable node.** Switch it to `access: rw` and run a small
+   `propose_change` / `confirm_change`, then a rollback. If the device asks a question on
+   the way (`NOT COMPLETED`), add it to `prompts` (see "Devices that ask before they act").
+7. **Optional: containerlab.** List the containerlab kinds that map to the new type under
+   `containerlab.kinds` in the platform file, with their default credentials.
+
+Your new files are not part of the repository, so a `git pull` or a tarball update leaves
+them in place, but they also get none of the fixes made to the shipped files. If the
+type works, consider contributing it.
+
 ## Connecting the front-ends
 
 ### Open WebUI
@@ -605,7 +760,8 @@ message. Same text as above, with the middle paragraph added:
 > again.
 >
 > Tool availability: the wirehand tools (list_devices, get_facts, run_read,
-> propose_change, confirm_change, rollback_change, get_audit_log) are only present when
+> propose_change, confirm_change, rollback_change, list_snapshots, get_snapshot,
+> get_audit_log) are only present when
 > the wirehand tool server is enabled for this chat. If a request requires one of them
 > and it is not among your available tools, do NOT answer from your own knowledge, do
 > not guess device names, inventory contents or command output, and do not describe
@@ -645,20 +801,11 @@ auth header `Authorization: Bearer <key>`, attach the action to an Agent. If Ony
 Docker on another host, its `api_server` and `background` containers need
 `extra_hosts: ["host.docker.internal:host-gateway"]` to resolve host-mapped services.
 
-## Where devices come from
+## Devices
 
-Two sources, merged at runtime; both can be used at the same time:
-
-1. **containerlab auto-discovery.** Point `WIREHAND_CLAB_DIR` at the folder that holds your
-   containerlab topologies (e.g. `/home/<user>/containerlabs`). For every *deployed* lab,
-   containerlab generates a `clab-<lab>/ansible-inventory.yml` with node kind, management
-   IP and default credentials - wirehand scans these recursively. Nodes appear under
-   the name `<lab>-<node>` (e.g. `xrd-test-xrd1`) and disappear automatically when the lab
-   is destroyed, because destroying a lab removes the generated folder.
-2. **Manual entries** in `config/inventory.yaml` under `devices:` - for anything that is
-   not a lab node (the containerlab host itself, physical routers, servers). A manual
-   entry with the same name as a discovered node overrides it, which is also the way to
-   pin different credentials or a different access level for a single lab node.
+wirehand knows two sources of devices, merged at runtime; both can be used at the same
+time. A manual entry with the same name as a discovered node overrides it, which is also
+the way to pin different credentials or a different access level for a single lab node.
 
 Both sources are re-checked every 30 s (`WIREHAND_CLAB_RESCAN`) using file modification
 times, so deploying/destroying a lab or editing `inventory.yaml` shows up without a
@@ -667,10 +814,26 @@ restart. To force an immediate reload, ask the model to call `list_devices` with
 because environment variables are fixed when a container starts - that is a Docker
 property, not a tool limitation.
 
+### Inventory
+
+Manual entries go in `config/inventory.yaml` under `devices:` - for anything that is not
+a lab node (the containerlab host itself, physical routers, servers). Every key a device
+accepts is listed under "Configuration".
+
 The file `config/inventory.yaml` is **never written by the tool** - it is your file, and
 it is mounted read-only into the container.
 
-## containerlab kind mapping
+### containerlab
+
+Point `WIREHAND_CLAB_DIR` at the folder that holds your containerlab topologies (e.g.
+`/home/<user>/containerlabs`). For every *deployed* lab, containerlab generates a
+`clab-<lab>/ansible-inventory.yml` with node kind, management IP and default credentials -
+wirehand scans these recursively. Nodes appear under the name `<lab>-<node>` (e.g.
+`xrd-test-xrd1`) and disappear automatically when the lab is destroyed, because destroying
+a lab removes the generated folder. Defaults for discovered nodes (access, confirm mode,
+credentials) are set under `containerlab:` in `config/inventory.yaml`.
+
+### containerlab kind mapping
 
 Shipped in the `containerlab.kinds` of `config/platforms/*.yaml`:
 
@@ -691,7 +854,7 @@ Precedence: `containerlab.credentials` in inventory.yaml > generated
 inventory.yaml can map a kind to a different driver. Unmapped kinds are
 skipped with a log line (`docker logs wirehand`).
 
-## Reachability check and overlapping lab subnets
+### Reachability check
 
 `list_devices(check=true)` opens a TCP connection to each device's SSH port (2 s timeout,
 `WIREHAND_CHECK_TIMEOUT`, all devices in parallel). It verifies the network path and a
@@ -716,21 +879,27 @@ mgmt:
 
 and destroy unused labs with `--cleanup` so their generated folders disappear.
 
-## Platform behavior for changes
+## Changes
+
+Every change goes the same way: `propose_change` (or `rollback_change`) stages it and
+returns a change ID, `confirm_change` applies it. How it is applied depends on the
+platform; who may approve it depends on the confirm mode.
+
+### Platform behavior
 
 Set per device type by `change.*` in `config/platforms/`:
 
 | device_type | Change path | Rollback |
 |---|---|---|
-| cisco_xr, huawei_vrpv8, junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed; VRP needs `mmi-mode` (see below) |
-| cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot only -> corrective change |
-| fortinet | config-set (persists immediately) | snapshot only |
-| linux | commands run sequentially as the login user | none - include backups in the change (`sudo cp x x.bak`) |
+| cisco_xr, huawei_vrpv8, juniper_junos | config-set + commit | native (`rollback configuration last 1`), staged + confirmed; VRP needs `mmi-mode` (see below) |
+| cisco_ios/xe/nxos, arista_eos, huawei (VRP5) | config-set + save | snapshot of last applied change -> corrective change |
+| fortinet | config-set (persists immediately) | snapshot of last applied change |
+| linux | commands run sequentially as the login user | none, and no snapshots - include backups in the change (`sudo cp x x.bak`) |
 
 `mode='exec'` runs in user/exec view on all platforms, commits nothing, and states that
 in its response.
 
-### Devices that ask before they act
+#### Devices that ask before they act
 
 Huawei VRP answers a maintenance command with a question:
 
@@ -757,7 +926,7 @@ IOS-XR needs neither: `rollback configuration last 1` runs there without asking.
 wirehand a new question, add the pattern and its two answers to `prompts` - in
 `common.yaml`, or in one platform's file if only that platform asks it - and restart.
 
-## Approving changes
+### Approving changes
 
 Wirehand refuses to let the model approve its own proposal, because that is the one thing
 it will eventually try. A real transcript (qwen3.6:35b-a3b):
@@ -804,7 +973,7 @@ spelling. Anything other than `totp`/`off` fails the inventory load at startup. 
 0.5.2 that boolean was read as "unset" on the containerlab path, so a per-kind
 `confirm: off` was silently ignored and the node kept asking for a code.
 
-### Setting it up
+#### Setting it up
 
 ```bash
 docker exec wirehand python -m app.approval --new     # prints secret + otpauth:// URI
@@ -817,7 +986,7 @@ typing it or by scanning the URI - `qrencode -t ANSIUTF8 '<uri>'` turns it into 
 in the terminal. The secret lives only in `.env` and the app; **no API endpoint ever
 returns it**, precisely so a front-end (and with it the model) cannot fetch it.
 
-### What a change looks like in the chat
+#### What a change looks like in the chat
 
 ```
 you:   add a loopback on vrp1
@@ -905,12 +1074,76 @@ requester never sees the 504.
 Everything lives in the named volume `wirehand_data` (`/app/data` inside the container):
 
 ```
-/app/data/audit.jsonl                    # append-only audit trail
-/app/data/snapshots/<device>/<ts>.txt    # pre-change config snapshots (last 20 per device)
+/app/data/audit.jsonl                                # append-only audit trail
+/app/data/snapshots/<device>/<YYYYmmdd-HHMMSS>.txt   # configuration BEFORE a staged change
 ```
 
+A snapshot is saved each time `propose_change` or `rollback_change` stages a change -
+**before** anything is applied, so it is the configuration *before* that change. Linux
+devices have no configuration to snapshot and save none (`snapshot: null` in
+`config/platforms/linux.yaml`); backups belong in the change itself. What became of the
+change is not stored with the file: wirehand reads it from the audit log by change ID.
+
 **From the chat:** ask "what was changed on xrd-test-xrd1 today?" - the model calls
-`get_audit_log`.
+`get_audit_log`. For snapshots:
+
+```
+User:  Which config snapshots are there for xrd-test-xrd1?
+Model: list_snapshots(device='xrd-test-xrd1')
+
+Snapshots for xrd-test-xrd1 (4, newest first). Each snapshot is the configuration BEFORE the change.
+
+NAME              SIZE    TRIGGER          CHANGE  STATUS              REASON
+20261015-201502   14.2k   propose_change   65C02D  applied             OSPF cost on Gi0/0/0/1
+20261015-193011   14.1k   propose_change   A1B2C3  expired             test loopback
+20261014-110847   14.1k   rollback_staged  9F3E21  applied (rollback)  -
+20261014-110120   13.9k   -                -       no audit entry      -
+
+Rollback base (last applied change): 20261015-201502
+Read one with get_snapshot(device='xrd-test-xrd1', name='20261015-201502').
+Retention - kept: max 20, 90 days, unapplied 7 days.
+
+User:  How was OSPF configured before the cost change?
+Model: get_snapshot(device='xrd-test-xrd1', name='20261015-201502', filter='router ospf|cost', context=2)
+```
+
+| STATUS | Meaning |
+|---|---|
+| `applied` / `applied (rollback)` | `confirm_change` applied it (a wrong approval code before does not matter) |
+| `outcome unknown` | `confirm_change` ran into a timeout or a broken connection after sending |
+| `pending (N min left)` | still staged, can still be confirmed |
+| `incomplete` | the device asked a question wirehand could not answer; nothing ran |
+| `failed` | `confirm_change` failed before anything reached the device (connection, credentials) |
+| `denied` | only refused approval codes, then the change ID expired |
+| `expired` | staged, never confirmed |
+| `no audit entry` | no audit entry names this file (e.g. the audit log was cleared) |
+
+**Snapshot content is returned unfiltered.** `get_snapshot` returns the file as the
+device printed it, including whatever secrets the running configuration contains
+(password hashes, keys, SNMP communities) - the same exposure as
+`run_read('show running-config')`. Only devices from the inventory can be queried.
+
+**Cleanup.** Per device, at startup, after every new snapshot and once a day. Set in
+`.env`; `0` switches a rule off:
+
+| Setting (env) | Default | Removes |
+|---|---|---|
+| `WIREHAND_SNAPSHOT_UNAPPLIED_DAYS` | 7 | snapshots older than this whose change was never applied (`expired`, `denied`, `incomplete`, `failed`, `no audit entry`) |
+| `WIREHAND_SNAPSHOT_MAX_AGE_DAYS` | 90 | any snapshot older than this |
+| `WIREHAND_SNAPSHOT_KEEP` | 20 | the oldest snapshots beyond this number |
+
+The rules run in this order. **Never removed**, whatever the rules say: the snapshot of
+the last applied configuration change (the rollback base, even when it is older than
+`MAX_AGE_DAYS`), and snapshots whose change is `pending` or has an `outcome unknown`.
+Protected snapshots count towards `KEEP`, but the next-oldest one goes instead. Each
+removal is audited as `snapshot_pruned` with `snapshot` and `reason` (`unapplied_age`,
+`max_age`, `max_count`); empty device folders are removed. The age comes from the file
+name (container local time). Startup logs the active rules, and warns when `KEEP` and
+`MAX_AGE_DAYS` are both `0`, because snapshots then grow without limit. Reading tools
+never remove anything.
+
+Two snapshots of the same device within the same second share a name; the second one
+overwrites the first.
 
 **From the shell:**
 
@@ -929,15 +1162,19 @@ docker exec wirehand cat /app/data/audit.jsonl \
 docker exec wirehand ls -l /app/data/snapshots/xrd-test-xrd1/
 docker exec wirehand cat /app/data/snapshots/xrd-test-xrd1/20260823-141502.txt
 
+# what the cleanup removed
+docker exec wirehand grep snapshot_pruned /app/data/audit.jsonl
+
 # copy everything out (backup)
 docker cp wirehand:/app/data ./wirehand-data-backup
 ```
 
 Each audit entry holds timestamp, event (`run_read`, `propose_change`, `confirm_change`,
 `rollback_staged`, `rollback_snapshot`, `confirm_denied`, `confirm_incomplete`,
-`confirm_unknown`, `confirm_timeout`, `read_timeout`, `propose_timeout`, `device_busy`, ...), device, the commands/lines involved and, for changes, the confirmation
-code and snapshot path - never credentials. The file is plain JSONL: one JSON object per
-line, greppable and jq-able.
+`confirm_unknown`, `confirm_timeout`, `read_timeout`, `propose_timeout`, `device_busy`,
+`list_snapshots`, `get_snapshot`, `snapshot_pruned`, ...), device, the commands/lines
+involved and, for changes, the change ID and snapshot path - never credentials. The file
+is plain JSONL: one JSON object per line, greppable and jq-able.
 
 **Operational endpoints** (curl, not exposed as LLM tools): `GET /health` (no auth;
 status, device count, pending changes) and `GET /pending` (Bearer auth; currently staged
@@ -950,7 +1187,7 @@ changes with age).
 | `PermissionError ... inventory.yaml` at startup | container uid != owner of the 600-file | rebuild with `docker compose build --build-arg APP_UID=$(id -u) --build-arg APP_GID=$(id -g)`; once: `docker volume rm wirehand_wirehand_data` |
 | `env var 'X' which is not set` | dotenv syntax (spaces, `#` in value) or `.env` edited without recreate | fix syntax; `docker compose up -d` (not `restart`) |
 | Browser: "Failed to fetch", log: `OPTIONS ... 400/405` | CORS preflight rejected | check `WIREHAND_CORS_ORIGINS`; tool URL must be reachable from the *browser* |
-| Open WebUI shows an old version | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
+| Open WebUI shows an old version, or the model does not know `list_snapshots` / `get_snapshot` | cached OpenAPI spec | toggle the tool-server entry off/on or re-add it |
 | Model runs `reset`/`clear` into a 403 | maintenance command on the read path | that is by design - `propose_change(mode='exec')` is the way |
 | `confirm_change` returns 502 `NOT COMPLETED: the device asked ...` | the platform asks a question wirehand does not know | add the pattern to `prompts` in `config/platforms/` and restart; nothing was applied, the session was dropped |
 | `confirm_change` returns 504 `OUTCOME UNKNOWN` | the device did not finish within `WIREHAND_DEADLINE_CONFIRM` | check the device state with `run_read` and decide by hand; nothing is rolled back automatically. If the device is just slow at committing, raise `WIREHAND_DEADLINE_CONFIRM` (and the front-end's tool timeout with it) |
@@ -975,14 +1212,16 @@ changes with age).
 
 ```bash
 pip install -r requirements.txt pytest httpx
-python -m pytest tests/                  # read path, platform files, approval codes, device prompts, containerlab discovery, timeouts
+python -m pytest tests/                  # read path, platform files, approval codes, device prompts, containerlab discovery, timeouts, snapshots
 PYTHONPATH=. python tests/test_api.py    # full propose/confirm/rollback/approval flow against a fake pool
 ```
 
-`tests/toolcall_suite.md` is a 16-prompt regression set for judging how reliably a
+`tests/toolcall_suite.md` is an 18-prompt regression set for judging how reliably a
 given LLM drives these tools - run it after every model or prompt change.
 
-## Design rules (why it looks the way it does)
+## Design rules
+
+*Why it looks the way it does.*
 
 Some of wirehand's choices may look unusual or even old-fashioned. They are deliberate.
 This section explains them without assuming background in AI or operations tooling.
@@ -1004,8 +1243,8 @@ observed in practice.
 
 **1. Few tools, each with a clear job.**
 With twenty similar-sounding tools, a small model regularly picks the wrong one. wirehand
-has seven, and their names say what they do (`list_devices`, `run_read`,
-`propose_change`, ...). Fewer choices mean fewer wrong choices.
+has nine, and their names say what they do (`list_devices`, `run_read`,
+`propose_change`, `list_snapshots`, ...). Fewer choices mean fewer wrong choices.
 
 **2. Simple arguments - mostly plain text.**
 Tools take a few simple values: a device name, a block of commands as text, a yes/no
@@ -1060,6 +1299,30 @@ a chat, one process is fast enough.
 Every rule trades a little elegance for reliability: keep the model's choices few, its
 inputs simple, its outputs readable and bounded - and never rely on the model for
 anything that must not go wrong.
+
+## Scaling
+
+The current version is built for small, local setups: one user or a few, working on
+some 10 lab devices. It has not been designed or tested beyond that.
+
+What this means in practice:
+
+- **One process.** wirehand runs with a single uvicorn worker (`--workers 1`). Pending
+  change IDs and the SSH connection pool live in that process, so it cannot be scaled
+  out to several workers or containers.
+- **Shared identities.** All front-ends use the same `WIREHAND_API_KEY`, and every
+  approval uses the same `WIREHAND_TOTP_SECRET`. wirehand cannot tell users apart, so
+  the audit log does not record who proposed or approved a change.
+- **Local files.** The audit log and snapshots are plain files under `WIREHAND_DATA`.
+
+Multi-user use has not been designed yet. Before several people work through one
+wirehand instance, how their sessions interact has to be checked and designed: for
+example two users staging changes on the same device, or one user confirming a change
+another user proposed.
+
+## Roadmap
+
+To be continued.
 
 ## License
 

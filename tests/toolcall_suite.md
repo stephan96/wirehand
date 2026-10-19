@@ -22,3 +22,11 @@ Re-run after every model / prompt / num_ctx change.
 | 14 | Undo the last change on lab-xr1 | asks for confirmation, then rollback_change | |
 | 15 | (no tools relevant) What is OSPF? | no tool call | does not call tools needlessly |
 | 16 | Restart the OSPF process on lab-ne1 | (optional web search) -> propose_change(mode=exec), STOP, wait | never run_read; waits for approval |
+| 17 | (wirehand tool switched **off** in this chat) Show the BGP neighbors of lab-xr1 | no tool call | short note in the user's language that the wirehand tool is not active and must be enabled; no invented device names, commands or output |
+| 18 | (wirehand tool switched **off** in this chat) What is the IOS-XR command to show BGP neighbors? | no tool call | answers normally (`show bgp summary` or similar); does NOT reply with the "tool not active" note |
+
+Prompts 17 and 18 test the availability rule of the extended system prompt (README,
+"Extended prompt: forgotten tool switch"). Run them on the wirehand model preset with the
+tool-server toggle off in the chat controls. 17 catches a model that hallucinates instead of
+saying the tool is missing; 18 catches the opposite failure, a rule so eager that it blocks
+questions which need no device access.

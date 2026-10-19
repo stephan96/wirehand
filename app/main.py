@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """wirehand: SSH-backed device analysis & change tool for LLM front-ends.
 
-"A hand on the wires" - the LLM works the devices through wirehand, wirehand keeps the glove on.
-
 Exposed as an OpenAPI tool server. Register http://host.docker.internal:8110
 in Open WebUI (Admin -> Settings -> External Tools) and in Onyx (Actions ->
 OpenAPI schema). Auth: `Authorization: Bearer <WIREHAND_API_KEY>`.
@@ -24,6 +22,7 @@ import os
 import threading
 from concurrent.futures import Future, TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -35,6 +34,7 @@ from . import platforms, safety
 from .approval import Approver, ConfigError
 from .inventory import Inventory
 from .safety import DEFAULT_MAX_OUTPUT_CHARS, check_read_command, filter_lines, split_commands, truncate
+from . import state
 from .state import ChangeStore, audit, read_audit
 from .platforms import pending_prompt
 from . import transport
@@ -51,6 +51,7 @@ MAX_OUT = int(os.environ.get("WIREHAND_MAX_OUTPUT_CHARS", DEFAULT_MAX_OUTPUT_CHA
 DEADLINE_READ = float(os.environ.get("WIREHAND_DEADLINE_READ", "60"))        # run_read, get_facts
 DEADLINE_PROPOSE = float(os.environ.get("WIREHAND_DEADLINE_PROPOSE", "60"))  # propose_change, rollback_change
 DEADLINE_CONFIRM = float(os.environ.get("WIREHAND_DEADLINE_CONFIRM", "60"))  # confirm_change
+PRUNE_INTERVAL = 86400   # seconds between snapshot cleanups (also at startup and after every snapshot)
 
 inventory = Inventory()
 pool = Pool()
@@ -79,13 +80,39 @@ async def lifespan(app: FastAPI):
             log.warning("%s=%gs is not below %s=%gs: that step never ends on its own timeout, the "
                         "deadline cuts it off (504) instead", step, value, dname, deadline)
     log.info("loaded %d devices (inventory.yaml=%s, containerlab=%s)", len(inventory.all()), inventory.path, inventory.clab_dir or "off")
+    log.info("snapshot retention: %s (WIREHAND_SNAPSHOT_KEEP / _MAX_AGE_DAYS / _UNAPPLIED_DAYS)",
+             state.retention_summary())
+    if not state.SNAPSHOT_KEEP and not state.SNAPSHOT_MAX_AGE_DAYS:
+        log.warning("WIREHAND_SNAPSHOT_KEEP=0 and WIREHAND_SNAPSHOT_MAX_AGE_DAYS=0 - snapshots of applied "
+                    "changes are never removed and grow without limit")
+    _prune("startup")
+    stop = threading.Event()
+    pruner = threading.Thread(target=_prune_daily, args=(stop,), daemon=True, name="wirehand-prune")
+    pruner.start()
     yield
+    stop.set()
+    pruner.join(timeout=5)
     pool.close_all()
+
+
+def _prune(when: str) -> None:
+    try:
+        removed = changes.prune()
+    except Exception:
+        log.exception("snapshot cleanup (%s) failed", when)
+        return
+    if removed:
+        log.info("snapshot cleanup (%s): removed %d snapshot(s)", when, len(removed))
+
+
+def _prune_daily(stop: threading.Event) -> None:
+    while not stop.wait(PRUNE_INTERVAL):
+        _prune("daily")
 
 
 # Also the start of the description: Open WebUI shows that on mouse-over in the
 # chat's tool selection, so users see which version they are talking to.
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 
 app = FastAPI(
     title="wirehand",
@@ -124,11 +151,15 @@ def _device(name: str):
         raise HTTPException(404, str(exc))
 
 
+def _filtered(text: str, flt: str = "", context: int = 0) -> str:
+    """The `filter` / `context` semantics of run_read, for any text."""
+    return filter_lines(text, flt, context) if flt else text
+
+
 def _fmt(device: str, results: list[tuple[str, str]], flt: str = "", context: int = 0) -> str:
     blocks = []
     for cmd, out in results:
-        body = filter_lines(out, flt, context) if flt else out
-        blocks.append(f"=== {device} : {cmd} ===\n{body.rstrip()}\n")
+        blocks.append(f"=== {device} : {cmd} ===\n{_filtered(out, flt, context).rstrip()}\n")
     return truncate("\n".join(blocks), MAX_OUT)
 
 
@@ -195,6 +226,39 @@ def _propose_timeout(t: ToolTimeout, dev, tool: str) -> HTTPException:
 def _busy(dev, exc: DeviceBusy, **fields) -> HTTPException:
     audit("device_busy", dev.name, **fields)
     return HTTPException(409, str(exc))
+
+
+NO_SNAPSHOT = ("No config snapshot: this platform has none. Backups are part of the change itself - "
+               "include them in it, e.g. 'sudo cp /etc/x /etc/x.bak'.")
+
+
+def _take_snapshot(dev, tool: str) -> Path | None:
+    """Save the configuration before a change is staged; None on platforms
+    without a snapshot command (Linux), which save nothing at all."""
+    snap_cmd = dev.platform.snapshot
+    if not snap_cmd:
+        return None
+    try:
+        snapshot = _within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1]
+    except ToolTimeout as t:
+        raise _propose_timeout(t, dev, tool)
+    except AuthError as exc:
+        audit("auth_failed", dev.name)
+        raise HTTPException(401, str(exc))
+    except DeviceBusy as exc:
+        raise _busy(dev, exc, tool="snapshot")
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc))
+    return changes.save_snapshot(dev.name, snapshot)
+
+
+def _before(dev, pc, what: str = "this change") -> str:
+    """Where the configuration from before a staged change is, for confirm_change answers."""
+    if not pc.snapshot_path:
+        return f"There is no configuration snapshot from before {what} on this platform."
+    name = Path(pc.snapshot_path).stem
+    return (f"The configuration from before {what} was saved as snapshot {name}: "
+            f"get_snapshot(device='{dev.name}', name='{name}').")
 
 
 def _next_step(dev, code: str) -> str:
@@ -471,20 +535,7 @@ def propose_change(body: ProposeIn) -> str:
             if opens > ends:
                 lines = lines + ["end"] * (opens - ends)
 
-    snap_cmd = plat.snapshot
-    try:
-        snapshot = (_within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1] if snap_cmd
-                    else "(no config snapshot on this platform; per-file backups are your responsibility - include them in the change, e.g. 'sudo cp /etc/x /etc/x.bak')")
-    except ToolTimeout as t:
-        raise _propose_timeout(t, dev, "propose_change")
-    except AuthError as exc:
-        audit("auth_failed", dev.name)
-        raise HTTPException(401, str(exc))
-    except DeviceBusy as exc:
-        raise _busy(dev, exc, tool="snapshot")
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc))
-    snap_path = changes.save_snapshot(dev.name, snapshot)
+    snap_path = _take_snapshot(dev, "propose_change")
 
     # Preview: ALWAYS the exact lines that will be sent. (An earlier version diffed
     # against the snapshot line-set; on hierarchical configs the same 'set ...' line can
@@ -500,10 +551,12 @@ def propose_change(body: ProposeIn) -> str:
             preview += (f"\n(dropped from the end: {', '.join(repr(d) for d in dropped)} - "
                         f"the tool leaves config mode itself)")
     pc = changes.create(dev.name, lines, snap_path, preview, mode=body.mode)
-    audit("propose_change", dev.name, code=pc.code, lines=lines, reason=body.reason, mode=body.mode, snapshot=str(snap_path))
+    audit("propose_change", dev.name, code=pc.code, lines=lines, reason=body.reason, mode=body.mode,
+          snapshot=str(snap_path or ""))
+    saved = f"Snapshot saved: {snap_path.stem}" if snap_path else NO_SNAPSHOT
     return (
         f"STAGED, NOT APPLIED. Change ID: {pc.code}  (device {dev.name}, expires in 10 min)\n"
-        f"Snapshot saved: {snap_path.name}\n\n{preview}\n\n"
+        f"{saved}\n\n{preview}\n\n"
         + _next_step(dev, pc.code)
     )
 
@@ -539,10 +592,10 @@ def confirm_change(
         try:
             verdict = approver.verify(approval)
         except ConfigError as exc:
-            audit("confirm_denied", dev.name, code=code, reason="approval not configured")
+            audit("confirm_denied", dev.name, code=pc.code, reason="approval not configured")
             raise HTTPException(503, str(exc))
         if not verdict.ok:
-            audit("confirm_denied", dev.name, code=code, reason=verdict.reason, approval_given=bool(approval.strip()))
+            audit("confirm_denied", dev.name, code=pc.code, reason=verdict.reason, approval_given=bool(approval.strip()))
             raise HTTPException(403, (
                 f"NOT APPLIED - {verdict.reason}. The change is still staged as {pc.code} until it "
                 f"expires. Ask the user for the current 6-digit code from their authenticator app "
@@ -566,14 +619,14 @@ def confirm_change(
     except ToolTimeout as t:
         # No automatic rollback: wirehand cannot tell what the device did, and
         # undoing a change that never landed is a change of its own.
-        audit("confirm_timeout", dev.name, code=code, mode=pc.mode, seconds=round(t.elapsed, 1))
+        audit("confirm_timeout", dev.name, code=pc.code, mode=pc.mode, seconds=round(t.elapsed, 1))
         raise HTTPException(504, (
             f"OUTCOME UNKNOWN on {dev.name} after {t.elapsed:.1f}s (deadline {t.seconds:g}s). The "
             f"change may or may not have been applied. Do NOT retry: the change ID {code} is used up and "
             f"the staged change is gone. Verify the current state with run_read and report it to the "
-            f"user. The configuration from before this change was saved as {pc.snapshot_path}."))
+            f"user. {_before(dev, pc)}"))
     except AuthError as exc:
-        audit("auth_failed", dev.name, code=code)
+        audit("auth_failed", dev.name, code=pc.code)
         raise HTTPException(401, str(exc))
     except DeviceBusy as exc:
         # Nothing was sent: the change is staged again under the same change ID.
@@ -581,42 +634,45 @@ def confirm_change(
         again = ("Ask the user for a NEW 6-digit code from their authenticator app - the one just "
                  "used does not work twice - and call confirm_change again with it."
                  if approver.requires_approval(dev.confirm) else "Call confirm_change again.")
-        audit("device_busy", dev.name, tool="confirm_change", code=code)
+        audit("device_busy", dev.name, tool="confirm_change", code=pc.code)
         raise HTTPException(409, (
             f"{exc} NOT APPLIED. The change is still staged as {pc.code} until it expires. {again}"))
     except OutcomeUnknown as exc:
         # Something went wrong after the change reached the device: it may or may
         # not have been applied. Saying "APPLIED" or "failed" would both be guesses.
-        audit("confirm_unknown", dev.name, code=code, mode=pc.mode, error=str(exc))
+        audit("confirm_unknown", dev.name, code=pc.code, mode=pc.mode, error=str(exc))
         raise HTTPException(502, (
             f"NOT CONFIRMED - OUTCOME UNKNOWN on {dev.name}: {exc}. The change may or may not have "
             f"been applied. Do NOT retry confirm_change; the change ID {code} is used up. Verify the "
-            f"current state with run_read and report it to the user. The configuration from before "
-            f"this change was saved as {pc.snapshot_path}."))
+            f"current state with run_read and report it to the user. {_before(dev, pc)}"))
     except Exception as exc:
-        audit("confirm_change_error", dev.name, code=code, error=str(exc))
-        raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. Snapshot {pc.snapshot_path} is available for rollback.")
+        audit("confirm_change_error", dev.name, code=pc.code, error=str(exc))
+        raise HTTPException(502, f"change failed on {dev.name}: {type(exc).__name__}: {exc}. {_before(dev, pc)}")
     # Never report success while the device is still asking a question: the
     # command has not run then, and saying "ROLLED BACK" when nothing was rolled
     # back is worse than failing.
     stuck = pending_prompt(out, dev.device_type)
     if stuck:
         pool.reset(dev)          # the session is sitting at that question
-        audit("confirm_incomplete", dev.name, code=code, mode=pc.mode, question=stuck[0])
+        audit("confirm_incomplete", dev.name, code=pc.code, mode=pc.mode, question=stuck[0])
         raise HTTPException(502, (
             f"NOT COMPLETED on {dev.name}: the device asked '{stuck[0]}' and is still waiting, "
             f"so the operation did NOT run. Nothing was applied by this call. Report this to the "
             f"user - it needs a fix on the wirehand host (the prompt is unknown to the "
             f"'prompts' in config/platforms/), not another attempt.\n\n{truncate(out, 4000)}"))
-    audit("confirm_change", dev.name, code=code, lines=pc.lines, mode=pc.mode,
+    audit("confirm_change", dev.name, code=pc.code, lines=pc.lines, mode=pc.mode,
           approval=approver.mode_for(dev.confirm))
     if pc.mode == "rollback":
         return truncate(f"ROLLED BACK on {dev.name} (change ID {code}). The device is back to the state "
-                        f"before its last commit; the configuration from before this rollback was "
-                        f"saved as {pc.snapshot_path}.\n\n{out}", MAX_OUT)
+                        f"before its last commit. {_before(dev, pc, 'this rollback')}\n\n{out}", MAX_OUT)
     if pc.mode == "exec":
         return truncate(f"EXECUTED on {dev.name} (change ID {code}, exec mode - nothing was committed).\n\n{out}", MAX_OUT)
-    rb = "native rollback available via rollback_change" if dev.platform.rollback_last else "no native rollback on this platform - rollback_change returns the snapshot for manual restore"
+    if dev.platform.rollback_last:
+        rb = "native rollback available via rollback_change"
+    elif pc.snapshot_path:
+        rb = "no native rollback on this platform - rollback_change returns the snapshot from before this change for a manual restore"
+    else:
+        rb = "no rollback and no configuration snapshot on this platform - undo it with a corrective propose_change"
     return truncate(f"APPLIED on {dev.name} (change ID {code}). {rb}.\n\n{out}", MAX_OUT)
 
 
@@ -628,8 +684,8 @@ def confirm_change(
               "nothing is undone yet. Show the preview to the user, then apply it with confirm_change "
               "and that change ID. Whether the user must additionally give a 6-digit authenticator "
               "code depends on the device's CONFIRM mode (see list_devices). On platforms without a native rollback it "
-              "changes nothing and returns the pre-change snapshot instead, so you can derive a "
-              "corrective propose_change from it. "
+              "changes nothing and returns the snapshot taken before the last APPLIED change instead, "
+              "so you can derive a corrective propose_change from it. "
               "Example: rollback_change(device='r1')"
           ), dependencies=[Depends(auth)])
 def rollback_change(device: str = Query(..., description="Device name")) -> str:
@@ -638,41 +694,159 @@ def rollback_change(device: str = Query(..., description="Device name")) -> str:
         raise HTTPException(403, f"device '{dev.name}' is read-only (access=ro)")
     cmds = list(dev.platform.rollback_last or [])
     if not cmds:
-        # No native rollback: returning the snapshot changes nothing on the device.
-        snap = changes.latest_snapshot(dev.name)
-        audit("rollback_snapshot", dev.name, snapshot=str(snap))
-        if not snap:
-            return f"No native rollback on {dev.device_type} and no snapshot found for {dev.name}."
-        return truncate(
-            f"No native rollback on {dev.device_type}. Pre-change snapshot {snap.name} follows; "
-            f"derive a corrective propose_change from it.\n\n{snap.read_text()}", MAX_OUT)
+        if dev.platform.snapshot is None:
+            audit("rollback_snapshot", dev.name, snapshot="", code="")
+            return (f"No native rollback on {dev.device_type}, and no configuration snapshots either: "
+                    f"there is no configuration to snapshot. Nothing was changed. Undo a change with a "
+                    f"corrective propose_change, using the backups that change made (e.g. "
+                    f"'sudo cp /etc/x.bak /etc/x').")
+        return _rollback_snapshot(dev)
 
     # A native rollback overwrites the running configuration - that is a write, so
     # it goes through the same two-stage gate (and the device's confirm mode) as any
     # other change instead of applying on a single call.
-    snap_cmd = dev.platform.snapshot
-    try:
-        snapshot = (_within(DEADLINE_PROPOSE, lambda b: pool.run(dev, [snap_cmd], budget=b))[0][1] if snap_cmd
-                    else "(no config snapshot for this platform)")
-    except ToolTimeout as t:
-        raise _propose_timeout(t, dev, "rollback_change")
-    except AuthError as exc:
-        audit("auth_failed", dev.name)
-        raise HTTPException(401, str(exc))
-    except DeviceBusy as exc:
-        raise _busy(dev, exc, tool="snapshot")
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc))
-    snap_path = changes.save_snapshot(dev.name, snapshot)
+    snap_path = _take_snapshot(dev, "rollback_change")
     preview = "Rollback commands (user/exec view):\n" + "\n".join(f"  > {c}" for c in cmds)
     pc = changes.create(dev.name, cmds, snap_path, preview, mode="rollback")
-    audit("rollback_staged", dev.name, code=pc.code, lines=cmds, snapshot=str(snap_path))
+    audit("rollback_staged", dev.name, code=pc.code, lines=cmds, snapshot=str(snap_path or ""))
+    saved = (f"The configuration as it is RIGHT NOW was saved as snapshot {snap_path.stem} first."
+             if snap_path else NO_SNAPSHOT)
     return (
         f"STAGED, NOT APPLIED. Change ID: {pc.code}  (device {dev.name}, expires in 10 min)\n"
-        f"This undoes the last commit on {dev.name}. The configuration as it is RIGHT NOW was saved "
-        f"as {snap_path.name} first.\n\n{preview}\n\n"
+        f"This undoes the last commit on {dev.name}. {saved}\n\n{preview}\n\n"
         + _next_step(dev, pc.code)
     )
+
+
+def _rollback_snapshot(dev) -> str:
+    """rollback_change without a native rollback: return the snapshot of the last
+    APPLIED change, which changes nothing on the device. Not simply the newest
+    snapshot - that may belong to a proposal that was never applied."""
+    index = changes.index(dev.name)
+    info = state.last_applied(dev.name, index=index)
+    if info is None:
+        audit("rollback_snapshot", dev.name, snapshot="", code="")
+        return (f"No native rollback on {dev.device_type}, and no applied change on {dev.name} has a "
+                f"saved snapshot. Nothing was changed. Do not use the newest snapshot instead - it may "
+                f"belong to a change that was never applied. list_snapshots(device='{dev.name}') shows "
+                f"what is there.")
+    path = state.snapshot_path(dev.name, info.name)
+    audit("rollback_snapshot", dev.name, snapshot=str(path), code=info.code)
+    head = (f"No native rollback on {dev.device_type}. Nothing was changed.\n"
+            f"Snapshot {info.name} is the configuration BEFORE change {info.code} - the last change "
+            f"applied on {dev.name} (applied {info.applied_ts}, reason: {info.reason or '-'}). "
+            f"Derive a corrective propose_change from it.\n")
+    newer = [n for n, i in sorted(index.items(), reverse=True)
+             if n > info.name and not i.applied and state.snapshot_path(dev.name, n).is_file()]
+    if newer:
+        head += (f"Newer snapshots belong to changes that were never applied and are NOT the rollback "
+                 f"base: {', '.join(newer[:5])}{', ...' if len(newer) > 5 else ''}.\n")
+    return truncate(f"{head}\n{path.read_text()}", MAX_OUT)
+
+
+def _size(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1000 * 1024:
+        return f"{n / 1024:.1f}k"
+    return f"{n / 1024 / 1024:.1f}M"
+
+
+PLACEHOLDER_NOTE = ("[placeholder] = an empty marker from before 0.6.3: this platform has no "
+                    "configuration to snapshot. Removed by the normal cleanup.")
+
+
+@app.get("/list_snapshots", operation_id="list_snapshots", response_class=PlainTextResponse,
+         summary="List the saved configuration snapshots of a device",
+         description=(
+             "wirehand saves the device's configuration every time propose_change or rollback_change "
+             "stages a change. Each snapshot is the configuration BEFORE that change. This lists them, "
+             "newest first, with the change ID, what became of the change (applied, expired, denied, "
+             "pending, outcome unknown, ...) and its reason, and names the rollback base: the snapshot "
+             "of the last applied change. Read one with get_snapshot. "
+             "Example: list_snapshots(device='r1')"
+         ), dependencies=[Depends(auth)])
+def list_snapshots(device: str = Query(..., description="Device name from list_devices")) -> str:
+    dev = _device(device)
+    files = changes.list_snapshots(dev.name)
+    audit("list_snapshots", dev.name, count=len(files))
+    retention = f"Retention - kept: {state.retention_summary()}."
+    if not files:
+        if dev.platform.snapshot is None:
+            why = (f"{dev.device_type} has no configuration to snapshot, so wirehand saves none. "
+                   f"Backups of changed files must be part of the change itself.")
+        elif not dev.writable:
+            why = ("the device is read-only (access=ro), so no change was ever staged on it - "
+                   "snapshots are only taken when a change is staged.")
+        else:
+            why = ("no change has been staged on it yet (or the snapshots were removed by the cleanup). "
+                   "A snapshot is saved each time propose_change or rollback_change stages a change.")
+        return f"No snapshots for {dev.name}: {why}\n{retention}"
+    index = changes.index(dev.name)
+    base = state.last_applied(dev.name, index=index)
+    infos = [index.get(p.stem) or state.SnapshotInfo(name=p.stem) for p in files]
+    placeholders = {p.stem for p in files if state.is_placeholder(p)}
+    sw = max([len("STATUS")] + [len(i.status) for i in infos])
+    rows = []
+    for p, i in zip(files, infos):
+        reason = i.reason or "-"
+        if p.stem in placeholders:
+            reason = "[placeholder] " + (i.reason or "")
+        rows.append(f"{p.stem:<17} {_size(p.stat().st_size):<7} {i.trigger or '-':<16} {i.code or '-':<7} "
+                    f"{i.status:<{sw}}  {reason}".rstrip())
+    out = [f"Snapshots for {dev.name} ({len(files)}, newest first). Each snapshot is the configuration "
+           f"BEFORE the change.", "",
+           f"{'NAME':<17} {'SIZE':<7} {'TRIGGER':<16} {'CHANGE':<7} {'STATUS':<{sw}}  REASON", *rows, ""]
+    if placeholders:
+        out.append(PLACEHOLDER_NOTE)
+    example = base.name if base else files[0].stem
+    out += [f"Rollback base (last applied change): {base.name if base else 'none'}",
+            f"Read one with get_snapshot(device='{dev.name}', name='{example}').",
+            retention]
+    return truncate("\n".join(out), MAX_OUT)
+
+
+@app.get("/get_snapshot", operation_id="get_snapshot", response_class=PlainTextResponse,
+         summary="Read a saved configuration snapshot of a device",
+         description=(
+             "Returns one snapshot from list_snapshots: the device's configuration as it was BEFORE "
+             "the change named in the header, unmodified. name is the NAME column of list_snapshots "
+             "or 'latest' (the newest snapshot, which is not necessarily the one before the last "
+             "APPLIED change - list_snapshots names that one as rollback base). Snapshots are long: "
+             "set filter to a regex so only matching lines are returned; use context to include "
+             "surrounding lines. "
+             "Examples: get_snapshot(device='r1', name='20261015-201502') | "
+             "get_snapshot(device='r1', name='latest', filter='router ospf|cost', context=2)"
+         ), dependencies=[Depends(auth)])
+def get_snapshot(
+    device: str = Query(..., description="Device name from list_devices"),
+    name: str = Query(..., description="Snapshot NAME from list_snapshots (YYYYmmdd-HHMMSS), or 'latest'"),
+    filter: str = Query("", description="Optional case-insensitive regex; only matching lines are returned"),
+    context: int = Query(0, ge=0, le=20, description="Lines of context around each filter match"),
+) -> str:
+    dev = _device(device)
+    try:
+        path = changes.get_snapshot(dev.name, name)
+    except ValueError:
+        raise HTTPException(400, (
+            f"invalid snapshot name '{name}': use a NAME from list_snapshots, format YYYYmmdd-HHMMSS "
+            f"without '.txt' (e.g. 20261015-201502), or 'latest'"))
+    if path is None:
+        raise HTTPException(404, (
+            f"no snapshot '{name}' for {dev.name}. list_snapshots(device='{dev.name}') shows the "
+            f"available ones."))
+    info = changes.index(dev.name).get(path.stem) or state.SnapshotInfo(name=path.stem)
+    audit("get_snapshot", dev.name, snapshot=path.stem, filter=filter)
+    head = (f"=== {dev.name} : snapshot {path.stem} ===\n"
+            f"Status: {info.status} | Change ID: {info.code or '-'} | Trigger: {info.trigger or '-'} | "
+            f"Reason: {info.reason or '-'}\n")
+    if info.code:
+        head += f"This is the configuration BEFORE change {info.code} (staged {info.staged_ts}).\n"
+    else:
+        head += "No audit entry names this snapshot: it is the configuration before an unknown change.\n"
+    if state.is_placeholder(path):
+        head += "Placeholder from before 0.6.3 - this platform has no configuration to snapshot.\n"
+    return truncate(head + "\n" + _filtered(path.read_text(), filter, context).rstrip() + "\n", MAX_OUT)
 
 
 @app.get("/get_audit_log", operation_id="get_audit_log", response_class=PlainTextResponse,

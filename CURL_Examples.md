@@ -187,10 +187,30 @@ curl -s -H "$AUTH" -X POST "$WH/confirm_change?code=3C19B4"
 # ROLLED BACK on xrd-test-xrd1 (change ID 3C19B4). ...
 ```
 
-Platforms without a native rollback (IOS/NX-OS/EOS/VRP5/FortiGate/Linux) touch nothing and
-return the pre-change snapshot for a manual corrective change - no code involved.
+Platforms without a native rollback (IOS/NX-OS/EOS/VRP5/FortiGate) touch nothing and
+return the snapshot from before the last **applied** change for a manual corrective change -
+no code involved. Linux has no snapshots; undo a change there with a corrective change.
 
-## 7. get_audit_log - what happened
+## 7. list_snapshots / get_snapshot - configuration before a change
+
+```bash
+curl -s -H "$AUTH" "$WH/list_snapshots?device=xrd-test-xrd1"
+# NAME              SIZE    TRIGGER          CHANGE  STATUS   REASON
+# 20261015-201502   14.2k   propose_change   65C02D  applied  OSPF cost on Gi0/0/0/1
+# ...
+# Rollback base (last applied change): 20261015-201502
+
+curl -s -H "$AUTH" --get \
+  --data-urlencode "device=xrd-test-xrd1" \
+  --data-urlencode "name=20261015-201502" \
+  --data-urlencode "filter=router ospf|cost" \
+  --data-urlencode "context=2" \
+  $WH/get_snapshot
+```
+
+`name=latest` returns the newest snapshot. Invalid names answer 400, missing ones 404.
+
+## 8. get_audit_log - what happened
 
 ```bash
 curl -s -H "$AUTH" $WH/get_audit_log
@@ -201,7 +221,7 @@ curl -s -H "$AUTH" --get \
   $WH/get_audit_log
 ```
 
-## 8. pending - currently staged changes (operational, not an LLM tool)
+## 9. pending - currently staged changes (operational, not an LLM tool)
 
 ```bash
 curl -s -H "$AUTH" $WH/pending | jq .
