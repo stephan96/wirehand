@@ -1322,7 +1322,13 @@ another user proposed.
 
 ## Roadmap
 
-To be continued.
+- v0.7: Audit log, pending changes and locks move to Postgres/Redis, the inventory comes from Nautobot, and devices are reached via bastion/jump hosts.
+
+- v0.8: Every action is tied to a person via OIDC and authorized through RBAC scopes from Nautobot, with per-user TOTP and secrets from OpenBao/Vault.
+
+- v0.9: API and SSH workers are split, and reads across many devices run as jobs with server-side aggregation, so the model only sees summaries.
+
+- v1.0: Four-eyes approval, blast-radius limits, SIEM export and HA make wirehand production-ready for a team.
 
 ## License
 
