@@ -92,6 +92,8 @@ one of the existing platforms does. See
 
 ## Demo videos
 
+Both demos use Cisco XRd devices running in [containerlab](https://containerlab.dev/).
+
 **Configuration** - an LLM proposes a configuration change, a human approves it,
 wirehand applies and snapshots it.
 
