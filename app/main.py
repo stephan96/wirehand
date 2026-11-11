@@ -112,7 +112,7 @@ def _prune_daily(stop: threading.Event) -> None:
 
 # Also the start of the description: Open WebUI shows that on mouse-over in the
 # chat's tool selection, so users see which version they are talking to.
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 
 app = FastAPI(
     title="wirehand",

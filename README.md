@@ -2,11 +2,12 @@
 
 *LLM-driven network operations, with human approval for every change.*
 
-**Version:** 0.6.3 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.4 · **License:** [Apache-2.0](LICENSE)
 
 ## Contents
 
 - [Summary](#summary)
+- [Demo videos](#demo-videos)
 - [How it works](#how-it-works)
   - [Overview](#overview)
   - [Tools](#tools)
@@ -88,6 +89,17 @@ one of the existing platforms does. See
 - Every change is staged, human-approved via a one-time TOTP code, snapshotted and
   audited. TOTP approval can be turned off globally or per device (e.g. for disposable
   lab nodes); see Configuration.
+
+## Demo videos
+
+**Configuration** - an LLM proposes a configuration change, a human approves it,
+wirehand applies and snapshots it.
+
+https://github.com/user-attachments/assets/dfb961e7-9b55-480c-8ec8-f4645a874474
+
+**Troubleshooting** - an LLM collects status from devices and analyzes the output.
+
+https://github.com/user-attachments/assets/fca9ff9b-2d4a-4be0-83f1-4882bda2c31c
 
 ## How it works
 
