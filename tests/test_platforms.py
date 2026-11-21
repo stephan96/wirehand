@@ -338,3 +338,94 @@ def test_accepted_lines_go_one_at_a_time_and_commit(monkeypatch):
     dev = Device(name="vrp3", host="h", device_type="huawei_vrpv8", username="u", password="p")
     transport.Pool().configure(dev, LINES, commit=True)
     assert conn.sent == LINES and conn.calls == ["config_set"] * 4 + ["commit", "exit_config_mode"]
+
+
+# --- change.close_views: insert the 'quit' that mmi-mode needs -----------------
+def _cv(lines, dt="huawei_vrpv8"):
+    out, added = platforms.get(dt).close_views(lines)
+    return [("+ " if i in added else "  ") + ln for i, ln in enumerate(out)]
+
+
+@pytest.mark.parametrize("dt", ["huawei", "huawei_vrpv8"])
+def test_flat_change_gets_quit_between_views(dt):
+    """Issue #47, first example: no indentation at all."""
+    assert _cv(["interface Ethernet3/0/0", "ip address 1.1.1.1 255.255.255.0",
+                "interface Ethernet3/0/1", "ip address 1.1.1.2 255.255.255.0",
+                "ip route-static 0.0.0.0 0 10.0.0.1"], dt) == [
+        "  interface Ethernet3/0/0", "  ip address 1.1.1.1 255.255.255.0",
+        "+ quit", "  interface Ethernet3/0/1", "  ip address 1.1.1.2 255.255.255.0",
+        "  ip route-static 0.0.0.0 0 10.0.0.1"]   # flat: not an opener, nothing to know
+
+
+AAA = ["aaa", " local-user ansible level 3",
+       " authentication-scheme default_admin", "  authentication-mode local hwtacacs",
+       " authorization-scheme default_admin", "  authorization-mode local hwtacacs",
+       "stelnet server enable"]
+
+
+def test_indented_change_closes_every_view_it_leaves():
+    """Issue #47, second example, without the quit lines the model forgot."""
+    assert _cv(AAA) == [
+        "  aaa", "   local-user ansible level 3",
+        "   authentication-scheme default_admin", "    authentication-mode local hwtacacs",
+        "+ quit", "   authorization-scheme default_admin", "    authorization-mode local hwtacacs",
+        "+ quit", "+ quit", "  stelnet server enable"]
+
+
+def test_quit_lines_already_there_are_kept_and_counted():
+    with_quits = AAA[:4] + [" quit"] + AAA[4:6] + [" quit", " quit"] + AAA[6:]
+    assert _cv(with_quits) == ["  " + ln for ln in with_quits]
+    # one of the two missing: only the other one is added
+    one = AAA[:4] + [" quit"] + AAA[4:6] + [" quit"] + AAA[6:]
+    assert _cv(one).count("+ quit") == 1
+
+
+def test_indented_top_level_lines_close_the_view():
+    """Display-config layout, also for a line that is no known opener."""
+    assert _cv(["interface LoopBack1", " description a", "ip route-static 0.0.0.0 0 10.0.0.1"]) == [
+        "  interface LoopBack1", "   description a", "+ quit", "  ip route-static 0.0.0.0 0 10.0.0.1"]
+    # a whole change indented by one space is the same change
+    assert _cv([" interface LoopBack1", "  description a", " interface LoopBack2"]).count("+ quit") == 1
+
+
+@pytest.mark.parametrize("lines", [
+    ["vlan batch 10 20", "vlan batch 30"],                         # no view
+    ["undo interface LoopBack1", "undo interface LoopBack2"],      # no view
+    ["interface LoopBack1", "quit", "interface LoopBack2"],        # already left
+    ["sysname r1", "lldp enable"],
+    ["interface LoopBack1", " description a"],                    # nothing after the view
+])
+def test_nothing_added_where_nothing_is_missing(lines):
+    assert _cv(lines) == ["  " + ln for ln in lines]
+
+
+def test_flat_vlan_and_bgp_are_openers():
+    assert _cv(["vlan 10", "description users", "bgp 65000", "peer 1.1.1.1 as-number 65001"]) == [
+        "  vlan 10", "  description users", "+ quit", "  bgp 65000", "  peer 1.1.1.1 as-number 65001"]
+
+
+def test_other_platforms_are_untouched():
+    lines = ["interface Gi0/0", " description a", "interface Gi0/1"]
+    assert platforms.get("cisco_ios").close_views(lines) == (lines, {})
+
+
+CV = "  drop_trailing: ['^quit$']\n  close_views: {command: quit, openers: ['^interface\\s']}\n"
+
+
+def test_close_views_load(tmp_path):
+    xr = load_platforms(_tree(tmp_path, cisco_xr=CFG.replace("containerlab:", CV + "containerlab:"))).platforms["cisco_xr"]
+    assert xr.close_cmd == "quit" and xr.close_views(["interface a", "x", "interface b"])[1] == {2: "interface a"}
+
+
+@pytest.mark.parametrize("files, message", [
+    ({"cisco_xr": CFG.replace("containerlab:", CV.replace("  drop_trailing: ['^quit$']\n", "") + "containerlab:")},
+     "must also match change.drop_trailing"),
+    ({"cisco_xr": CFG.replace("containerlab:", CV.replace("command: quit", "command: 'quit now'") + "containerlab:")},
+     "must be one word"),
+    ({"linux": SHELL.replace("rollback_last: null}", "rollback_last: null, close_views: {command: quit}}")},
+     "only applies to change.apply: config_set"),
+])
+def test_close_views_is_validated(tmp_path, files, message):
+    with pytest.raises(PlatformError) as exc:
+        load_platforms(_tree(tmp_path, **files))
+    assert message in str(exc.value), str(exc.value)

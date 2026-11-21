@@ -368,9 +368,14 @@ committed/saved and reported `APPLIED` - in mmi-mode the lines after a rejected
 - Config lines go to these devices one at a time. This costs no time: Netmiko already
   waits for each line's echo and prompt in a batch (measured on NE40E: 0.025 s per line
   either way; the commit takes 7-14 s).
-- New key `change.config_errors` in `config/platforms/`. If you keep your own copy of
+- `propose_change` inserts the `quit` lines mmi-mode needs between sub-views and marks
+  them in the preview (see "Missing quit lines").
+- The `propose_change` tool description asks for Huawei changes indented like
+  `display current-configuration` - toggle the tool server in Open WebUI so the model
+  sees it.
+- New keys `change.config_errors` and `change.close_views` in `config/platforms/`. If you keep your own copy of
   `config/platforms/`, take the new `huawei.yaml` and `huawei_vrpv8.yaml` - without the
-  key the old behaviour stays.
+  keys the old behaviour stays.
 
 **Open WebUI caches the tool description: after an update, toggle the tool-server entry
 off/on (or re-add it) so the model sees the new tool descriptions.**
@@ -634,6 +639,7 @@ rejected when the inventory loads, and every file needs its counterpart in
 | `change.drop_trailing` | trailing lines dropped from a config change (`end`, `return`, `exit`) - the tool leaves config mode itself, and the preview names what was dropped |
 | `change.last_line_only` | lines that are dropped at the end like `drop_trailing`, but refused anywhere else (`end`, `return`: in the middle they leave config mode with the change uncommitted) |
 | `change.config_errors` | how the device reports a rejected config line (`patterns`), and on commit platforms how the uncommitted change is thrown away (`discard`, verified with `dirty_prompt`); `hint` is shown to the model. See "Rejected config lines" |
+| `change.close_views` | the command that leaves a sub-view (`command: quit`) and the top-level commands that open one (`openers`); `propose_change` inserts the command where a change moves on without leaving a view. See "Missing quit lines" |
 | `change.refuse_in_config` | lines a config change must not contain (they leave config mode, commit or reboot), with the reason shown to the model |
 | `prompts` | device questions and the answers to them; shared ones in `common.yaml` |
 | `comment_prefixes` | lines of a proposed change that are dropped as comments (`#`, `!`) |
@@ -981,6 +987,38 @@ The session is dropped in every case, the change ID is used up, and the audit lo
 `confirm_rejected` with `line`, `rejected`, `error` and `state`. The answer includes
 `config_errors.hint`, which tells the model to leave a sub-view with `quit`. A VRP5
 partial change counts as applied in `list_snapshots`, so its snapshot is the rollback base.
+
+#### Missing quit lines
+
+The same mmi-mode behaviour also catches changes that are written the way they look in
+`display current-configuration`, without `quit`. Small models do this all the time. On
+platforms with `change.close_views` (both Huawei files), `propose_change` therefore
+inserts the missing `quit` lines **before** staging, so the preview shows exactly what
+will be sent:
+
+```
+Configuration lines to send:
+  + aaa
+  +  authentication-scheme default_admin
+  +   authentication-mode local hwtacacs
+  + quit   (added: leaves 'authentication-scheme default_admin')
+  +  authorization-scheme default_admin
+  +   authorization-mode local hwtacacs
+  + quit   (added: leaves 'authorization-scheme default_admin')
+  + quit   (added: leaves 'aaa')
+  + interface LoopBack1
+(3 'quit' line(s) added - this device rejects a line that does not belong to the current view)
+```
+
+- **With indentation:** a line opens a view when the next line is indented deeper, and
+  every step back out closes one view. This also covers lines that open no view
+  themselves (`ip route-static ...` after an interface block).
+- **Without indentation:** each line matching `close_views.openers` (`interface ...`,
+  `aaa`, `bgp ...`, `vlan <id>`, ...) closes the view the previous opener opened. Nested
+  views cannot be recognised in a flat change. If one is missed, the device rejects the
+  next line, and "Rejected config lines" stops the change.
+- A `quit` that is already in the change closes the innermost view and is kept. Lines
+  are only ever added, never removed or changed. A trailing `quit` is still dropped.
 
 ### Approving changes
 

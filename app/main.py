@@ -501,6 +501,9 @@ class ProposeIn(BaseModel):
         "Configuration lines, ONE PER LINE, exactly as typed on the device. "
         "Cisco/Huawei/Arista/Junos: config-mode lines only (no 'configure terminal', no 'commit' - "
         "the tool adds them). "
+        "Huawei: indent sub-view lines by one space per level, as in 'display current-configuration' "
+        "(e.g. 'interface LoopBack1\\n description x\\ninterface LoopBack2') - the tool inserts the "
+        "'quit' lines the device needs between views. "
         "FortiGate: full section blocks INCLUDING 'config ...', 'next' and 'end' lines, e.g. "
         "'config system global\\nset lldp-reception enable\\nset lldp-transmission enable\\nend' "
         "(missing 'end' lines are appended automatically). "
@@ -536,6 +539,7 @@ def propose_change(body: ProposeIn) -> str:
     if body.mode not in ("config", "exec"):
         raise HTTPException(400, "mode must be 'config' or 'exec'")
     dropped: list[str] = []
+    added: dict[int, str] = {}
     if body.mode == "config":
         refused = plat.refused_lines(lines)      # change.refuse_in_config
         if refused:
@@ -555,6 +559,10 @@ def propose_change(body: ProposeIn) -> str:
                 f"{misplaced} is only allowed as the last line - in the middle of a change it leaves "
                 f"config mode with the change uncommitted. Remove it (the tool leaves config mode "
                 f"itself), or split the change into separate propose_change calls"))
+        # Huawei mmi-mode: a change that moves on from a sub-view without 'quit'
+        # gets it inserted (change.close_views). Before the snapshot, so the staged
+        # lines - and the preview - are exactly what will be sent.
+        lines, added = plat.close_views(lines)
         if plat.balance_end:
             # FortiOS applies a section only at 'end' - balance missing ends automatically.
             opens = sum(1 for ln in lines if ln.strip().lower().startswith("config "))
@@ -573,7 +581,12 @@ def propose_change(body: ProposeIn) -> str:
     elif plat.shell:
         preview = "Commands to run:\n" + "\n".join(f"  $ {ln}" for ln in lines)
     else:
-        preview = "Configuration lines to send:\n" + "\n".join(f"  + {ln}" for ln in lines)
+        preview = "Configuration lines to send:\n" + "\n".join(
+            f"  + {ln}" + (f"   (added: leaves {added[i]!r})" if i in added else "")
+            for i, ln in enumerate(lines))
+        if added:
+            preview += (f"\n({len(added)} '{plat.close_cmd}' line(s) added - this device rejects a line "
+                        f"that does not belong to the current view)")
         if dropped:
             preview += (f"\n(dropped from the end: {', '.join(repr(d) for d in dropped)} - "
                         f"the tool leaves config mode itself)")

@@ -553,14 +553,15 @@ def test_snapshot_platforms_still_save_one(data, monkeypatch):
 # ------------------------------------------- a line the device rejected ---
 
 class RejectPool(ChangePool):
-    """configure() fails like transport does when the device rejects line 3."""
+    """configure() fails like transport does when the device rejects 'interface Ethernet3/0/1'
+    (line 4: propose_change inserted a 'quit' before it)."""
     def __init__(self, state_):
         super().__init__()
         self.state = state_
 
     def configure(self, dev, lines, commit, **kw):
         from app.transport import ConfigRejected
-        raise ConfigRejected(dev.name, lines, 2, "Error[1]: Unrecognized command found at '^' position.",
+        raise ConfigRejected(dev.name, lines, lines.index("interface Ethernet3/0/1"), "Error[1]: Unrecognized command found at '^' position.",
                              "interface Ethernet3/0/1\nError[1]: Unrecognized command", self.state)
 
 
@@ -570,7 +571,7 @@ CHANGE = "interface Ethernet3/0/0\n ip address 1.1.1.1 24\ninterface Ethernet3/0
 @pytest.mark.parametrize("device, state_, says, status", [
     ("vrp8", "discarded", "NOT APPLIED on vrp8", "rejected"),
     ("vrp8", "unverified", "could not verify", "outcome unknown"),
-    ("vrp5", "partial", "PARTIALLY APPLIED on vrp5", "applied partially (line 3 rejected, not saved)"),
+    ("vrp5", "partial", "PARTIALLY APPLIED on vrp5", "applied partially (line 4 rejected, not saved)"),
 ])
 def test_rejected_line_is_never_reported_as_applied(data, monkeypatch, device, state_, says, status):
     monkeypatch.setattr(main, "pool", RejectPool(state_))
@@ -579,10 +580,26 @@ def test_rejected_line_is_never_reported_as_applied(data, monkeypatch, device, s
     name = r.text.split("Snapshot saved: ")[1].split("\n")[0]
     a = client.post("/confirm_change", params={"code": code}, headers=H)
     assert a.status_code == 422 and says in a.text, a.text
-    assert "line 3 of 4 ('interface Ethernet3/0/1')" in a.text and "Hint:" in a.text and "quit" in a.text
+    assert "line 4 of 5 ('interface Ethernet3/0/1')" in a.text and "Hint:" in a.text and "quit" in a.text
     assert "APPLIED on" not in a.text.replace("NOT APPLIED on", "").replace("PARTIALLY APPLIED on", "")
     last = json.loads(state.AUDIT_FILE.read_text().splitlines()[-1])
-    assert last["event"] == "confirm_rejected" and last["state"] == state_ and last["line"] == 3
+    assert last["event"] == "confirm_rejected" and last["state"] == state_ and last["line"] == 4
     assert main.changes.index(device)[name].status == status
     # the staged change is used up either way
     assert client.post("/confirm_change", params={"code": code}, headers=H).status_code == 404
+
+
+def test_propose_inserts_and_marks_the_missing_quit(data, monkeypatch):
+    monkeypatch.setattr(main, "pool", ChangePool())
+    r = client.post("/propose_change", json={"device": "vrp8", "config": CHANGE + "\nquit"}, headers=H)
+    assert r.status_code == 200, r.text
+    assert "  + quit   (added: leaves 'interface Ethernet3/0/0')\n  + interface Ethernet3/0/1" in r.text, r.text
+    assert "1 'quit' line(s) added" in r.text and "dropped from the end: 'quit'" in r.text
+    code = r.text.split("Change ID: ")[1][:6]
+    assert main.changes.peek(code).lines == ["interface Ethernet3/0/0", " ip address 1.1.1.1 24", "quit",
+                                             "interface Ethernet3/0/1", " ip address 1.1.1.2 24"]
+
+
+def test_propose_schema_tells_the_model_how_to_write_huawei_views():
+    desc = client.get("/openapi.json").json()["components"]["schemas"]["ProposeIn"]["properties"]["config"]["description"]
+    assert "Huawei: indent sub-view lines" in desc and "inserts the 'quit' lines" in desc, desc
