@@ -44,8 +44,9 @@ _KEYS = {
                "comment_prefixes", "prompts", "containerlab"},
     "session": {"enable", "prep"},
     "change": {"apply", "finish", "rollback_last", "balance_end", "refuse_in_config", "drop_trailing",
-               "last_line_only"},
+               "last_line_only", "config_errors"},
     "refuse_in_config": {"reason", "patterns"},
+    "config_errors": {"patterns", "discard", "dirty_prompt", "hint"},
     "containerlab": {"kinds"},
     "prompt": {"pattern", "proceed", "abort", "note"},
     "creds": {"username", "password"},
@@ -87,6 +88,12 @@ class Platform:
     prompts: tuple[Prompt, ...]         # own first, then common.yaml's
     kinds: dict[str, tuple[str, str] | None] = field(default_factory=dict)
     sources: tuple[str, ...] = ()
+    # change.config_errors: how the device says it rejected a config line, and how
+    # an uncommitted change is thrown away afterwards (commit platforms only).
+    error_rx: tuple[re.Pattern[str], ...] = ()
+    discard: tuple[str, ...] = ()
+    dirty_prompt: re.Pattern[str] | None = None
+    error_hint: str = ""
 
     @property
     def shell(self) -> bool:
@@ -110,6 +117,14 @@ class Platform:
         while end and any(rx.search(lines[end - 1].strip()) for rx in drop):
             end -= 1
         return lines[:end], lines[end:]
+
+    def config_error(self, output: str) -> str | None:
+        """The first line of `output` in which the device rejected a config line
+        (change.config_errors.patterns), or None."""
+        for ln in (output or "").splitlines():
+            if any(rx.search(ln) for rx in self.error_rx):
+                return ln.strip()
+        return None
 
     def misplaced_lines(self, lines: list[str]) -> list[str]:
         """Lines matching change.last_line_only that are NOT at the end (call it
@@ -279,6 +294,7 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
     if rollback and finish == "none":
         raise PlatformError(f"{file}: change.rollback_last undoes a commit, but change.finish is "
                             "'none' - this platform has no commits to roll back")
+    error_rx, discard, dirty, hint = _config_errors(change, apply, finish, file)
 
     prefixes = common_prefixes
     if "comment_prefixes" in raw:
@@ -291,7 +307,36 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
         enable=enable, prep=prep, apply=apply, finish=finish, rollback_last=rollback,
         balance_end=balance_end, refuse=refuse, refuse_reason=reason, drop_trailing=drop, last_line_only=last,
         comment_prefixes=prefixes, prompts=prompts, sources=sources,
+        error_rx=error_rx, discard=discard, dirty_prompt=dirty, error_hint=hint,
     )
+
+
+def _config_errors(change: dict, apply: str, finish: str, file: str):
+    """change.config_errors -> (patterns, discard commands, dirty prompt, hint)."""
+    if "config_errors" not in change:
+        return (), (), None, ""
+    where = f"{file}: change.config_errors"
+    if apply != "config_set":
+        raise PlatformError(f"{where} only applies to change.apply: config_set")
+    ce = _keys(change["config_errors"], "config_errors", where)
+    pats = ce.get("patterns")
+    if not isinstance(pats, list) or not pats:
+        raise PlatformError(f"{where}.patterns must be a non-empty list")
+    error_rx = _pattern_list(pats, f"{where}.patterns")
+    if finish != "commit" and ({"discard", "dirty_prompt"} & set(ce)):
+        raise PlatformError(f"{where}: discard and dirty_prompt throw away an UNCOMMITTED change, "
+                            f"so they need change.finish: commit - with '{finish}' the lines are "
+                            "active as soon as they are sent")
+    discard = _str_list(ce.get("discard") or [], f"{where}.discard")
+    dirty = None
+    if ce.get("dirty_prompt") is not None:
+        if not discard:
+            raise PlatformError(f"{where}.dirty_prompt checks that 'discard' worked - list the discard commands")
+        dirty = _compile(ce["dirty_prompt"], f"{where}.dirty_prompt")
+    hint = ce.get("hint", "")
+    if not isinstance(hint, str):
+        raise PlatformError(f"{where}.hint must be a string")
+    return error_rx, discard, dirty, " ".join(hint.split())
 
 
 def _kinds(raw: dict, file: str) -> dict[str, tuple[str, str] | None]:

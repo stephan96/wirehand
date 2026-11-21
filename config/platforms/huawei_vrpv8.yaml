@@ -35,6 +35,22 @@ change:
   # change uncommitted, VRP8 asks whether to commit, and the session hangs.
   last_line_only:
     - '^return$'
+  # How the device says it rejected a line ("Error: ...", "Error[1]: Unrecognized
+  # command found at '^' position."). Matched line by line; the command echo
+  # starts with the prompt, so a description containing "Error:" does not match.
+  config_errors:
+    patterns:
+      - '^\s*Error(\[\d+\])?:'
+    # Throws the uncommitted candidate away and returns to system-view; the prompt
+    # then shows '~' (nothing uncommitted) instead of '*'. Verified on NE40E V800R023.
+    discard:
+      - clear configuration candidate
+    dirty_prompt: '^\[\*'
+    hint: >-
+      Sessions run in mmi-mode, where a line that does not belong to the current
+      view is rejected instead of falling back to the parent view. Leave a
+      sub-view (interface, aaa, bgp, ...) with 'quit' before configuring another
+      one, e.g. 'interface X', '<lines>', 'quit', 'interface Y'.
   # Matched against every line of a change made in system-view. 'quit' and
   # 'return' only leave a view, so they are allowed.
   refuse_in_config:

@@ -102,7 +102,7 @@ class SnapshotInfo:
 
     @property
     def unapplied(self) -> bool:
-        return self.status in ("expired", "denied", "incomplete", "failed", "no audit entry")
+        return self.status in ("expired", "denied", "incomplete", "failed", "rejected", "no audit entry")
 
 
 def _code(value) -> str:
@@ -118,7 +118,11 @@ def snapshot_index(device: str, pending: dict[str, float] | None = None) -> dict
 
     The status is the strongest outcome of the change's code, because a wrong
     approval (confirm_denied) does not discard the staged change:
-      applied > outcome unknown > pending > incomplete / failed > denied > expired
+      applied > applied partially > outcome unknown > pending > incomplete / failed /
+      rejected > denied > expired
+    A rejected line (confirm_rejected) leaves nothing behind - except on a platform
+    without a candidate (state 'partial'), where the lines before it are active:
+    that counts as applied, so its snapshot is the rollback base.
     """
     pending = pending or {}
     staged: dict[str, dict] = {}            # snapshot name -> staging event
@@ -142,11 +146,18 @@ def snapshot_index(device: str, pending: dict[str, float] | None = None) -> dict
         seen = events.get(code or "", [])
         names = {r.get("event") for _, r in seen}
         applied = [(seq, r) for seq, r in seen if r.get("event") == "confirm_change"]
+        partial = [(seq, r) for seq, r in seen
+                   if r.get("event") == "confirm_rejected" and r.get("state") == "partial"]
         if applied:
             info.applied_seq, last = applied[-1]
             info.applied_ts = last.get("ts")
             info.status = "applied (rollback)" if mode == "rollback" else "applied"
-        elif names & {"confirm_unknown", "confirm_timeout"}:
+        elif partial:
+            info.applied_seq, last = partial[-1]
+            info.applied_ts = last.get("ts")
+            info.status = f"applied partially (line {last.get('line')} rejected, not saved)"
+        elif names & {"confirm_unknown", "confirm_timeout"} or any(
+                r.get("event") == "confirm_rejected" and r.get("state") == "unverified" for _, r in seen):
             info.status = "outcome unknown"
         elif code in pending:
             info.status = f"pending ({max(1, math.ceil(pending[code] / 60))} min left)"
@@ -154,6 +165,8 @@ def snapshot_index(device: str, pending: dict[str, float] | None = None) -> dict
             info.status = "incomplete"
         elif names & {"confirm_change_error", "auth_failed"}:
             info.status = "failed"          # nothing reached the device
+        elif "confirm_rejected" in names:
+            info.status = "rejected"        # stopped at a rejected line, nothing left behind
         elif "confirm_denied" in names:
             info.status = "denied"
         else:

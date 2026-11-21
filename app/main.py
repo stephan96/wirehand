@@ -38,7 +38,7 @@ from . import state
 from .state import ChangeStore, audit, read_audit
 from .platforms import pending_prompt
 from . import transport
-from .transport import (AuthError, Budget, DeadlineExceeded, DeviceBusy, OutcomeUnknown, Pool,
+from .transport import (AuthError, Budget, ConfigRejected, DeadlineExceeded, DeviceBusy, OutcomeUnknown, Pool,
                         check_devices)
 
 logging.basicConfig(level=os.environ.get("WIREHAND_LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -112,7 +112,7 @@ def _prune_daily(stop: threading.Event) -> None:
 
 # Also the start of the description: Open WebUI shows that on mouse-over in the
 # chat's tool selection, so users see which version they are talking to.
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 
 app = FastAPI(
     title="wirehand",
@@ -259,6 +259,33 @@ def _before(dev, pc, what: str = "this change") -> str:
     name = Path(pc.snapshot_path).stem
     return (f"The configuration from before {what} was saved as snapshot {name}: "
             f"get_snapshot(device='{dev.name}', name='{name}').")
+
+
+def _rejected_text(dev, pc, exc: ConfigRejected) -> str:
+    """confirm_change answer when the device rejected a line. Never 'APPLIED':
+    the change stopped at that line and was neither committed nor saved."""
+    n, total = exc.index + 1, len(exc.lines)
+    sent = exc.lines[:exc.index]
+    head = f"line {n} of {total} ({exc.line!r}) was rejected by the device: {exc.error}"
+    if exc.state == "discarded":
+        what = (f"NOT APPLIED on {dev.name}: {head}. Nothing was committed - the lines sent before it "
+                f"were discarded, the device is unchanged.")
+    elif exc.state == "unverified":
+        what = (f"NOT APPLIED on {dev.name}: {head}. Nothing was committed, but wirehand could not "
+                f"verify that the uncommitted lines were discarded (the session was closed). Check "
+                f"with run_read that the configuration is unchanged before proposing again.")
+    elif exc.state == "nothing":
+        what = f"NOT APPLIED on {dev.name}: {head}. It was the first line; nothing was sent after it."
+    else:
+        what = (f"PARTIALLY APPLIED on {dev.name}: {head}. The {len(sent)} line(s) before it ARE ACTIVE "
+                f"in the running configuration but were NOT saved; the lines after it were not sent. "
+                f"Tell the user, and propose a corrective change (or the missing lines) - "
+                f"{_before(dev, pc)}")
+    parts = [what, f"The change ID {pc.code} is used up; fix the change and stage it again with "
+                   f"propose_change."]
+    if dev.platform.error_hint:
+        parts.append(f"Hint: {dev.platform.error_hint}")
+    return " ".join(parts) + f"\n\n{truncate(exc.output, 4000)}"
 
 
 def _next_step(dev, code: str) -> str:
@@ -637,6 +664,10 @@ def confirm_change(
         audit("device_busy", dev.name, tool="confirm_change", code=pc.code)
         raise HTTPException(409, (
             f"{exc} NOT APPLIED. The change is still staged as {pc.code} until it expires. {again}"))
+    except ConfigRejected as exc:
+        audit("confirm_rejected", dev.name, code=pc.code, line=exc.index + 1, rejected=exc.line,
+              error=exc.error, state=exc.state)
+        raise HTTPException(422, _rejected_text(dev, pc, exc))
     except OutcomeUnknown as exc:
         # Something went wrong after the change reached the device: it may or may
         # not have been applied. Saying "APPLIED" or "failed" would both be guesses.

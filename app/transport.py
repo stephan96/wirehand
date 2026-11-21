@@ -35,6 +35,24 @@ class OutcomeUnknown(RuntimeError):
         super().__init__(f"{what} on {device} failed after it was sent: {type(exc).__name__}: {exc}")
 
 
+class ConfigRejected(RuntimeError):
+    """The device rejected a line of a config change (change.config_errors).
+    The change was stopped at that line and neither committed nor saved.
+
+    state says what is on the device now:
+      discarded   commit platform, the uncommitted lines were thrown away (verified)
+      unverified  commit platform, nothing was committed, but throwing the lines away
+                  could not be verified - the session was dropped
+      nothing     save platform, the very first line was rejected
+      partial     save platform, the lines before `index` are ACTIVE (not saved)
+    """
+
+    def __init__(self, device: str, lines: list[str], index: int, error: str, output: str, state: str):
+        self.device, self.lines, self.index = device, lines, index
+        self.line, self.error, self.output, self.state = lines[index], error, output, state
+        super().__init__(f"{device} rejected line {index + 1} of {len(lines)} ({self.line!r}): {error}")
+
+
 class DeviceBusy(RuntimeError):
     """Another call held the device's session for longer than WIREHAND_LOCK_WAIT.
     Nothing was sent to the device."""
@@ -354,7 +372,10 @@ class Pool:
                         chunks.append(f"$ {ln}\n" + (conn.send_command(ln, read_timeout=_step(budget, t)) or ""))
                     out = "\n".join(chunks)
                 else:
-                    out = conn.send_config_set(lines, read_timeout=_step(budget, t), exit_config_mode=False)
+                    if plat.error_rx:
+                        out = self._config_checked(conn, s, device, lines, budget, t)
+                    else:
+                        out = conn.send_config_set(lines, read_timeout=_step(budget, t), exit_config_mode=False)
                     if plat.finish == "commit":
                         out += "\n" + (self._commit(conn, _step(budget, t)) if commit else "")
                         conn.exit_config_mode()
@@ -365,7 +386,7 @@ class Pool:
                             out += "\n" + conn.save_config()
                 # A config session can end on a question too ('Save? [Y/N]').
                 out = self._settle(conn, device, out, t, "yes", budget)
-            except AuthError:
+            except (AuthError, ConfigRejected):
                 raise
             except Exception as exc:
                 # Part of the change may be on the device, maybe uncommitted in
@@ -377,6 +398,49 @@ class Pool:
             finally:
                 s.last_used = time.time()
             return out
+
+    def _config_checked(self, conn, s: _Session, device: Device, lines: list[str],
+                        budget: Budget | None, t: float) -> str:
+        """send_config_set one line at a time and stop at the first line the
+        device rejects (change.config_errors.patterns). Netmiko's own
+        error_pattern raises without the output, and a batch would carry on: in
+        Huawei's mmi-mode the lines after a rejected 'interface Y' land in the
+        view of interface X.
+
+        Raises ConfigRejected after cleaning up: on a commit platform the
+        candidate is discarded (change.config_errors.discard), on a save platform
+        nothing is saved. Either way the session is dropped - it may sit in a
+        sub-view."""
+        plat = device.platform
+        out = ""
+        for i, ln in enumerate(lines):
+            part = conn.send_config_set([ln], read_timeout=_step(budget, t),
+                                        enter_config_mode=(i == 0), exit_config_mode=False) or ""
+            out += part
+            err = plat.config_error(part)
+            if err is None:
+                continue
+            log.warning("%s: line %d of %d rejected (%r): %s", device.name, i + 1, len(lines), ln, err)
+            if plat.finish == "commit":
+                state = "unverified"
+                try:
+                    for cmd in plat.discard:
+                        out += "\n" + (conn.send_config_set([cmd], read_timeout=_step(budget, t),
+                                                             enter_config_mode=False, exit_config_mode=False) or "")
+                    if plat.discard:
+                        prompt = conn.find_prompt()
+                        if plat.dirty_prompt is None or not plat.dirty_prompt.search(prompt):
+                            state = "discarded"
+                        else:
+                            log.warning("%s: still uncommitted after discard (prompt %r)", device.name, prompt)
+                except Exception as exc:
+                    log.warning("%s: discarding the rejected change failed: %s: %s",
+                                device.name, type(exc).__name__, exc)
+            else:
+                state = "partial" if i else "nothing"
+            s.drop()
+            raise ConfigRejected(device.name, lines, i, err, out, state)
+        return out
 
     @staticmethod
     def _commit(conn, timeout: float) -> str:

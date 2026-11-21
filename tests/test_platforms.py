@@ -235,3 +235,106 @@ def test_configure_follows_the_platform_file(monkeypatch, device_type, calls):
     pool.configure(dev, ["line one"], commit=dev.platform.commits)
     session_prep = len(dev.platform.prep)          # mmi-mode on Huawei goes through send_command
     assert conn.calls[session_prep:] == calls, conn.calls
+
+
+# --- change.config_errors: a rejected line stops the change --------------------
+REJECT = "interface Ethernet3/0/1\n                               ^\nError[1]: Unrecognized command found at '^' position.\n[*vrp3-Ethernet3/0/0]"
+
+
+@pytest.mark.parametrize("dt", ["huawei", "huawei_vrpv8"])
+def test_huawei_recognises_rejected_lines(dt):
+    p = platforms.get(dt)
+    assert p.config_error(REJECT) == "Error[1]: Unrecognized command found at '^' position."
+    assert p.config_error("Error: Wrong parameter found at '^' position.")
+    assert p.config_error("[*vrp3-LoopBack1]description Error: not a device error") is None
+    assert p.config_error("Warning: The slave board is not in position.") is None
+    assert "quit" in p.error_hint
+
+
+def test_only_vrp8_discards():
+    assert platforms.get("huawei_vrpv8").discard == ("clear configuration candidate",)
+    assert platforms.get("huawei").discard == () and platforms.get("huawei").dirty_prompt is None
+
+
+CE = "  config_errors: {patterns: ['^Error:'], discard: [abort], dirty_prompt: '^\\[\\*'}\n"
+
+
+def test_config_errors_load(tmp_path):
+    xr = load_platforms(_tree(tmp_path, cisco_xr=CFG.replace("containerlab:", CE + "containerlab:"))).platforms["cisco_xr"]
+    assert xr.discard == ("abort",) and xr.dirty_prompt.search("[*r1]") and xr.config_error("Error: x")
+
+
+@pytest.mark.parametrize("files, message", [
+    ({"cisco_xr": CFG.replace("finish: commit", "finish: save").replace("  rollback_last: [rollback configuration last 1]\n", "  rollback_last: null\n").replace("containerlab:", CE + "containerlab:")},
+     "need change.finish: commit"),
+    ({"cisco_xr": CFG.replace("containerlab:", "  config_errors: {patterns: []}\ncontainerlab:")}, "patterns must be a non-empty list"),
+    ({"cisco_xr": CFG.replace("containerlab:", "  config_errors: {patterns: ['^E'], dirty_prompt: 'x'}\ncontainerlab:")},
+     "list the discard commands"),
+    ({"cisco_xr": CFG.replace("containerlab:", "  config_errors: {patterns: ['^E'], colour: red}\ncontainerlab:")}, "unknown key(s) colour"),
+    ({"linux": SHELL.replace("rollback_last: null}", "rollback_last: null, config_errors: {patterns: ['^E']}}")},
+     "only applies to change.apply: config_set"),
+])
+def test_config_errors_are_validated(tmp_path, files, message):
+    with pytest.raises(PlatformError) as exc:
+        load_platforms(_tree(tmp_path, **files))
+    assert message in str(exc.value), str(exc.value)
+
+
+class RejectingConn:
+    """Answers every config line with a prompt, the `bad` one with Huawei's error."""
+    def __init__(self, bad: str, prompt_after_discard: str = "[~vrp3]"):
+        self.bad, self.after = bad, prompt_after_discard
+        self.calls, self.sent = [], []
+    def is_alive(self): return True
+    def find_prompt(self): return self.after
+    def send_command(self, cmd, **kw): return ""
+    def send_config_set(self, lines, **kw):
+        self.calls.append("config_set"); self.sent += lines
+        return REJECT if lines == [self.bad] else f"{lines[0]}\n[*vrp3-x]"
+    def commit(self, **kw): self.calls.append("commit"); return "committed"
+    def save_config(self): self.calls.append("save_config"); return "saved"
+    def exit_config_mode(self): self.calls.append("exit_config_mode")
+    def disconnect(self): pass
+
+
+LINES = ["interface Ethernet3/0/0", " ip address 1.1.1.1 255.255.255.0",
+         "interface Ethernet3/0/1", " ip address 1.1.1.2 255.255.255.0"]
+
+
+def _configure(monkeypatch, device_type, conn, lines=LINES):
+    transport = pytest.importorskip("app.transport")
+    from app.inventory import Device
+    monkeypatch.setattr(transport, "ConnectHandler", lambda **kw: conn)
+    dev = Device(name="vrp3", host="h", device_type=device_type, username="u", password="p")
+    with pytest.raises(transport.ConfigRejected) as exc:
+        transport.Pool().configure(dev, lines, commit=dev.platform.commits)
+    return exc.value
+
+
+@pytest.mark.parametrize("after, state", [("[~vrp3]", "discarded"), ("[*vrp3]", "unverified")])
+def test_vrp8_rejected_line_is_not_committed_but_discarded(monkeypatch, after, state):
+    conn = RejectingConn("interface Ethernet3/0/1", after)
+    exc = _configure(monkeypatch, "huawei_vrpv8", conn)
+    assert exc.state == state and exc.index == 2 and exc.line == "interface Ethernet3/0/1"
+    # the line after the rejected one must NOT reach the device (it would land on Ethernet3/0/0)
+    assert conn.sent == LINES[:3] + ["clear configuration candidate"], conn.sent
+    assert "commit" not in conn.calls and "Error[1]" in exc.output
+
+
+@pytest.mark.parametrize("bad, state, index", [("interface Ethernet3/0/1", "partial", 2),
+                                               ("interface Ethernet3/0/0", "nothing", 0)])
+def test_vrp5_rejected_line_is_not_saved(monkeypatch, bad, state, index):
+    conn = RejectingConn(bad)
+    exc = _configure(monkeypatch, "huawei", conn)
+    assert exc.state == state and exc.index == index
+    assert conn.sent == LINES[:index + 1] and "save_config" not in conn.calls
+
+
+def test_accepted_lines_go_one_at_a_time_and_commit(monkeypatch):
+    transport = pytest.importorskip("app.transport")
+    from app.inventory import Device
+    conn = RejectingConn("never sent")
+    monkeypatch.setattr(transport, "ConnectHandler", lambda **kw: conn)
+    dev = Device(name="vrp3", host="h", device_type="huawei_vrpv8", username="u", password="p")
+    transport.Pool().configure(dev, LINES, commit=True)
+    assert conn.sent == LINES and conn.calls == ["config_set"] * 4 + ["commit", "exit_config_mode"]
