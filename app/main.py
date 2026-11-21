@@ -38,7 +38,7 @@ from . import state
 from .state import ChangeStore, audit, read_audit
 from .platforms import pending_prompt
 from . import transport
-from .transport import (AuthError, Budget, DeadlineExceeded, DeviceBusy, OutcomeUnknown, Pool,
+from .transport import (AuthError, Budget, ConfigRejected, DeadlineExceeded, DeviceBusy, OutcomeUnknown, Pool,
                         check_devices)
 
 logging.basicConfig(level=os.environ.get("WIREHAND_LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -112,7 +112,7 @@ def _prune_daily(stop: threading.Event) -> None:
 
 # Also the start of the description: Open WebUI shows that on mouse-over in the
 # chat's tool selection, so users see which version they are talking to.
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 
 app = FastAPI(
     title="wirehand",
@@ -259,6 +259,33 @@ def _before(dev, pc, what: str = "this change") -> str:
     name = Path(pc.snapshot_path).stem
     return (f"The configuration from before {what} was saved as snapshot {name}: "
             f"get_snapshot(device='{dev.name}', name='{name}').")
+
+
+def _rejected_text(dev, pc, exc: ConfigRejected) -> str:
+    """confirm_change answer when the device rejected a line. Never 'APPLIED':
+    the change stopped at that line and was neither committed nor saved."""
+    n, total = exc.index + 1, len(exc.lines)
+    sent = exc.lines[:exc.index]
+    head = f"line {n} of {total} ({exc.line!r}) was rejected by the device: {exc.error}"
+    if exc.state == "discarded":
+        what = (f"NOT APPLIED on {dev.name}: {head}. Nothing was committed - the lines sent before it "
+                f"were discarded, the device is unchanged.")
+    elif exc.state == "unverified":
+        what = (f"NOT APPLIED on {dev.name}: {head}. Nothing was committed, but wirehand could not "
+                f"verify that the uncommitted lines were discarded (the session was closed). Check "
+                f"with run_read that the configuration is unchanged before proposing again.")
+    elif exc.state == "nothing":
+        what = f"NOT APPLIED on {dev.name}: {head}. It was the first line; nothing was sent after it."
+    else:
+        what = (f"PARTIALLY APPLIED on {dev.name}: {head}. The {len(sent)} line(s) before it ARE ACTIVE "
+                f"in the running configuration but were NOT saved; the lines after it were not sent. "
+                f"Tell the user, and propose a corrective change (or the missing lines) - "
+                f"{_before(dev, pc)}")
+    parts = [what, f"The change ID {pc.code} is used up; fix the change and stage it again with "
+                   f"propose_change."]
+    if dev.platform.error_hint:
+        parts.append(f"Hint: {dev.platform.error_hint}")
+    return " ".join(parts) + f"\n\n{truncate(exc.output, 4000)}"
 
 
 def _next_step(dev, code: str) -> str:
@@ -474,6 +501,9 @@ class ProposeIn(BaseModel):
         "Configuration lines, ONE PER LINE, exactly as typed on the device. "
         "Cisco/Huawei/Arista/Junos: config-mode lines only (no 'configure terminal', no 'commit' - "
         "the tool adds them). "
+        "Huawei: indent sub-view lines by one space per level, as in 'display current-configuration' "
+        "(e.g. 'interface LoopBack1\\n description x\\ninterface LoopBack2') - the tool inserts the "
+        "'quit' lines the device needs between views. "
         "FortiGate: full section blocks INCLUDING 'config ...', 'next' and 'end' lines, e.g. "
         "'config system global\\nset lldp-reception enable\\nset lldp-transmission enable\\nend' "
         "(missing 'end' lines are appended automatically). "
@@ -509,6 +539,7 @@ def propose_change(body: ProposeIn) -> str:
     if body.mode not in ("config", "exec"):
         raise HTTPException(400, "mode must be 'config' or 'exec'")
     dropped: list[str] = []
+    added: dict[int, str] = {}
     if body.mode == "config":
         refused = plat.refused_lines(lines)      # change.refuse_in_config
         if refused:
@@ -528,6 +559,10 @@ def propose_change(body: ProposeIn) -> str:
                 f"{misplaced} is only allowed as the last line - in the middle of a change it leaves "
                 f"config mode with the change uncommitted. Remove it (the tool leaves config mode "
                 f"itself), or split the change into separate propose_change calls"))
+        # Huawei mmi-mode: a change that moves on from a sub-view without 'quit'
+        # gets it inserted (change.close_views). Before the snapshot, so the staged
+        # lines - and the preview - are exactly what will be sent.
+        lines, added = plat.close_views(lines)
         if plat.balance_end:
             # FortiOS applies a section only at 'end' - balance missing ends automatically.
             opens = sum(1 for ln in lines if ln.strip().lower().startswith("config "))
@@ -546,7 +581,12 @@ def propose_change(body: ProposeIn) -> str:
     elif plat.shell:
         preview = "Commands to run:\n" + "\n".join(f"  $ {ln}" for ln in lines)
     else:
-        preview = "Configuration lines to send:\n" + "\n".join(f"  + {ln}" for ln in lines)
+        preview = "Configuration lines to send:\n" + "\n".join(
+            f"  + {ln}" + (f"   (added: leaves {added[i]!r})" if i in added else "")
+            for i, ln in enumerate(lines))
+        if added:
+            preview += (f"\n({len(added)} '{plat.close_cmd}' line(s) added - this device rejects a line "
+                        f"that does not belong to the current view)")
         if dropped:
             preview += (f"\n(dropped from the end: {', '.join(repr(d) for d in dropped)} - "
                         f"the tool leaves config mode itself)")
@@ -637,6 +677,10 @@ def confirm_change(
         audit("device_busy", dev.name, tool="confirm_change", code=pc.code)
         raise HTTPException(409, (
             f"{exc} NOT APPLIED. The change is still staged as {pc.code} until it expires. {again}"))
+    except ConfigRejected as exc:
+        audit("confirm_rejected", dev.name, code=pc.code, line=exc.index + 1, rejected=exc.line,
+              error=exc.error, state=exc.state)
+        raise HTTPException(422, _rejected_text(dev, pc, exc))
     except OutcomeUnknown as exc:
         # Something went wrong after the change reached the device: it may or may
         # not have been applied. Saying "APPLIED" or "failed" would both be guesses.

@@ -44,8 +44,10 @@ _KEYS = {
                "comment_prefixes", "prompts", "containerlab"},
     "session": {"enable", "prep"},
     "change": {"apply", "finish", "rollback_last", "balance_end", "refuse_in_config", "drop_trailing",
-               "last_line_only"},
+               "last_line_only", "config_errors", "close_views"},
     "refuse_in_config": {"reason", "patterns"},
+    "config_errors": {"patterns", "discard", "dirty_prompt", "hint"},
+    "close_views": {"command", "openers"},
     "containerlab": {"kinds"},
     "prompt": {"pattern", "proceed", "abort", "note"},
     "creds": {"username", "password"},
@@ -87,6 +89,16 @@ class Platform:
     prompts: tuple[Prompt, ...]         # own first, then common.yaml's
     kinds: dict[str, tuple[str, str] | None] = field(default_factory=dict)
     sources: tuple[str, ...] = ()
+    # change.config_errors: how the device says it rejected a config line, and how
+    # an uncommitted change is thrown away afterwards (commit platforms only).
+    error_rx: tuple[re.Pattern[str], ...] = ()
+    discard: tuple[str, ...] = ()
+    dirty_prompt: re.Pattern[str] | None = None
+    error_hint: str = ""
+    # change.close_views: the command that leaves a sub-view, and the top-level
+    # commands that open one (used when a change has no indentation).
+    close_cmd: str = ""
+    openers: tuple[re.Pattern[str], ...] = ()
 
     @property
     def shell(self) -> bool:
@@ -110,6 +122,64 @@ class Platform:
         while end and any(rx.search(lines[end - 1].strip()) for rx in drop):
             end -= 1
         return lines[:end], lines[end:]
+
+    def close_views(self, lines: list[str]) -> tuple[list[str], dict[int, str]]:
+        """Insert change.close_views.command where a change moves on from a
+        sub-view without leaving it - in Huawei's mmi-mode the next line would be
+        rejected there instead of falling back to the parent view.
+
+        Returns (lines, added): `added` maps the index of every inserted line to
+        the view it leaves. Lines are only ever ADDED, never removed or changed.
+
+        With indentation (the layout of 'display current-configuration'), a line
+        opens a view when the next line is indented deeper, and every step back
+        out closes one view. Without any, a line matching `openers` closes the
+        view the last opener opened. A close command the change already contains
+        closes the innermost view and is kept."""
+        if not self.close_cmd:
+            return list(lines), {}
+        cmd = self.close_cmd.lower()
+        is_close = [ln.strip().lower() == cmd for ln in lines]
+        depth = [len(ln) - len(ln.lstrip()) for ln in lines]
+        body = [d for d, c in zip(depth, is_close) if not c]
+        indented = bool(body) and max(body) > min(body)
+        out: list[str] = []
+        added: dict[int, str] = {}
+        stack: list[tuple[int, str]] = []          # open views: (indent of the opener, opener)
+
+        def close(view: str):
+            added[len(out)] = view
+            out.append(self.close_cmd)
+
+        for i, ln in enumerate(lines):
+            if is_close[i]:
+                if stack:
+                    stack.pop()
+                out.append(ln)
+                continue
+            text = ln.strip()
+            if indented:
+                while stack and stack[-1][0] >= depth[i]:
+                    close(stack.pop()[1])
+                out.append(ln)
+                nxt = next((j for j in range(i + 1, len(lines)) if not is_close[j]), None)
+                if nxt is not None and not is_close[i + 1] and depth[nxt] > depth[i]:
+                    stack.append((depth[i], text))
+            else:
+                if any(rx.search(text) for rx in self.openers):
+                    while stack:
+                        close(stack.pop()[1])
+                    stack.append((0, text))
+                out.append(ln)
+        return out, added
+
+    def config_error(self, output: str) -> str | None:
+        """The first line of `output` in which the device rejected a config line
+        (change.config_errors.patterns), or None."""
+        for ln in (output or "").splitlines():
+            if any(rx.search(ln) for rx in self.error_rx):
+                return ln.strip()
+        return None
 
     def misplaced_lines(self, lines: list[str]) -> list[str]:
         """Lines matching change.last_line_only that are NOT at the end (call it
@@ -279,6 +349,22 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
     if rollback and finish == "none":
         raise PlatformError(f"{file}: change.rollback_last undoes a commit, but change.finish is "
                             "'none' - this platform has no commits to roll back")
+    error_rx, discard, dirty, hint = _config_errors(change, apply, finish, file)
+    close_cmd, openers = "", ()
+    if "close_views" in change:
+        where = f"{file}: change.close_views"
+        if apply != "config_set":
+            raise PlatformError(f"{where} only applies to change.apply: config_set")
+        cv = _keys(change["close_views"], "close_views", where)
+        close_cmd = cv.get("command")
+        if not isinstance(close_cmd, str) or not close_cmd.strip() or " " in close_cmd.strip():
+            raise PlatformError(f"{where}.command must be one word, e.g. quit")
+        close_cmd = close_cmd.strip()
+        if not any(rx.search(close_cmd) for rx in drop + last):
+            raise PlatformError(f"{where}.command '{close_cmd}' must also match change.drop_trailing "
+                                "or change.last_line_only - a close command the model puts at the "
+                                "end has to be dropped, the tool leaves config mode itself")
+        openers = _pattern_list(cv.get("openers") or [], f"{where}.openers")
 
     prefixes = common_prefixes
     if "comment_prefixes" in raw:
@@ -291,7 +377,37 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
         enable=enable, prep=prep, apply=apply, finish=finish, rollback_last=rollback,
         balance_end=balance_end, refuse=refuse, refuse_reason=reason, drop_trailing=drop, last_line_only=last,
         comment_prefixes=prefixes, prompts=prompts, sources=sources,
+        error_rx=error_rx, discard=discard, dirty_prompt=dirty, error_hint=hint,
+        close_cmd=close_cmd, openers=openers,
     )
+
+
+def _config_errors(change: dict, apply: str, finish: str, file: str):
+    """change.config_errors -> (patterns, discard commands, dirty prompt, hint)."""
+    if "config_errors" not in change:
+        return (), (), None, ""
+    where = f"{file}: change.config_errors"
+    if apply != "config_set":
+        raise PlatformError(f"{where} only applies to change.apply: config_set")
+    ce = _keys(change["config_errors"], "config_errors", where)
+    pats = ce.get("patterns")
+    if not isinstance(pats, list) or not pats:
+        raise PlatformError(f"{where}.patterns must be a non-empty list")
+    error_rx = _pattern_list(pats, f"{where}.patterns")
+    if finish != "commit" and ({"discard", "dirty_prompt"} & set(ce)):
+        raise PlatformError(f"{where}: discard and dirty_prompt throw away an UNCOMMITTED change, "
+                            f"so they need change.finish: commit - with '{finish}' the lines are "
+                            "active as soon as they are sent")
+    discard = _str_list(ce.get("discard") or [], f"{where}.discard")
+    dirty = None
+    if ce.get("dirty_prompt") is not None:
+        if not discard:
+            raise PlatformError(f"{where}.dirty_prompt checks that 'discard' worked - list the discard commands")
+        dirty = _compile(ce["dirty_prompt"], f"{where}.dirty_prompt")
+    hint = ce.get("hint", "")
+    if not isinstance(hint, str):
+        raise PlatformError(f"{where}.hint must be a string")
+    return error_rx, discard, dirty, " ".join(hint.split())
 
 
 def _kinds(raw: dict, file: str) -> dict[str, tuple[str, str] | None]:

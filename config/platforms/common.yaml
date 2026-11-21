@@ -48,6 +48,23 @@
 #     last_line_only: ['<regex>', ...]       dropped at the end like drop_trailing, but
 #                                            refused anywhere else ('end' in the middle
 #                                            leaves config mode uncommitted)
+#     config_errors:                         optional, apply: config_set only
+#       patterns: ['<regex>', ...]           an output line matching one means the device
+#                                            rejected the line just sent: the lines go one
+#                                            at a time, the change stops there and is
+#                                            neither committed nor saved
+#       discard: [<command>, ...]            finish: commit only - throws the uncommitted
+#                                            change away after a rejected line
+#       dirty_prompt: '<regex>'              prompt that still shows uncommitted changes
+#                                            after 'discard' (then it did not work)
+#       hint: <text>                         shown to the model with the error
+#     close_views:                           optional, apply: config_set only
+#       command: <word>                      leaves a sub-view ('quit'); must also match
+#                                            drop_trailing or last_line_only
+#       openers: ['<regex>', ...]            top-level commands that open a sub-view, for
+#                                            changes without indentation. propose_change
+#                                            inserts 'command' where a change moves on
+#                                            without leaving a view (see README)
 #   comment_prefixes: ['#', ...]             optional, replaces the value below
 #   prompts: [...]                           optional, checked before the ones below
 #   containerlab:

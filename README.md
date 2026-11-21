@@ -2,7 +2,7 @@
 
 *LLM-driven network operations, with human approval for every change.*
 
-**Version:** 0.6.4 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.5 · **License:** [Apache-2.0](LICENSE)
 
 ## Contents
 
@@ -357,6 +357,26 @@ automatic snapshot cleanup (see "Audit log & snapshots"). Behaviour changes:
 - `confirm_change` answers name the pre-change snapshot by name, with the `get_snapshot`
   call to read it, instead of a file path.
 
+**Upgrading to 0.6.5:** on Huawei VRP8 and VRP5 a config line the device rejects
+(`Error: ...`) now stops the change. Before, wirehand sent the remaining lines anyway,
+committed/saved and reported `APPLIED` - in mmi-mode the lines after a rejected
+`interface Y` then landed on the previous interface (issue #47). What changes:
+
+- `confirm_change` answers HTTP 422 `NOT APPLIED` (VRP8: nothing committed, the
+  candidate is discarded) or `PARTIALLY APPLIED` (VRP5: the lines before the rejected
+  one are active but not saved) and logs `confirm_rejected`.
+- Config lines go to these devices one at a time. This costs no time: Netmiko already
+  waits for each line's echo and prompt in a batch (measured on NE40E: 0.025 s per line
+  either way; the commit takes 7-14 s).
+- `propose_change` inserts the `quit` lines mmi-mode needs between sub-views and marks
+  them in the preview (see "Missing quit lines").
+- The `propose_change` tool description asks for Huawei changes indented like
+  `display current-configuration` - toggle the tool server in Open WebUI so the model
+  sees it.
+- New keys `change.config_errors` and `change.close_views` in `config/platforms/`. If you keep your own copy of
+  `config/platforms/`, take the new `huawei.yaml` and `huawei_vrpv8.yaml` - without the
+  keys the old behaviour stays.
+
 **Open WebUI caches the tool description: after an update, toggle the tool-server entry
 off/on (or re-add it) so the model sees the new tool descriptions.**
 
@@ -618,6 +638,8 @@ rejected when the inventory loads, and every file needs its counterpart in
 | `change.balance_end` | append missing `end` lines to open `config` blocks (FortiOS) |
 | `change.drop_trailing` | trailing lines dropped from a config change (`end`, `return`, `exit`) - the tool leaves config mode itself, and the preview names what was dropped |
 | `change.last_line_only` | lines that are dropped at the end like `drop_trailing`, but refused anywhere else (`end`, `return`: in the middle they leave config mode with the change uncommitted) |
+| `change.config_errors` | how the device reports a rejected config line (`patterns`), and on commit platforms how the uncommitted change is thrown away (`discard`, verified with `dirty_prompt`); `hint` is shown to the model. See "Rejected config lines" |
+| `change.close_views` | the command that leaves a sub-view (`command: quit`) and the top-level commands that open one (`openers`); `propose_change` inserts the command where a change moves on without leaving a view. See "Missing quit lines" |
 | `change.refuse_in_config` | lines a config change must not contain (they leave config mode, commit or reboot), with the reason shown to the model |
 | `prompts` | device questions and the answers to them; shared ones in `common.yaml` |
 | `comment_prefixes` | lines of a proposed change that are dropped as comments (`#`, `!`) |
@@ -940,6 +962,64 @@ IOS-XR needs neither: `rollback configuration last 1` runs there without asking.
 wirehand a new question, add the pattern and its two answers to `prompts` - in
 `common.yaml`, or in one platform's file if only that platform asks it - and restart.
 
+#### Rejected config lines
+
+In mmi-mode, VRP does not fall back to the parent view: a line that does not belong to
+the current view is rejected, and the session stays where it was.
+
+```
+[*vrp3-Ethernet3/0/0]interface Ethernet3/0/1
+Error[1]: Unrecognized command found at '^' position.
+[*vrp3-Ethernet3/0/0]ip address 1.1.1.2 255.255.255.0     <- lands on Ethernet3/0/0
+```
+
+On platforms with `change.config_errors` (both Huawei files), wirehand therefore sends
+the lines **one at a time** and stops at the first output line that matches
+`config_errors.patterns`. It never commits or saves such a change:
+
+| Platform | What happens | `confirm_change` answers |
+|---|---|---|
+| huawei_vrpv8 | `clear configuration candidate`, then the prompt must show `[~...]` (nothing uncommitted) | 422 `NOT APPLIED` - device unchanged |
+| huawei_vrpv8, discard not verifiable | session dropped | 422 `NOT APPLIED ... could not verify` - check with `run_read` |
+| huawei (VRP5, no candidate) | not saved | 422 `PARTIALLY APPLIED` - the lines before it are active, a corrective change is needed |
+
+The session is dropped in every case, the change ID is used up, and the audit log gets
+`confirm_rejected` with `line`, `rejected`, `error` and `state`. The answer includes
+`config_errors.hint`, which tells the model to leave a sub-view with `quit`. A VRP5
+partial change counts as applied in `list_snapshots`, so its snapshot is the rollback base.
+
+#### Missing quit lines
+
+The same mmi-mode behaviour also catches changes that are written the way they look in
+`display current-configuration`, without `quit`. Small models do this all the time. On
+platforms with `change.close_views` (both Huawei files), `propose_change` therefore
+inserts the missing `quit` lines **before** staging, so the preview shows exactly what
+will be sent:
+
+```
+Configuration lines to send:
+  + aaa
+  +  authentication-scheme default_admin
+  +   authentication-mode local hwtacacs
+  + quit   (added: leaves 'authentication-scheme default_admin')
+  +  authorization-scheme default_admin
+  +   authorization-mode local hwtacacs
+  + quit   (added: leaves 'authorization-scheme default_admin')
+  + quit   (added: leaves 'aaa')
+  + interface LoopBack1
+(3 'quit' line(s) added - this device rejects a line that does not belong to the current view)
+```
+
+- **With indentation:** a line opens a view when the next line is indented deeper, and
+  every step back out closes one view. This also covers lines that open no view
+  themselves (`ip route-static ...` after an interface block).
+- **Without indentation:** each line matching `close_views.openers` (`interface ...`,
+  `aaa`, `bgp ...`, `vlan <id>`, ...) closes the view the previous opener opened. Nested
+  views cannot be recognised in a flat change. If one is missed, the device rejects the
+  next line, and "Rejected config lines" stops the change.
+- A `quit` that is already in the change closes the innermost view and is kept. Lines
+  are only ever added, never removed or changed. A trailing `quit` is still dropped.
+
 ### Approving changes
 
 Wirehand refuses to let the model approve its own proposal, because that is the one thing
@@ -1124,10 +1204,12 @@ Model: get_snapshot(device='xrd-test-xrd1', name='20261015-201502', filter='rout
 | STATUS | Meaning |
 |---|---|
 | `applied` / `applied (rollback)` | `confirm_change` applied it (a wrong approval code before does not matter) |
-| `outcome unknown` | `confirm_change` ran into a timeout or a broken connection after sending |
+| `applied partially (line N rejected, not saved)` | VRP5: the device rejected line N, the lines before it are active (see "Rejected config lines") |
+| `outcome unknown` | `confirm_change` ran into a timeout or a broken connection after sending, or a rejected VRP8 change whose discard could not be verified |
 | `pending (N min left)` | still staged, can still be confirmed |
 | `incomplete` | the device asked a question wirehand could not answer; nothing ran |
 | `failed` | `confirm_change` failed before anything reached the device (connection, credentials) |
+| `rejected` | the device rejected a line; nothing was committed and nothing is left behind |
 | `denied` | only refused approval codes, then the change ID expired |
 | `expired` | staged, never confirmed |
 | `no audit entry` | no audit entry names this file (e.g. the audit log was cleared) |
@@ -1142,7 +1224,7 @@ device printed it, including whatever secrets the running configuration contains
 
 | Setting (env) | Default | Removes |
 |---|---|---|
-| `WIREHAND_SNAPSHOT_UNAPPLIED_DAYS` | 7 | snapshots older than this whose change was never applied (`expired`, `denied`, `incomplete`, `failed`, `no audit entry`) |
+| `WIREHAND_SNAPSHOT_UNAPPLIED_DAYS` | 7 | snapshots older than this whose change was never applied (`expired`, `denied`, `incomplete`, `failed`, `rejected`, `no audit entry`) |
 | `WIREHAND_SNAPSHOT_MAX_AGE_DAYS` | 90 | any snapshot older than this |
 | `WIREHAND_SNAPSHOT_KEEP` | 20 | the oldest snapshots beyond this number |
 
@@ -1184,7 +1266,7 @@ docker cp wirehand:/app/data ./wirehand-data-backup
 ```
 
 Each audit entry holds timestamp, event (`run_read`, `propose_change`, `confirm_change`,
-`rollback_staged`, `rollback_snapshot`, `confirm_denied`, `confirm_incomplete`,
+`rollback_staged`, `rollback_snapshot`, `confirm_denied`, `confirm_incomplete`, `confirm_rejected`,
 `confirm_unknown`, `confirm_timeout`, `read_timeout`, `propose_timeout`, `device_busy`,
 `list_snapshots`, `get_snapshot`, `snapshot_pruned`, ...), device, the commands/lines
 involved and, for changes, the change ID and snapshot path - never credentials. The file

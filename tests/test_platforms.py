@@ -235,3 +235,197 @@ def test_configure_follows_the_platform_file(monkeypatch, device_type, calls):
     pool.configure(dev, ["line one"], commit=dev.platform.commits)
     session_prep = len(dev.platform.prep)          # mmi-mode on Huawei goes through send_command
     assert conn.calls[session_prep:] == calls, conn.calls
+
+
+# --- change.config_errors: a rejected line stops the change --------------------
+REJECT = "interface Ethernet3/0/1\n                               ^\nError[1]: Unrecognized command found at '^' position.\n[*vrp3-Ethernet3/0/0]"
+
+
+@pytest.mark.parametrize("dt", ["huawei", "huawei_vrpv8"])
+def test_huawei_recognises_rejected_lines(dt):
+    p = platforms.get(dt)
+    assert p.config_error(REJECT) == "Error[1]: Unrecognized command found at '^' position."
+    assert p.config_error("Error: Wrong parameter found at '^' position.")
+    assert p.config_error("[*vrp3-LoopBack1]description Error: not a device error") is None
+    assert p.config_error("Warning: The slave board is not in position.") is None
+    assert "quit" in p.error_hint
+
+
+def test_only_vrp8_discards():
+    assert platforms.get("huawei_vrpv8").discard == ("clear configuration candidate",)
+    assert platforms.get("huawei").discard == () and platforms.get("huawei").dirty_prompt is None
+
+
+CE = "  config_errors: {patterns: ['^Error:'], discard: [abort], dirty_prompt: '^\\[\\*'}\n"
+
+
+def test_config_errors_load(tmp_path):
+    xr = load_platforms(_tree(tmp_path, cisco_xr=CFG.replace("containerlab:", CE + "containerlab:"))).platforms["cisco_xr"]
+    assert xr.discard == ("abort",) and xr.dirty_prompt.search("[*r1]") and xr.config_error("Error: x")
+
+
+@pytest.mark.parametrize("files, message", [
+    ({"cisco_xr": CFG.replace("finish: commit", "finish: save").replace("  rollback_last: [rollback configuration last 1]\n", "  rollback_last: null\n").replace("containerlab:", CE + "containerlab:")},
+     "need change.finish: commit"),
+    ({"cisco_xr": CFG.replace("containerlab:", "  config_errors: {patterns: []}\ncontainerlab:")}, "patterns must be a non-empty list"),
+    ({"cisco_xr": CFG.replace("containerlab:", "  config_errors: {patterns: ['^E'], dirty_prompt: 'x'}\ncontainerlab:")},
+     "list the discard commands"),
+    ({"cisco_xr": CFG.replace("containerlab:", "  config_errors: {patterns: ['^E'], colour: red}\ncontainerlab:")}, "unknown key(s) colour"),
+    ({"linux": SHELL.replace("rollback_last: null}", "rollback_last: null, config_errors: {patterns: ['^E']}}")},
+     "only applies to change.apply: config_set"),
+])
+def test_config_errors_are_validated(tmp_path, files, message):
+    with pytest.raises(PlatformError) as exc:
+        load_platforms(_tree(tmp_path, **files))
+    assert message in str(exc.value), str(exc.value)
+
+
+class RejectingConn:
+    """Answers every config line with a prompt, the `bad` one with Huawei's error."""
+    def __init__(self, bad: str, prompt_after_discard: str = "[~vrp3]"):
+        self.bad, self.after = bad, prompt_after_discard
+        self.calls, self.sent = [], []
+    def is_alive(self): return True
+    def find_prompt(self): return self.after
+    def send_command(self, cmd, **kw): return ""
+    def send_config_set(self, lines, **kw):
+        self.calls.append("config_set"); self.sent += lines
+        return REJECT if lines == [self.bad] else f"{lines[0]}\n[*vrp3-x]"
+    def commit(self, **kw): self.calls.append("commit"); return "committed"
+    def save_config(self): self.calls.append("save_config"); return "saved"
+    def exit_config_mode(self): self.calls.append("exit_config_mode")
+    def disconnect(self): pass
+
+
+LINES = ["interface Ethernet3/0/0", " ip address 1.1.1.1 255.255.255.0",
+         "interface Ethernet3/0/1", " ip address 1.1.1.2 255.255.255.0"]
+
+
+def _configure(monkeypatch, device_type, conn, lines=LINES):
+    transport = pytest.importorskip("app.transport")
+    from app.inventory import Device
+    monkeypatch.setattr(transport, "ConnectHandler", lambda **kw: conn)
+    dev = Device(name="vrp3", host="h", device_type=device_type, username="u", password="p")
+    with pytest.raises(transport.ConfigRejected) as exc:
+        transport.Pool().configure(dev, lines, commit=dev.platform.commits)
+    return exc.value
+
+
+@pytest.mark.parametrize("after, state", [("[~vrp3]", "discarded"), ("[*vrp3]", "unverified")])
+def test_vrp8_rejected_line_is_not_committed_but_discarded(monkeypatch, after, state):
+    conn = RejectingConn("interface Ethernet3/0/1", after)
+    exc = _configure(monkeypatch, "huawei_vrpv8", conn)
+    assert exc.state == state and exc.index == 2 and exc.line == "interface Ethernet3/0/1"
+    # the line after the rejected one must NOT reach the device (it would land on Ethernet3/0/0)
+    assert conn.sent == LINES[:3] + ["clear configuration candidate"], conn.sent
+    assert "commit" not in conn.calls and "Error[1]" in exc.output
+
+
+@pytest.mark.parametrize("bad, state, index", [("interface Ethernet3/0/1", "partial", 2),
+                                               ("interface Ethernet3/0/0", "nothing", 0)])
+def test_vrp5_rejected_line_is_not_saved(monkeypatch, bad, state, index):
+    conn = RejectingConn(bad)
+    exc = _configure(monkeypatch, "huawei", conn)
+    assert exc.state == state and exc.index == index
+    assert conn.sent == LINES[:index + 1] and "save_config" not in conn.calls
+
+
+def test_accepted_lines_go_one_at_a_time_and_commit(monkeypatch):
+    transport = pytest.importorskip("app.transport")
+    from app.inventory import Device
+    conn = RejectingConn("never sent")
+    monkeypatch.setattr(transport, "ConnectHandler", lambda **kw: conn)
+    dev = Device(name="vrp3", host="h", device_type="huawei_vrpv8", username="u", password="p")
+    transport.Pool().configure(dev, LINES, commit=True)
+    assert conn.sent == LINES and conn.calls == ["config_set"] * 4 + ["commit", "exit_config_mode"]
+
+
+# --- change.close_views: insert the 'quit' that mmi-mode needs -----------------
+def _cv(lines, dt="huawei_vrpv8"):
+    out, added = platforms.get(dt).close_views(lines)
+    return [("+ " if i in added else "  ") + ln for i, ln in enumerate(out)]
+
+
+@pytest.mark.parametrize("dt", ["huawei", "huawei_vrpv8"])
+def test_flat_change_gets_quit_between_views(dt):
+    """Issue #47, first example: no indentation at all."""
+    assert _cv(["interface Ethernet3/0/0", "ip address 1.1.1.1 255.255.255.0",
+                "interface Ethernet3/0/1", "ip address 1.1.1.2 255.255.255.0",
+                "ip route-static 0.0.0.0 0 10.0.0.1"], dt) == [
+        "  interface Ethernet3/0/0", "  ip address 1.1.1.1 255.255.255.0",
+        "+ quit", "  interface Ethernet3/0/1", "  ip address 1.1.1.2 255.255.255.0",
+        "  ip route-static 0.0.0.0 0 10.0.0.1"]   # flat: not an opener, nothing to know
+
+
+AAA = ["aaa", " local-user ansible level 3",
+       " authentication-scheme default_admin", "  authentication-mode local hwtacacs",
+       " authorization-scheme default_admin", "  authorization-mode local hwtacacs",
+       "stelnet server enable"]
+
+
+def test_indented_change_closes_every_view_it_leaves():
+    """Issue #47, second example, without the quit lines the model forgot."""
+    assert _cv(AAA) == [
+        "  aaa", "   local-user ansible level 3",
+        "   authentication-scheme default_admin", "    authentication-mode local hwtacacs",
+        "+ quit", "   authorization-scheme default_admin", "    authorization-mode local hwtacacs",
+        "+ quit", "+ quit", "  stelnet server enable"]
+
+
+def test_quit_lines_already_there_are_kept_and_counted():
+    with_quits = AAA[:4] + [" quit"] + AAA[4:6] + [" quit", " quit"] + AAA[6:]
+    assert _cv(with_quits) == ["  " + ln for ln in with_quits]
+    # one of the two missing: only the other one is added
+    one = AAA[:4] + [" quit"] + AAA[4:6] + [" quit"] + AAA[6:]
+    assert _cv(one).count("+ quit") == 1
+
+
+def test_indented_top_level_lines_close_the_view():
+    """Display-config layout, also for a line that is no known opener."""
+    assert _cv(["interface LoopBack1", " description a", "ip route-static 0.0.0.0 0 10.0.0.1"]) == [
+        "  interface LoopBack1", "   description a", "+ quit", "  ip route-static 0.0.0.0 0 10.0.0.1"]
+    # a whole change indented by one space is the same change
+    assert _cv([" interface LoopBack1", "  description a", " interface LoopBack2"]).count("+ quit") == 1
+
+
+@pytest.mark.parametrize("lines", [
+    ["vlan batch 10 20", "vlan batch 30"],                         # no view
+    ["undo interface LoopBack1", "undo interface LoopBack2"],      # no view
+    ["interface LoopBack1", "quit", "interface LoopBack2"],        # already left
+    ["sysname r1", "lldp enable"],
+    ["interface LoopBack1", " description a"],                    # nothing after the view
+])
+def test_nothing_added_where_nothing_is_missing(lines):
+    assert _cv(lines) == ["  " + ln for ln in lines]
+
+
+def test_flat_vlan_and_bgp_are_openers():
+    assert _cv(["vlan 10", "description users", "bgp 65000", "peer 1.1.1.1 as-number 65001"]) == [
+        "  vlan 10", "  description users", "+ quit", "  bgp 65000", "  peer 1.1.1.1 as-number 65001"]
+
+
+def test_other_platforms_are_untouched():
+    lines = ["interface Gi0/0", " description a", "interface Gi0/1"]
+    assert platforms.get("cisco_ios").close_views(lines) == (lines, {})
+
+
+CV = "  drop_trailing: ['^quit$']\n  close_views: {command: quit, openers: ['^interface\\s']}\n"
+
+
+def test_close_views_load(tmp_path):
+    xr = load_platforms(_tree(tmp_path, cisco_xr=CFG.replace("containerlab:", CV + "containerlab:"))).platforms["cisco_xr"]
+    assert xr.close_cmd == "quit" and xr.close_views(["interface a", "x", "interface b"])[1] == {2: "interface a"}
+
+
+@pytest.mark.parametrize("files, message", [
+    ({"cisco_xr": CFG.replace("containerlab:", CV.replace("  drop_trailing: ['^quit$']\n", "") + "containerlab:")},
+     "must also match change.drop_trailing"),
+    ({"cisco_xr": CFG.replace("containerlab:", CV.replace("command: quit", "command: 'quit now'") + "containerlab:")},
+     "must be one word"),
+    ({"linux": SHELL.replace("rollback_last: null}", "rollback_last: null, close_views: {command: quit}}")},
+     "only applies to change.apply: config_set"),
+])
+def test_close_views_is_validated(tmp_path, files, message):
+    with pytest.raises(PlatformError) as exc:
+        load_platforms(_tree(tmp_path, **files))
+    assert message in str(exc.value), str(exc.value)
