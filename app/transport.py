@@ -76,6 +76,9 @@ LOCK_WAIT = float(os.environ.get("WIREHAND_LOCK_WAIT", "20"))
 MIN_STEP = 1.0
 # How often we answer a follow-up question for a single command before giving up.
 MAX_PROMPT_ANSWERS = 3
+# How many sub-views a rejected line may leave before it counts as rejected
+# (VRP nests 3-4 deep at most: aaa -> authentication-scheme).
+MAX_VIEW_DEPTH = 8
 pending_prompt = platforms.pending_prompt   # re-exported: callers ask transport
 
 
@@ -365,6 +368,7 @@ class Pool:
         with self._locked(s, budget):
             conn = self._open_or_raise(s)
             plat = device.platform
+            views = ""          # note on the sub-views left for rejected lines (close_views)
             try:
                 if plat.shell:
                     chunks = []
@@ -373,7 +377,7 @@ class Pool:
                     out = "\n".join(chunks)
                 else:
                     if plat.error_rx:
-                        out = self._config_checked(conn, s, device, lines, budget, t)
+                        out, views = self._config_checked(conn, s, device, lines, budget, t)
                     else:
                         out = conn.send_config_set(lines, read_timeout=_step(budget, t), exit_config_mode=False)
                     if plat.finish == "commit":
@@ -386,6 +390,8 @@ class Pool:
                             out += "\n" + conn.save_config()
                 # A config session can end on a question too ('Save? [Y/N]').
                 out = self._settle(conn, device, out, t, "yes", budget)
+                if views:
+                    out = views + "\n\n" + out
             except (AuthError, ConfigRejected):
                 raise
             except Exception as exc:
@@ -400,12 +406,18 @@ class Pool:
             return out
 
     def _config_checked(self, conn, s: _Session, device: Device, lines: list[str],
-                        budget: Budget | None, t: float) -> str:
+                        budget: Budget | None, t: float) -> tuple[str, str]:
         """send_config_set one line at a time and stop at the first line the
         device rejects (change.config_errors.patterns). Netmiko's own
         error_pattern raises without the output, and a batch would carry on: in
         Huawei's mmi-mode the lines after a rejected 'interface Y' land in the
         view of interface X.
+
+        With change.close_views.retry_on, a line rejected that way inside a
+        sub-view is sent again after leaving the view with close_views.command,
+        up to system-view - what VRP itself does outside mmi-mode. Only the
+        device decides where a line belongs; wirehand needs no list of commands.
+        Returns (output, a note on every view left that way, or "").
 
         Raises ConfigRejected after cleaning up: on a commit platform the
         candidate is discarded (change.config_errors.discard), on a save platform
@@ -413,11 +425,45 @@ class Pool:
         sub-view."""
         plat = device.platform
         out = ""
-        for i, ln in enumerate(lines):
-            part = conn.send_config_set([ln], read_timeout=_step(budget, t),
-                                        enter_config_mode=(i == 0), exit_config_mode=False) or ""
+        notes: list[str] = []
+        closes = 0
+
+        def send(line: str, first: bool = False) -> str:
+            nonlocal out
+            part = conn.send_config_set([line], read_timeout=_step(budget, t),
+                                        enter_config_mode=first, exit_config_mode=False) or ""
             out += part
+            return part
+
+        system = None
+        if plat.retry_rx:
+            conn.config_mode()
+            system = plat.view_of(conn.find_prompt())
+            if system is None:
+                log.warning("%s: system-view prompt not recognised, no fallback to parent views", device.name)
+        for i, ln in enumerate(lines):
+            part = send(ln, first=(i == 0 and system is None))
             err = plat.config_error(part)
+            left: list[str] = []
+            while err is not None and system is not None and plat.retry_in_parent(part) \
+                    and len(left) < MAX_VIEW_DEPTH:
+                view = plat.view_of(conn.find_prompt())
+                if view is None or view == system:
+                    break
+                if plat.config_error(send(plat.close_cmd)):
+                    break
+                left.append(view)
+                part = send(ln)
+                err = plat.config_error(part)
+            if left:
+                log.info("%s: line %d %r: left %s with %r", device.name, i + 1, ln, left, plat.close_cmd)
+                if err is None:
+                    closes += len(left)
+                    notes.append(f"  line {i + 1} {ln!r}: rejected in {' and '.join(map(repr, left))}, "
+                                 f"accepted after {len(left)} {plat.close_cmd!r}")
+                else:
+                    err += (f" (also after leaving {' and '.join(map(repr, left))} with "
+                            f"{plat.close_cmd!r})")
             if err is None:
                 continue
             log.warning("%s: line %d of %d rejected (%r): %s", device.name, i + 1, len(lines), ln, err)
@@ -440,7 +486,10 @@ class Pool:
                 state = "partial" if i else "nothing"
             s.drop()
             raise ConfigRejected(device.name, lines, i, err, out, state)
-        return out
+        if not notes:
+            return out, ""
+        return out, (f"{closes} {plat.close_cmd!r} line(s) sent where the device rejected a line inside a "
+                     f"sub-view (mmi-mode does not fall back to the parent view):\n" + "\n".join(notes))
 
     @staticmethod
     def _commit(conn, timeout: float) -> str:

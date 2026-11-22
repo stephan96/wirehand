@@ -222,6 +222,7 @@ def test_configure_follows_the_platform_file(monkeypatch, device_type, calls):
         def __init__(self): self.calls = []
         def is_alive(self): return True
         def find_prompt(self): return "#"
+        def config_mode(self): pass
         def send_command(self, cmd, **kw): self.calls.append("send_command"); return "ok"
         def send_config_set(self, lines, **kw): self.calls.append("config_set"); return "ok"
         def commit(self): self.calls.append("commit"); return "committed"
@@ -287,6 +288,7 @@ class RejectingConn:
         self.calls, self.sent = [], []
     def is_alive(self): return True
     def find_prompt(self): return self.after
+    def config_mode(self): pass
     def send_command(self, cmd, **kw): return ""
     def send_config_set(self, lines, **kw):
         self.calls.append("config_set"); self.sent += lines
@@ -347,14 +349,13 @@ def _cv(lines, dt="huawei_vrpv8"):
 
 
 @pytest.mark.parametrize("dt", ["huawei", "huawei_vrpv8"])
-def test_flat_change_gets_quit_between_views(dt):
-    """Issue #47, first example: no indentation at all."""
-    assert _cv(["interface Ethernet3/0/0", "ip address 1.1.1.1 255.255.255.0",
-                "interface Ethernet3/0/1", "ip address 1.1.1.2 255.255.255.0",
-                "ip route-static 0.0.0.0 0 10.0.0.1"], dt) == [
-        "  interface Ethernet3/0/0", "  ip address 1.1.1.1 255.255.255.0",
-        "+ quit", "  interface Ethernet3/0/1", "  ip address 1.1.1.2 255.255.255.0",
-        "  ip route-static 0.0.0.0 0 10.0.0.1"]   # flat: not an opener, nothing to know
+def test_flat_change_is_left_to_the_device(dt):
+    """Without indentation wirehand cannot know where a view ends ('isis ipv6
+    enable 1' is an interface line, 'isis 1' opens a view): nothing is inserted,
+    the apply step leaves a view where the device rejects a line."""
+    lines = ["interface LoopBack1", "ipv6 enable", "isis ipv6 enable 1",
+             "interface Ethernet3/0/1", "isis cost 100", "isis 1", "is-level level-2"]
+    assert _cv(lines, dt) == ["  " + ln for ln in lines]
 
 
 AAA = ["aaa", " local-user ansible level 3",
@@ -399,22 +400,30 @@ def test_nothing_added_where_nothing_is_missing(lines):
     assert _cv(lines) == ["  " + ln for ln in lines]
 
 
-def test_flat_vlan_and_bgp_are_openers():
-    assert _cv(["vlan 10", "description users", "bgp 65000", "peer 1.1.1.1 as-number 65001"]) == [
-        "  vlan 10", "  description users", "+ quit", "  bgp 65000", "  peer 1.1.1.1 as-number 65001"]
-
-
 def test_other_platforms_are_untouched():
     lines = ["interface Gi0/0", " description a", "interface Gi0/1"]
     assert platforms.get("cisco_ios").close_views(lines) == (lines, {})
 
 
-CV = "  drop_trailing: ['^quit$']\n  close_views: {command: quit, openers: ['^interface\\s']}\n"
+CV = ("  drop_trailing: ['^quit$']\n  config_errors: {patterns: ['^Error:']}\n"
+      "  close_views: {command: quit, retry_on: [Unrecognized], view_prompt: '^\\[[~*]?(.+)\\]$'}\n")
 
 
 def test_close_views_load(tmp_path):
     xr = load_platforms(_tree(tmp_path, cisco_xr=CFG.replace("containerlab:", CV + "containerlab:"))).platforms["cisco_xr"]
-    assert xr.close_cmd == "quit" and xr.close_views(["interface a", "x", "interface b"])[1] == {2: "interface a"}
+    assert xr.close_cmd == "quit" and xr.close_views(["interface a", " x", "interface b"])[1] == {2: "interface a"}
+    assert xr.retry_in_parent("Error: Unrecognized command") and not xr.retry_in_parent("Error: Wrong parameter")
+    assert xr.view_of("[*r1-GigabitEthernet0/0]") == "r1-GigabitEthernet0/0" and xr.view_of("<r1>") is None
+
+
+@pytest.mark.parametrize("dt", ["huawei", "huawei_vrpv8"])
+def test_huawei_views(dt):
+    p = platforms.get(dt)
+    assert p.retry_in_parent(REJECT)
+    assert not p.retry_in_parent("Error: Wrong parameter found at '^' position.")
+    assert p.view_of("[~wirehand-lab-vrp3]") == "wirehand-lab-vrp3"
+    assert p.view_of("[*wirehand-lab-vrp3-LoopBack1]") == "wirehand-lab-vrp3-LoopBack1"
+    assert p.view_of("[vrp3-aaa-authen-default]") == "vrp3-aaa-authen-default"
 
 
 @pytest.mark.parametrize("files, message", [
@@ -424,8 +433,143 @@ def test_close_views_load(tmp_path):
      "must be one word"),
     ({"linux": SHELL.replace("rollback_last: null}", "rollback_last: null, close_views: {command: quit}}")},
      "only applies to change.apply: config_set"),
+    ({"cisco_xr": CFG.replace("containerlab:", CV.replace("  config_errors: {patterns: ['^Error:']}\n", "") + "containerlab:")},
+     "needs change.config_errors"),
+    ({"cisco_xr": CFG.replace("containerlab:", CV.replace("retry_on: [Unrecognized], ", "") + "containerlab:")},
+     "retry_on must be a non-empty list"),
+    ({"cisco_xr": CFG.replace("containerlab:", CV.replace("(.+)", ".+") + "containerlab:")},
+     "group 1 is the view"),
+    ({"cisco_xr": CFG.replace("containerlab:", CV.replace("retry_on", "openers") + "containerlab:")},
+     "unknown key(s) openers"),
 ])
 def test_close_views_is_validated(tmp_path, files, message):
     with pytest.raises(PlatformError) as exc:
         load_platforms(_tree(tmp_path, **files))
     assert message in str(exc.value), str(exc.value)
+
+
+# --- change.close_views.retry_on: the device decides where a line belongs ----
+class ViewConn:
+    """A VRP8 in mmi-mode, reduced to views: an opener opens a view from
+    system-view; in a sub-view, a line belonging to another view is rejected
+    as unknown instead of falling back to the parent view."""
+    OPENERS = ("interface ", "isis 1", "aaa")
+    SYSTEM_ONLY = ("ip route-static", "sysname")
+    UNKNOWN = "Error[1]: Unrecognized command found at '^' position.\n"
+
+    def __init__(self):
+        self.view, self.sent, self.calls, self.dirty = [], [], [], False
+    def is_alive(self): return True
+    def config_mode(self): self.calls.append("config_mode")
+    def find_prompt(self): return "[" + "~*"[self.dirty] + "-".join(["vrp3"] + self.view) + "]"
+    def send_command(self, cmd, **kw): return ""
+    def commit(self, **kw): self.calls.append("commit"); return "committed"
+    def exit_config_mode(self): self.calls.append("exit_config_mode")
+    def disconnect(self): pass
+    def send_config_set(self, lines, **kw):
+        (ln,) = lines
+        self.sent.append(ln)
+        echo = f"{self.find_prompt()}{ln}\n"
+        if ln == "quit":
+            self.view.pop()
+        elif ln == "clear configuration candidate":
+            self.view, self.dirty = [], False
+            return echo + self.find_prompt()
+        elif ln.startswith("bogus"):
+            return echo + self.UNKNOWN + self.find_prompt()
+        elif ln.startswith(self.OPENERS + self.SYSTEM_ONLY):
+            if self.view:
+                return echo + self.UNKNOWN + self.find_prompt()
+            if ln.startswith(self.OPENERS):
+                self.view.append(ln.split()[-1] if ln.startswith("interface") else ln.replace(" ", "-"))
+        elif not self.view:
+            return echo + self.UNKNOWN + self.find_prompt()
+        self.dirty = True
+        return echo + self.find_prompt()
+
+
+ISIS = ["interface LoopBack1", "ipv6 enable", "isis ipv6 enable 1",
+        "interface Ethernet3/0/1", "isis ipv6 enable 1", "isis circuit-type p2p", "isis cost 100",
+        "isis 1", "is-level level-2", "ip route-static 0.0.0.0 0 10.0.0.1"]
+
+
+def _apply(monkeypatch, lines, conn):
+    transport = pytest.importorskip("app.transport")
+    from app.inventory import Device
+    monkeypatch.setattr(transport, "ConnectHandler", lambda **kw: conn)
+    dev = Device(name="vrp3", host="h", device_type="huawei_vrpv8", username="u", password="p")
+    return transport.Pool().configure(dev, lines, commit=True)
+
+
+def test_flat_change_leaves_a_view_only_where_the_device_rejects_a_line(monkeypatch):
+    """The change from the bug report: the interface isis lines stay in their
+    interface; 'interface Ethernet3/0/1' and 'isis 1' each leave one view,
+    'ip route-static' leaves the isis view."""
+    conn = ViewConn()
+    out = _apply(monkeypatch, ISIS, conn)
+    assert conn.sent == [
+        "interface LoopBack1", "ipv6 enable", "isis ipv6 enable 1",
+        "interface Ethernet3/0/1", "quit", "interface Ethernet3/0/1",
+        "isis ipv6 enable 1", "isis circuit-type p2p", "isis cost 100",
+        "isis 1", "quit", "isis 1", "is-level level-2",
+        "ip route-static 0.0.0.0 0 10.0.0.1", "quit", "ip route-static 0.0.0.0 0 10.0.0.1"]
+    assert conn.calls == ["config_mode", "commit", "exit_config_mode"]
+    assert out.startswith("3 'quit' line(s) sent"), out
+    assert "line 4 'interface Ethernet3/0/1': rejected in 'vrp3-LoopBack1', accepted after 1 'quit'" in out
+
+
+def test_nested_views_are_left_one_by_one(monkeypatch):
+    conn = ViewConn()
+    out = _apply(monkeypatch, ["aaa", "interface LoopBack9", "description x", "sysname r9"], conn)
+    assert conn.sent == ["aaa", "interface LoopBack9", "quit", "interface LoopBack9", "description x",
+                         "sysname r9", "quit", "sysname r9"]
+    assert out.startswith("2 'quit' line(s) sent"), out
+
+
+def test_two_views_left_for_one_line(monkeypatch):
+    class Nested(ViewConn):
+        def send_config_set(self, lines, **kw):
+            if lines == ["authentication-scheme a"] and self.view == ["aaa"]:
+                self.sent += lines
+                self.view.append("authen-a")
+                return self.find_prompt()
+            return super().send_config_set(lines, **kw)
+    conn = Nested()
+    out = _apply(monkeypatch, ["aaa", "authentication-scheme a", "authentication-mode local", "sysname r9"], conn)
+    # tried in every view on the way out, as VRP does outside mmi-mode
+    assert conn.sent[-5:] == ["sysname r9", "quit", "sysname r9", "quit", "sysname r9"]
+    assert "rejected in 'vrp3-aaa-authen-a' and 'vrp3-aaa', accepted after 2 'quit'" in out
+
+
+def test_indented_change_needs_no_fallback(monkeypatch):
+    conn = ViewConn()
+    out = _apply(monkeypatch, ["interface LoopBack1", " ipv6 enable", "quit", "isis 1", " is-level level-2"], conn)
+    assert conn.sent.count("quit") == 1 and "line(s) sent" not in out
+
+
+def test_line_unknown_in_system_view_too_is_rejected_and_discarded(monkeypatch):
+    """Never 'quit' out of system-view: the line is rejected, nothing committed."""
+    transport = pytest.importorskip("app.transport")
+    conn = ViewConn()
+    with pytest.raises(transport.ConfigRejected) as exc:
+        _apply(monkeypatch, ["interface LoopBack1", "description x", "bogus line"], conn)
+    assert conn.sent == ["interface LoopBack1", "description x", "bogus line", "quit", "bogus line",
+                         "clear configuration candidate"]
+    assert exc.value.index == 2 and exc.value.state == "discarded"
+    assert "also after leaving 'vrp3-LoopBack1' with 'quit'" in exc.value.error
+    assert "commit" not in conn.calls
+
+
+def test_other_errors_do_not_leave_the_view(monkeypatch):
+    transport = pytest.importorskip("app.transport")
+
+    class Wrong(ViewConn):
+        def send_config_set(self, lines, **kw):
+            if lines == ["ip address 1.1.1.1"]:
+                self.sent += lines
+                return "Error: Incomplete command found at '^' position.\n" + self.find_prompt()
+            return super().send_config_set(lines, **kw)
+    conn = Wrong()
+    with pytest.raises(transport.ConfigRejected):
+        _apply(monkeypatch, ["interface LoopBack1", "ip address 1.1.1.1"], conn)
+    assert "quit" not in conn.sent

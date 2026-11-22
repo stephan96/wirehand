@@ -61,10 +61,13 @@
 #     close_views:                           optional, apply: config_set only
 #       command: <word>                      leaves a sub-view ('quit'); must also match
 #                                            drop_trailing or last_line_only
-#       openers: ['<regex>', ...]            top-level commands that open a sub-view, for
-#                                            changes without indentation. propose_change
-#                                            inserts 'command' where a change moves on
-#                                            without leaving a view (see README)
+#       retry_on: ['<regex>', ...]           a line rejected with one of these inside a
+#                                            sub-view is sent again after 'command', up
+#                                            to system-view. Needs config_errors
+#       view_prompt: '<regex>'               config-mode prompt, group 1 = the view; the
+#                                            system-view is the one config mode starts in
+#                                            An indented change also gets 'command'
+#                                            inserted by propose_change (see README)
 #   comment_prefixes: ['#', ...]             optional, replaces the value below
 #   prompts: [...]                           optional, checked before the ones below
 #   containerlab:

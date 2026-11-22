@@ -2,7 +2,7 @@
 
 *LLM-driven network operations, with human approval for every change.*
 
-**Version:** 0.6.5 · **License:** [Apache-2.0](LICENSE)
+**Version:** 0.6.6 · **License:** [Apache-2.0](LICENSE)
 
 ## Contents
 
@@ -357,6 +357,23 @@ automatic snapshot cleanup (see "Audit log & snapshots"). Behaviour changes:
 - `confirm_change` answers name the pre-change snapshot by name, with the `get_snapshot`
   call to read it, instead of a file path.
 
+**Upgrading to 0.6.6:** fixes the `quit` lines 0.6.5 inserted into Huawei changes
+written without indentation. 0.6.5 guessed where a view starts from a list of
+command patterns (`close_views.openers`). The list matched interface commands such as
+`isis ipv6 enable 1` or `isis cost 100` as if they opened the `isis` view, so a `quit`
+before them left the interface. With `mpls`, the same line exists in interface and system
+view, and the wrongly inserted `quit` would have been accepted. What changes:
+
+- A change without indentation gets no `quit` lines at propose time any more. At
+  apply time, a line the device rejects as `Unrecognized command` inside a sub-view is
+  sent again after `quit`, up to system-view (VRP's own behaviour outside mmi-mode).
+  The device decides where a line belongs; there is no list of commands. The
+  `confirm_change` answer lists every `quit` sent this way.
+- Indented changes are unchanged: the preview still shows the inserted `quit` lines.
+- `change.close_views.openers` is gone; the new keys are `close_views.retry_on` and
+  `close_views.view_prompt`. If you keep your own copy of `config/platforms/`, take the
+  new `huawei.yaml` and `huawei_vrpv8.yaml`: a file that still has `openers` fails to load.
+
 **Upgrading to 0.6.5:** on Huawei VRP8 and VRP5 a config line the device rejects
 (`Error: ...`) now stops the change. Before, wirehand sent the remaining lines anyway,
 committed/saved and reported `APPLIED` - in mmi-mode the lines after a rejected
@@ -639,7 +656,7 @@ rejected when the inventory loads, and every file needs its counterpart in
 | `change.drop_trailing` | trailing lines dropped from a config change (`end`, `return`, `exit`) - the tool leaves config mode itself, and the preview names what was dropped |
 | `change.last_line_only` | lines that are dropped at the end like `drop_trailing`, but refused anywhere else (`end`, `return`: in the middle they leave config mode with the change uncommitted) |
 | `change.config_errors` | how the device reports a rejected config line (`patterns`), and on commit platforms how the uncommitted change is thrown away (`discard`, verified with `dirty_prompt`); `hint` is shown to the model. See "Rejected config lines" |
-| `change.close_views` | the command that leaves a sub-view (`command: quit`) and the top-level commands that open one (`openers`); `propose_change` inserts the command where a change moves on without leaving a view. See "Missing quit lines" |
+| `change.close_views` | the command that leaves a sub-view (`command: quit`), the device answers after which a rejected line is sent again in the parent view (`retry_on`), and the config-mode prompt with the view as group 1 (`view_prompt`). `propose_change` inserts the command into indented changes, `confirm_change` sends it where the device rejects a line inside a sub-view. Needs `config_errors`. See "Missing quit lines" |
 | `change.refuse_in_config` | lines a config change must not contain (they leave config mode, commit or reboot), with the reason shown to the model |
 | `prompts` | device questions and the answers to them; shared ones in `common.yaml` |
 | `comment_prefixes` | lines of a proposed change that are dropped as comments (`#`, `!`) |
@@ -985,16 +1002,18 @@ the lines **one at a time** and stops at the first output line that matches
 
 The session is dropped in every case, the change ID is used up, and the audit log gets
 `confirm_rejected` with `line`, `rejected`, `error` and `state`. The answer includes
-`config_errors.hint`, which tells the model to leave a sub-view with `quit`. A VRP5
+`config_errors.hint`, which tells the model to check the line's syntax and view. A VRP5
 partial change counts as applied in `list_snapshots`, so its snapshot is the rollback base.
 
 #### Missing quit lines
 
 The same mmi-mode behaviour also catches changes that are written the way they look in
-`display current-configuration`, without `quit`. Small models do this all the time. On
-platforms with `change.close_views` (both Huawei files), `propose_change` therefore
-inserts the missing `quit` lines **before** staging, so the preview shows exactly what
-will be sent:
+`display current-configuration`, without `quit`. Small models do this all the time.
+Platforms with `change.close_views` (both Huawei files) add the missing `quit` lines in
+two places:
+
+**Indented change, at propose time.** `propose_change` inserts the missing `quit`
+lines **before** staging, so the preview shows exactly what will be sent:
 
 ```
 Configuration lines to send:
@@ -1010,15 +1029,35 @@ Configuration lines to send:
 (3 'quit' line(s) added - this device rejects a line that does not belong to the current view)
 ```
 
-- **With indentation:** a line opens a view when the next line is indented deeper, and
-  every step back out closes one view. This also covers lines that open no view
-  themselves (`ip route-static ...` after an interface block).
-- **Without indentation:** each line matching `close_views.openers` (`interface ...`,
-  `aaa`, `bgp ...`, `vlan <id>`, ...) closes the view the previous opener opened. Nested
-  views cannot be recognised in a flat change. If one is missed, the device rejects the
-  next line, and "Rejected config lines" stops the change.
+- A line opens a view when the next line is indented deeper, and every step back out
+  closes one view. This also covers lines that open no view themselves
+  (`ip route-static ...` after an interface block).
 - A `quit` that is already in the change closes the innermost view and is kept. Lines
   are only ever added, never removed or changed. A trailing `quit` is still dropped.
+
+**Any change, at apply time.** Without indentation, wirehand cannot know where a view
+ends: `isis 1` opens a view, `isis ipv6 enable 1` is an interface command, and VRP has
+thousands of commands. So `confirm_change` asks the device. When a line is rejected with
+one of `close_views.retry_on` (`Unrecognized command`) while the prompt
+(`close_views.view_prompt`) shows a sub-view, wirehand sends `quit` and the same line
+again, view by view up to system-view. That is what VRP itself does outside mmi-mode.
+The answer lists every `quit` sent:
+
+```
+APPLIED on vrp3 (change ID F9E4C4). native rollback available via rollback_change.
+
+2 'quit' line(s) sent where the device rejected a line inside a sub-view (mmi-mode does not fall back to the parent view):
+  line 5 'interface Ethernet3/0/1': rejected in 'vrp3-LoopBack1', accepted after 1 'quit'
+  line 10 'isis 1': rejected in 'vrp3-Ethernet3/0/1', accepted after 1 'quit'
+```
+
+- Only `retry_on` errors cause a `quit`. `Incomplete command`, `Wrong parameter` and
+  the like stop the change in the view where they happened.
+- wirehand never sends `quit` in system-view (that would leave config mode). A line
+  that is also unknown there is rejected as described in "Rejected config lines", with
+  `(also after leaving '<view>' with 'quit')` in the error.
+- The preview of a multi-line change says that this can happen. Rollback is not
+  affected: it uses the snapshot and the commit, not the lines sent.
 
 ### Approving changes
 

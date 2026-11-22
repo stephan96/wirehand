@@ -47,7 +47,7 @@ _KEYS = {
                "last_line_only", "config_errors", "close_views"},
     "refuse_in_config": {"reason", "patterns"},
     "config_errors": {"patterns", "discard", "dirty_prompt", "hint"},
-    "close_views": {"command", "openers"},
+    "close_views": {"command", "retry_on", "view_prompt"},
     "containerlab": {"kinds"},
     "prompt": {"pattern", "proceed", "abort", "note"},
     "creds": {"username", "password"},
@@ -95,10 +95,12 @@ class Platform:
     discard: tuple[str, ...] = ()
     dirty_prompt: re.Pattern[str] | None = None
     error_hint: str = ""
-    # change.close_views: the command that leaves a sub-view, and the top-level
-    # commands that open one (used when a change has no indentation).
+    # change.close_views: the command that leaves a sub-view; the device answers
+    # that make the apply step leave a sub-view and send a rejected line again
+    # (retry_on); and how a prompt names the current view (view_prompt, group 1).
     close_cmd: str = ""
-    openers: tuple[re.Pattern[str], ...] = ()
+    retry_rx: tuple[re.Pattern[str], ...] = ()
+    view_rx: re.Pattern[str] | None = None
 
     @property
     def shell(self) -> bool:
@@ -133,16 +135,21 @@ class Platform:
 
         With indentation (the layout of 'display current-configuration'), a line
         opens a view when the next line is indented deeper, and every step back
-        out closes one view. Without any, a line matching `openers` closes the
-        view the last opener opened. A close command the change already contains
-        closes the innermost view and is kept."""
+        out closes one view. A close command the change already contains closes
+        the innermost view and is kept.
+
+        A change without indentation is returned unchanged: where its views end
+        cannot be known without knowing every command of the device. The apply
+        step handles it instead (retry_on: a line the device rejects in a sub-view
+        is sent again after leaving the view)."""
         if not self.close_cmd:
             return list(lines), {}
         cmd = self.close_cmd.lower()
         is_close = [ln.strip().lower() == cmd for ln in lines]
         depth = [len(ln) - len(ln.lstrip()) for ln in lines]
         body = [d for d, c in zip(depth, is_close) if not c]
-        indented = bool(body) and max(body) > min(body)
+        if not body or max(body) == min(body):
+            return list(lines), {}
         out: list[str] = []
         added: dict[int, str] = {}
         stack: list[tuple[int, str]] = []          # open views: (indent of the opener, opener)
@@ -157,21 +164,24 @@ class Platform:
                     stack.pop()
                 out.append(ln)
                 continue
-            text = ln.strip()
-            if indented:
-                while stack and stack[-1][0] >= depth[i]:
-                    close(stack.pop()[1])
-                out.append(ln)
-                nxt = next((j for j in range(i + 1, len(lines)) if not is_close[j]), None)
-                if nxt is not None and not is_close[i + 1] and depth[nxt] > depth[i]:
-                    stack.append((depth[i], text))
-            else:
-                if any(rx.search(text) for rx in self.openers):
-                    while stack:
-                        close(stack.pop()[1])
-                    stack.append((0, text))
-                out.append(ln)
+            while stack and stack[-1][0] >= depth[i]:
+                close(stack.pop()[1])
+            out.append(ln)
+            nxt = next((j for j in range(i + 1, len(lines)) if not is_close[j]), None)
+            if nxt is not None and not is_close[i + 1] and depth[nxt] > depth[i]:
+                stack.append((depth[i], ln.strip()))
         return out, added
+
+    def retry_in_parent(self, output: str) -> bool:
+        """Did the device reject a line in a way that leaving the sub-view may fix
+        (change.close_views.retry_on, e.g. VRP's 'Unrecognized command')?"""
+        return any(rx.search(ln) for ln in (output or "").splitlines() for rx in self.retry_rx)
+
+    def view_of(self, prompt: str) -> str | None:
+        """The view a config-mode prompt names (close_views.view_prompt, group 1):
+        '[*vrp3-LoopBack1]' -> 'vrp3-LoopBack1', '[~vrp3]' -> 'vrp3'."""
+        m = self.view_rx.search((prompt or "").strip()) if self.view_rx else None
+        return m.group(1) if m else None
 
     def config_error(self, output: str) -> str | None:
         """The first line of `output` in which the device rejected a config line
@@ -350,7 +360,7 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
         raise PlatformError(f"{file}: change.rollback_last undoes a commit, but change.finish is "
                             "'none' - this platform has no commits to roll back")
     error_rx, discard, dirty, hint = _config_errors(change, apply, finish, file)
-    close_cmd, openers = "", ()
+    close_cmd, retry_rx, view_rx = "", (), None
     if "close_views" in change:
         where = f"{file}: change.close_views"
         if apply != "config_set":
@@ -364,7 +374,17 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
             raise PlatformError(f"{where}.command '{close_cmd}' must also match change.drop_trailing "
                                 "or change.last_line_only - a close command the model puts at the "
                                 "end has to be dropped, the tool leaves config mode itself")
-        openers = _pattern_list(cv.get("openers") or [], f"{where}.openers")
+        if not error_rx:
+            raise PlatformError(f"{where} needs change.config_errors: a rejected line is only seen "
+                                "with it")
+        retry_rx = _pattern_list(cv.get("retry_on"), f"{where}.retry_on")
+        if not retry_rx:
+            raise PlatformError(f"{where}.retry_on must be a non-empty list of the device answers "
+                                "after which a line is sent again in the parent view")
+        view_rx = _compile(cv.get("view_prompt"), f"{where}.view_prompt")
+        if view_rx.groups < 1:
+            raise PlatformError(f"{where}.view_prompt must be a regex whose group 1 is the view "
+                                "name in the config-mode prompt, e.g. '^\\[[~*]?(.+)\\]$'")
 
     prefixes = common_prefixes
     if "comment_prefixes" in raw:
@@ -378,7 +398,7 @@ def _platform(dt: str, raw: dict, file: str, sources: tuple[str, ...],
         balance_end=balance_end, refuse=refuse, refuse_reason=reason, drop_trailing=drop, last_line_only=last,
         comment_prefixes=prefixes, prompts=prompts, sources=sources,
         error_rx=error_rx, discard=discard, dirty_prompt=dirty, error_hint=hint,
-        close_cmd=close_cmd, openers=openers,
+        close_cmd=close_cmd, retry_rx=retry_rx, view_rx=view_rx,
     )
 
 

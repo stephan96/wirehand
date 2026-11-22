@@ -112,7 +112,7 @@ def _prune_daily(stop: threading.Event) -> None:
 
 # Also the start of the description: Open WebUI shows that on mouse-over in the
 # chat's tool selection, so users see which version they are talking to.
-VERSION = "0.6.5"
+VERSION = "0.6.6"
 
 app = FastAPI(
     title="wirehand",
@@ -503,7 +503,7 @@ class ProposeIn(BaseModel):
         "the tool adds them). "
         "Huawei: indent sub-view lines by one space per level, as in 'display current-configuration' "
         "(e.g. 'interface LoopBack1\\n description x\\ninterface LoopBack2') - the tool inserts the "
-        "'quit' lines the device needs between views. "
+        "'quit' lines the device needs between views, and the preview shows them. "
         "FortiGate: full section blocks INCLUDING 'config ...', 'next' and 'end' lines, e.g. "
         "'config system global\\nset lldp-reception enable\\nset lldp-transmission enable\\nend' "
         "(missing 'end' lines are appended automatically). "
@@ -559,9 +559,10 @@ def propose_change(body: ProposeIn) -> str:
                 f"{misplaced} is only allowed as the last line - in the middle of a change it leaves "
                 f"config mode with the change uncommitted. Remove it (the tool leaves config mode "
                 f"itself), or split the change into separate propose_change calls"))
-        # Huawei mmi-mode: a change that moves on from a sub-view without 'quit'
-        # gets it inserted (change.close_views). Before the snapshot, so the staged
-        # lines - and the preview - are exactly what will be sent.
+        # Huawei mmi-mode: an indented change that moves on from a sub-view without
+        # 'quit' gets it inserted (change.close_views). Before the snapshot, so the
+        # staged lines - and the preview - are what will be sent. A flat change is
+        # left as it is; confirm_change leaves a view where the device rejects a line.
         lines, added = plat.close_views(lines)
         if plat.balance_end:
             # FortiOS applies a section only at 'end' - balance missing ends automatically.
@@ -587,6 +588,9 @@ def propose_change(body: ProposeIn) -> str:
         if added:
             preview += (f"\n({len(added)} '{plat.close_cmd}' line(s) added - this device rejects a line "
                         f"that does not belong to the current view)")
+        if plat.retry_rx and len(lines) > 1:
+            preview += (f"\n(if the device does not know a line inside a sub-view, wirehand leaves the view "
+                        f"with '{plat.close_cmd}' and sends the line again - the result lists every one)")
         if dropped:
             preview += (f"\n(dropped from the end: {', '.join(repr(d) for d in dropped)} - "
                         f"the tool leaves config mode itself)")
