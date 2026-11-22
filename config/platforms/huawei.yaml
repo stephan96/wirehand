@@ -36,28 +36,19 @@ change:
   last_line_only:
     - '^return$'
   # mmi-mode does not fall back to the parent view: after 'interface X', a line
-  # 'interface Y' is rejected until 'quit' leaves X. propose_change inserts the
-  # missing 'quit' lines (the preview marks them). With indentation (the layout of
-  # 'display current-configuration') every step back out closes a view; without
-  # any, each of these top-level commands closes the view the previous one opened.
+  # 'interface Y' is rejected until 'quit' leaves X.
+  # - Indented change (the layout of 'display current-configuration'):
+  #   propose_change inserts the missing 'quit' lines, the preview marks them.
+  # - Any change: a line the device rejects with one of retry_on while the prompt
+  #   shows a sub-view is sent again after 'quit', up to system-view - what VRP
+  #   does by itself outside mmi-mode. The device decides where a line belongs,
+  #   wirehand needs no list of the commands that open a view.
   close_views:
     command: quit
-    openers:
-      - '^interface\s+\S'
-      - '^aaa$'
-      - '^bgp\s+\d'
-      - '^ospf(v3)?(\s|$)'
-      - '^isis(\s|$)'
-      - '^rip(ng)?(\s|$)'
-      - '^acl(\s+(number|name|ipv6))?\s+\S'
-      - '^route-policy\s+\S+\s+(permit|deny)\s+node\s+\d+'
-      - '^ip\s+vpn-instance\s+\S'
-      - '^user-interface\s'
-      - '^vlan\s+\d+$'
-      - '^mpls(\s+ldp)?$'
-      - '^bfd$'
-      - '^segment-routing$'
-      - '^traffic\s+(classifier|behavior|policy)\s+\S'
+    retry_on:
+      - 'Unrecognized command'
+    # group 1 = the view: '[~vrp3]' -> vrp3, '[*vrp3-LoopBack1]' -> vrp3-LoopBack1
+    view_prompt: '^\[[~*]?(.+)\]$'
   # How the device says it rejected a line ("Error: ...", "Error[1]: Unrecognized
   # command found at '^' position."). Matched line by line; the command echo
   # starts with the prompt, so a description containing "Error:" does not match.
@@ -67,10 +58,11 @@ change:
     # VRP5 has no candidate: lines before the rejected one are already active.
     # wirehand stops there and does NOT save, so a reboot would still revert them.
     hint: >-
-      Sessions run in mmi-mode, where a line that does not belong to the current
-      view is rejected instead of falling back to the parent view. Leave a
-      sub-view (interface, aaa, bgp, ...) with 'quit' before configuring another
-      one, e.g. 'interface X', '<lines>', 'quit', 'interface Y'.
+      A line the device does not know inside a sub-view is already sent again
+      after leaving the view with 'quit', so this line was rejected in
+      system-view as well (or rejected for another reason). Check its syntax and
+      the view it belongs to with run_read, e.g. 'display current-configuration
+      interface X'.
   # Matched against every line of a change made in system-view. 'quit' and
   # 'return' only leave a view, so they are allowed.
   refuse_in_config:
